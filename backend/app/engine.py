@@ -1,19 +1,22 @@
 """Core trading engine for the Ultimate Bot.
 
 The engine runs continuously, polling market data, updating candles,
-evaluating the currently selected strategy and executing trades via the
-``PaperBroker``. It exposes methods to start the loop and to handle
-bar‑close logic for both scalping and trend modes. The engine relies on
-``StrategyRouter`` to select the active strategy based on user settings.
+evaluating the unified adaptive strategy ("Adaptive Router") and
+executing trades via the ``PaperBroker``. It exposes methods to start
+the loop and to handle bar‑close logic for both scalping and higher TF
+modes. The router auto‑selects the sub‑strategy based on regime.
 """
+
+from __future__ import annotations
 
 import asyncio
 import time
 from datetime import datetime
+from typing import Any
+
 from .config import settings
 from .datafeed import seed_klines, poll_coinbase_tick
 from .broker import PaperBroker, FEE_MAKER, FEE_TAKER
-from .ta import ema
 from .strategies.router import StrategyRouter
 
 
@@ -27,14 +30,23 @@ class BotEngine:
 
     def __init__(self) -> None:
         self.client = None
-        self.m1: list[dict] = []
-        self.h1: list[dict] = []
+        # Candles as lists of DICTS (we convert from Pydantic models on seed)
+        self.m1: list[dict[str, Any]] = []
+        self.h1: list[dict[str, Any]] = []
+
+        # Intraday VWAP (rebuilt per minute)
         self.vwap: list[float | None] = []
+
+        # Market snapshot
         self.bid: float | None = None
         self.ask: float | None = None
         self.price: float | None = None
+
+        # UI/status
         self.status_text: str = "Loading..."
-        self.profile: dict = {
+
+        # Risk/profile knobs (read by strategies via context)
+        self.profile: dict[str, Any] = {
             "ATR_PCT_MIN": 0.0004,
             "ATR_PCT_MAX": 0.0200,
             "VWAP_SLOPE_MAX": 0.00060,
@@ -44,23 +56,31 @@ class BotEngine:
             "RISK_PCT_SCALP": 0.010,
             "LEV_CAP": 8,
         }
-        self.settings: dict = {
+
+        # Engine settings (shown in UI)
+        self.settings: dict[str, Any] = {
             "scalp_mode": True,
             "auto_trade": True,
-            "strategy": "Level King — Regime",
+            "strategy": "Adaptive Router",  # <- unified strategy label
             "macro_pause": False,
         }
+
         self.router = StrategyRouter()
         self.broker = PaperBroker(start_equity=settings.start_equity)
+
+        # Cooldown / guardrails
         self._cool_until: int = 0
-        self._last_bar_time_m1: int = 0
-        self._last_bar_time_h1: int = 0
         self._loss_streak: int = 0
 
     async def start(self, client) -> None:
         """Begin polling and trading loop using the provided HTTP client."""
         self.client = client
-        self.m1, self.h1 = await seed_klines(client)
+        m1_seed, h1_seed = await seed_klines(client)
+
+        # Convert Candle models -> dicts so we can use dict-style access everywhere
+        self.m1 = [c.model_dump() if hasattr(c, "model_dump") else dict(c) for c in m1_seed]
+        self.h1 = [c.model_dump() if hasattr(c, "model_dump") else dict(c) for c in h1_seed]
+
         self._rebuild_vwap()
         asyncio.create_task(self._run())
 
@@ -74,14 +94,16 @@ class BotEngine:
         bucket = (t_ms // 60000) * 60000
         t = bucket // 1000
         if not self.m1 or self.m1[-1]["time"] != t:
-            self.m1.append({
-                "time": t,
-                "open": price,
-                "high": price,
-                "low": price,
-                "close": price,
-                "volume": 0.0,
-            })
+            self.m1.append(
+                {
+                    "time": t,
+                    "open": price,
+                    "high": price,
+                    "low": price,
+                    "close": price,
+                    "volume": 0.0,
+                }
+            )
             self.m1 = self.m1[-3000:]
         else:
             c = self.m1[-1]
@@ -91,7 +113,7 @@ class BotEngine:
 
     def _aggregate_h1(self) -> None:
         """Aggregate the m1 candles into h1 candles."""
-        bars = {}
+        bars: dict[int, dict[str, Any]] = {}
         for c in self.m1:
             bucket = (c["time"] // 3600) * 3600
             b = bars.get(bucket)
@@ -102,18 +124,18 @@ class BotEngine:
                     "high": c["high"],
                     "low": c["low"],
                     "close": c["close"],
-                    "volume": c["volume"],
+                    "volume": c.get("volume", 0.0),
                 }
             else:
                 b["high"] = max(b["high"], c["high"])
                 b["low"] = min(b["low"], c["low"])
                 b["close"] = c["close"]
-                b["volume"] += c["volume"]
+                b["volume"] += c.get("volume", 0.0)
         self.h1 = sorted(bars.values(), key=lambda x: x["time"])
 
     def _rebuild_vwap(self) -> None:
-        """Recompute VWAP for the current m1 series."""
-        out = []
+        """Recompute VWAP for the current m1 series (reset each UTC day)."""
+        out: list[float | None] = []
         day = None
         pv = 0.0
         vv = 0.0
@@ -159,7 +181,6 @@ class BotEngine:
                 if self.broker.pos and self.price is not None:
                     _ = self.broker.mark(self.price)
                     p = self.broker.pos
-                    # check hard stops
                     hit_stop = (self.price <= p.stop) if p.side == "long" else (self.price >= p.stop)
                     hit_take = (self.price >= p.take) if p.side == "long" else (self.price <= p.take)
                     if hit_stop or hit_take:
@@ -171,8 +192,7 @@ class BotEngine:
                             self.status_text = "Cooling off after losses"
                             self._loss_streak = 0
 
-                now = int(time.time())
-                # check closed bars
+                # on closed bars trigger evaluations
                 if len(self.m1) >= 2 and self.m1[-2]["time"] != last_m1_closed:
                     last_m1_closed = self.m1[-2]["time"]
                     await self._maybe_signal(tf="m1")
@@ -184,19 +204,32 @@ class BotEngine:
             await asyncio.sleep(1.0)
 
     async def _maybe_signal(self, tf: str) -> None:
-        """Evaluate the selected strategy and open/close trades."""
+        """Evaluate the adaptive strategy and open/close trades."""
         if self.settings.get("macro_pause"):
             self.status_text = "Macro pause"
             return
         if int(time.time()) < self._cool_until:
             return
+
         pnl = self._day_pnl()
         fills = self._fills_today()
         daily_ok = (pnl < 500) and (pnl > -500) and (fills < 60)
+
         last_open = self.broker.history[-1].open_time if self.broker.history else 0
         now = int(time.time())
         cooldown_ok = (now - last_open) > (60 if self.settings.get("scalp_mode") else 3600)
+
+        # Select the main series for this tick (used by router for regime calc)
+        scalp = bool(self.settings.get("scalp_mode"))
+        src = self.m1 if scalp else self.h1
+        iC = (len(src) - 2) if len(src) >= 2 else None
+
+        # Also compute H1 index so Breakout/Trend can run even if scalp_mode=True
+        iC_h1 = (len(self.h1) - 2) if len(self.h1) >= 2 else None
+        iC_m1 = (len(self.m1) - 2) if len(self.m1) >= 2 else None
+
         context = {
+            # gates / limits
             "daily_ok": daily_ok,
             "cooldown_ok": cooldown_ok,
             "fills": fills,
@@ -204,49 +237,56 @@ class BotEngine:
             "fee_rate": FEE_MAKER,
             "fee_taker": FEE_TAKER,
             "profile": self.profile,
+
+            # data
             "vwap": self.vwap,
             "bid": self.bid,
             "ask": self.ask,
+
+            # series and indexes for both TFs
+            "m1": self.m1,
+            "h1": self.h1,
+            "iC": iC,            # index for the series passed to router.evaluate(...)
+            "iC_m1": iC_m1,      # explicit m1 index
+            "iC_h1": iC_h1,      # explicit h1 index
+
+            # warmup minimums used by strategies
             "min_bars": 5,
-            "min_bars_h1": 60,
+            "min_h1_bars": 240,  # satisfies Breakout/Trend warmups
         }
-        if self.settings.get("scalp_mode"):
-            src = self.m1
-            iC = len(self.m1) - 2
-        else:
-            src = self.h1
-            iC = len(self.h1) - 2
-        context["iC"] = iC
-        strategy = self.router.pick(self.settings.get("scalp_mode", True))
+
+        # Let the router decide and return a Signal
+        strategy = self.router.pick(scalp)
         sig = strategy.evaluate(src, context)
+
         # update status text
-        self.status_text = (
-            "Considering entering now" if sig.type in ("BUY", "SELL") else sig.reason
-        )
+        self.status_text = "Considering entering now" if sig.type in ("BUY", "SELL") else sig.reason
+
         # handle trade
         if sig.type in ("BUY", "SELL") and self.settings.get("auto_trade") and self.price is not None:
+            # Price reference from the series that produced the signal
+            if iC is None or iC < 0 or iC >= len(src):
+                return
             entry = src[iC]["close"]
+
             stopd = sig.stop_dist or (entry * 0.005)
             taked = sig.take_dist or (entry * 0.005)
-            risk_pct = (
-                self.profile.get("RISK_PCT_SCALP", 0.01)
-                if self.settings.get("scalp_mode")
-                else 0.003
-            )
+
+            risk_pct = self.profile.get("RISK_PCT_SCALP", 0.01) if scalp else 0.003
             risk_usd = self.broker.equity * risk_pct
+
             qty = max(0.0001, risk_usd / max(1.0, stopd))
-            notional_cap = self.broker.equity * (
-                self.profile.get("LEV_CAP", 8)
-                if self.settings.get("scalp_mode")
-                else 1
-            )
+            notional_cap = self.broker.equity * (self.profile.get("LEV_CAP", 8) if scalp else 1)
             qty = min(qty, max(0.0001, notional_cap / max(1.0, entry)))
+
             stop = (entry - stopd) if sig.type == "BUY" else (entry + stopd)
             take = (entry + taked) if sig.type == "BUY" else (entry - taked)
+
             # reverse if opposite side open
             if self.broker.pos:
                 ps = self.broker.pos.side
                 if (sig.type == "BUY" and ps == "short") or (sig.type == "SELL" and ps == "long"):
                     self.broker.close(entry)
+
             if not self.broker.pos:
                 self.broker.open(sig.type, entry, qty, stop, take, stopd, maker=True)
