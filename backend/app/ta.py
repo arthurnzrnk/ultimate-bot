@@ -1,25 +1,12 @@
 """Technical analysis utilities for the Ultimate Bot backend.
 
-This module implements basic indicators such as exponential moving averages
-(EMA), rolling moving averages (RMA), average true range (ATR), the average
-directional index (ADX) and Donchian channels. Keeping these calculations
-pure and dependency‑free makes the trading engine easier to test and
-maintain. Indicator functions operate on lists of numbers or dictionaries
-representing OHLC candles.
+This module implements EMA, RMA, ATR, ADX and Donchian channels. All
+indicator functions are dependency‑free and operate on lists of numbers
+or OHLC dictionaries.
 """
 
-# backend/app/ta.py
-"""Technical analysis utilities (canonical).
-
-All strategies import from here. Functions:
-- ema, rma
-- atr
-- adx
-- donchian -> returns {"hi": [...], "lo": [...]}
-- rsi
-"""
-
-from typing import List, Optional, Dict, Sequence
+from collections.abc import Sequence
+from typing import List, Optional, Dict, Any
 
 
 def ema(values: Sequence[float], period: int) -> List[Optional[float]]:
@@ -43,17 +30,16 @@ def rma(values: Sequence[float], period: int) -> List[Optional[float]]:
     out: List[Optional[float]] = [None] * n
     if n <= period:
         return out
-    seed = sum(values[1 : period + 1]) / float(period)
-    out[period] = seed
+    avg = sum(values[1 : period + 1]) / period
+    out[period] = avg
     a = 1.0 / period
-    e = seed
     for i in range(period + 1, n):
-        e = a * values[i] + (1.0 - a) * e
-        out[i] = e
+        avg = a * values[i] + (1.0 - a) * avg
+        out[i] = avg
     return out
 
 
-def atr(ohlc: List[dict], period: int = 14) -> List[Optional[float]]:
+def atr(ohlc: List[Dict[str, Any]], period: int = 14) -> List[Optional[float]]:
     n = len(ohlc)
     if n == 0:
         return []
@@ -68,10 +54,11 @@ def atr(ohlc: List[dict], period: int = 14) -> List[Optional[float]]:
             hc = abs(c["high"] - pc)
             lc = abs(c["low"] - pc)
             tr[i] = max(hl, hc, lc)
+    # Fill Nones with 0.0 before EMA
     return ema([t if t is not None else 0.0 for t in tr], period)
 
 
-def adx(ohlc: List[dict], period: int = 14) -> List[Optional[float]]:
+def adx(ohlc: List[Dict[str, Any]], period: int = 14) -> List[Optional[float]]:
     n = len(ohlc)
     if n < period + 2:
         return [None] * n
@@ -98,13 +85,13 @@ def adx(ohlc: List[dict], period: int = 14) -> List[Optional[float]]:
             continue
         plus_di[i] = 100.0 * (pdm_r[i] / atr_r[i])
         minus_di[i] = 100.0 * (mdm_r[i] / atr_r[i])
-        denom = (plus_di[i] or 0.0) + (minus_di[i] or 0.0)
+        denom = (plus_di[i] or 0) + (minus_di[i] or 0)
         if denom:
-            dx[i] = 100.0 * abs((plus_di[i] or 0.0) - (minus_di[i] or 0.0)) / denom
+            dx[i] = 100.0 * abs((plus_di[i] or 0) - (minus_di[i] or 0)) / denom
     return rma([d if d is not None else 0.0 for d in dx], period)
 
 
-def donchian(ohlc: List[dict], period: int = 20) -> Dict[str, List[Optional[float]]]:
+def donchian(ohlc: List[Dict[str, Any]], period: int = 20) -> Dict[str, List[Optional[float]]]:
     n = len(ohlc)
     hi: List[Optional[float]] = [None] * n
     lo: List[Optional[float]] = [None] * n
@@ -118,26 +105,3 @@ def donchian(ohlc: List[dict], period: int = 20) -> Dict[str, List[Optional[floa
         hi[i] = H
         lo[i] = L
     return {"hi": hi, "lo": lo}
-
-
-def rsi(closes: Sequence[float], period: int = 14) -> List[Optional[float]]:
-    n = len(closes)
-    if n < period + 1:
-        return [None] * n
-    gains = [0.0]
-    losses = [0.0]
-    for i in range(1, n):
-        ch = closes[i] - closes[i - 1]
-        gains.append(max(0.0, ch))
-        losses.append(max(0.0, -ch))
-    avg_gain = rma(gains, period)
-    avg_loss = rma(losses, period)
-    out: List[Optional[float]] = [None] * n
-    for i in range(n):
-        ag = avg_gain[i]
-        al = avg_loss[i]
-        if ag is None or al is None:
-            continue
-        rs = ag / al if al > 0 else float("inf")
-        out[i] = 100.0 - (100.0 / (1.0 + rs))
-    return out
