@@ -5,6 +5,11 @@ export async function getStatus() {
   return r.json()
 }
 
+export async function getLogs(limit: number = 200) {
+  const r = await fetch(`${API_BASE}/logs?limit=${limit}`)
+  return r.json()
+}
+
 export async function postSettings(body: any) {
   await fetch(`${API_BASE}/settings`, {
     method: 'POST',
