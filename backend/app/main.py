@@ -6,7 +6,7 @@ updating settings. When run with Uvicorn, the app will start the engine
 and begin paper trading.
 """
 
-from fastapi import FastAPI, Body
+from fastapi import FastAPI, Body, Query
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import math
@@ -72,6 +72,12 @@ def get_status() -> Status:
         pnlToday=_fmt(pnl_today, 2) or 0.0,
         unrealNet=_fmt(unreal, 2) or 0.0,
     )
+
+
+@app.get("/logs")
+def get_logs(limit: int = Query(200, ge=1, le=500)) -> dict:
+    """Return recent engine log lines (for the Status page)."""
+    return {"ok": True, "logs": engine.logs[-limit:]}
 
 
 @app.post("/settings")
