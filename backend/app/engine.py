@@ -45,6 +45,10 @@ class BotEngine:
         # UI/status
         self.status_text: str = "Loading..."
 
+        # --- NEW: in‑memory log buffer shown on the Status page ---
+        # Each item: {"ts": int (unix seconds), "text": str}
+        self.logs: list[dict[str, Any]] = []
+
         # Risk/profile knobs (read by strategies via context)
         self.profile: dict[str, Any] = {
             "ATR_PCT_MIN": 0.0004,
@@ -72,6 +76,14 @@ class BotEngine:
         self._cool_until: int = 0
         self._loss_streak: int = 0
 
+    # --- NEW: small helper to push messages into the status/log buffer ---
+    def _log(self, text: str, set_status: bool = True) -> None:
+        if set_status:
+            self.status_text = text
+        self.logs.append({"ts": int(time.time()), "text": text})
+        # keep only the last ~500 messages
+        self.logs = self.logs[-500:]
+
     async def start(self, client) -> None:
         """Begin polling and trading loop using the provided HTTP client."""
         self.client = client
@@ -82,6 +94,7 @@ class BotEngine:
         self.h1 = [c.model_dump() if hasattr(c, "model_dump") else dict(c) for c in h1_seed]
 
         self._rebuild_vwap()
+        self._log(f"Engine initialized. Seeded m1={len(self.m1)} bars, h1={len(self.h1)} bars.")
         asyncio.create_task(self._run())
 
     def _push_trade_to_m1(self, price: float, iso: str) -> None:
@@ -185,11 +198,15 @@ class BotEngine:
                     hit_take = (self.price >= p.take) if p.side == "long" else (self.price <= p.take)
                     if hit_stop or hit_take:
                         net = self.broker.close(p.take if hit_take else self.price)
+                        if hit_take:
+                            self._log(f"Closed on TAKE ({p.side}); PnL {net:+.2f}")
+                        else:
+                            self._log(f"Closed on STOP ({p.side}); PnL {net:+.2f}")
                         if net is not None and net < 0:
                             self._loss_streak += 1
                         if self._loss_streak >= 3:
                             self._cool_until = int(time.time()) + 1800
-                            self.status_text = "Cooling off after losses"
+                            self._log("Cooling off after losses (30 min).")
                             self._loss_streak = 0
 
                 # on closed bars trigger evaluations
@@ -201,6 +218,7 @@ class BotEngine:
                     await self._maybe_signal(tf="h1")
             except Exception as e:
                 self.status_text = f"Error loop: {e}"
+                self._log(f"Error in loop: {e}", set_status=False)
             await asyncio.sleep(1.0)
 
     async def _maybe_signal(self, tf: str) -> None:
@@ -259,7 +277,7 @@ class BotEngine:
         strategy = self.router.pick(scalp)
         sig = strategy.evaluate(src, context)
 
-        # update status text
+        # update status text for the dashboard
         self.status_text = "Considering entering now" if sig.type in ("BUY", "SELL") else sig.reason
 
         # handle trade
@@ -287,6 +305,11 @@ class BotEngine:
                 ps = self.broker.pos.side
                 if (sig.type == "BUY" and ps == "short") or (sig.type == "SELL" and ps == "long"):
                     self.broker.close(entry)
+                    self._log(f"Reversed position at {entry:.2f}")
 
             if not self.broker.pos:
                 self.broker.open(sig.type, entry, qty, stop, take, stopd, maker=True)
+                self._log(
+                    f"Open {sig.type} @ {entry:.2f} | qty={qty:.6f} stop={stop:.2f} take={take:.2f} score={sig.score}",
+                    set_status=False,
+                )
