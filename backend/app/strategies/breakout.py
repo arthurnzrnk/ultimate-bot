@@ -17,7 +17,8 @@ class Breakout(Strategy):
         ax  = adx(h1, 14)
 
         wnd  = a14[max(0, iC-30):iC] or []
-        if len(wnd) < 10: return Signal(type="WAIT", reason="ATR warmup")
+        if len(wnd) < 10:
+            return Signal(type="WAIT", reason="ATR warmup")
         med  = median([x for x in wnd if x is not None])
         squeeze = (a14[iC-1] or 0.0) <= ctx.get("squeeze_frac", 0.6) * med
 
