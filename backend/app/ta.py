@@ -8,21 +8,21 @@ maintain. Indicator functions operate on lists of numbers or dictionaries
 representing OHLC candles.
 """
 
-from collections.abc import Sequence
-from typing import List, Tuple, Optional
+# backend/app/ta.py
+"""Technical analysis utilities (canonical).
+
+All strategies import from here. Functions:
+- ema, rma
+- atr
+- adx
+- donchian -> returns {"hi": [...], "lo": [...]}
+- rsi
+"""
+
+from typing import List, Optional, Dict, Sequence
 
 
 def ema(values: Sequence[float], period: int) -> List[Optional[float]]:
-    """Compute an exponential moving average.
-
-    Args:
-        values: Sequence of numerical values.
-        period: The EMA period.
-
-    Returns:
-        A list of floats (or ``None`` for undefined entries) representing
-        the EMA for each element in the input sequence.
-    """
     if not values:
         return []
     k = 2.0 / (period + 1.0)
@@ -37,47 +37,23 @@ def ema(values: Sequence[float], period: int) -> List[Optional[float]]:
 
 
 def rma(values: Sequence[float], period: int) -> List[Optional[float]]:
-    """Compute a rolling moving average.
-
-    Unlike a simple moving average, the RMA uses an exponential weighting
-    scheme that is similar to EMA but with a different smoothing factor.
-
-    Args:
-        values: Sequence of numerical values.
-        period: The RMA period.
-
-    Returns:
-        A list of floats (or ``None``) representing the RMA for each
-        element. Values before the period index are ``None``.
-    """
     n = len(values)
     if n == 0 or period < 1:
         return []
     out: List[Optional[float]] = [None] * n
     if n <= period:
         return out
-    avg = sum(values[1: period + 1]) / period
-    out[period] = avg
+    seed = sum(values[1 : period + 1]) / float(period)
+    out[period] = seed
     a = 1.0 / period
+    e = seed
     for i in range(period + 1, n):
-        avg = a * values[i] + (1.0 - a) * avg
-        out[i] = avg
+        e = a * values[i] + (1.0 - a) * e
+        out[i] = e
     return out
 
 
 def atr(ohlc: List[dict], period: int = 14) -> List[Optional[float]]:
-    """Calculate the Average True Range.
-
-    ATR measures market volatility using high, low and close values. The
-    implementation here uses the EMA smoothing factor for the true range.
-
-    Args:
-        ohlc: List of candles with 'high', 'low', 'close'.
-        period: Lookback period for the ATR.
-
-    Returns:
-        A list of ATR values with the same length as ``ohlc``.
-    """
     n = len(ohlc)
     if n == 0:
         return []
@@ -96,19 +72,6 @@ def atr(ohlc: List[dict], period: int = 14) -> List[Optional[float]]:
 
 
 def adx(ohlc: List[dict], period: int = 14) -> List[Optional[float]]:
-    """Calculate the Average Directional Index (ADX).
-
-    ADX indicates trend strength, regardless of direction. Values below
-    20 often indicate a ranging market, while values above 25 suggest a
-    trending market.
-
-    Args:
-        ohlc: List of candles with 'high', 'low', and 'close' keys.
-        period: Lookback period for ADX.
-
-    Returns:
-        A list of ADX values corresponding to ``ohlc`` length.
-    """
     n = len(ohlc)
     if n < period + 2:
         return [None] * n
@@ -135,26 +98,13 @@ def adx(ohlc: List[dict], period: int = 14) -> List[Optional[float]]:
             continue
         plus_di[i] = 100.0 * (pdm_r[i] / atr_r[i])
         minus_di[i] = 100.0 * (mdm_r[i] / atr_r[i])
-        denom = (plus_di[i] or 0) + (minus_di[i] or 0)
+        denom = (plus_di[i] or 0.0) + (minus_di[i] or 0.0)
         if denom:
-            dx[i] = 100.0 * abs((plus_di[i] or 0) - (minus_di[i] or 0)) / denom
+            dx[i] = 100.0 * abs((plus_di[i] or 0.0) - (minus_di[i] or 0.0)) / denom
     return rma([d if d is not None else 0.0 for d in dx], period)
 
 
-def donchian(ohlc: List[dict], period: int = 100) -> Tuple[List[Optional[float]], List[Optional[float]]]:
-    """Compute Donchian channel high and low bands.
-
-    A Donchian channel defines the upper and lower boundaries of price
-    movement over a given period. The high band is the highest high, and
-    the low band is the lowest low over the lookback window.
-
-    Args:
-        ohlc: List of candles with 'high' and 'low' keys.
-        period: Number of bars to look back for band calculation.
-
-    Returns:
-        A tuple of two lists: the high band and the low band.
-    """
+def donchian(ohlc: List[dict], period: int = 20) -> Dict[str, List[Optional[float]]]:
     n = len(ohlc)
     hi: List[Optional[float]] = [None] * n
     lo: List[Optional[float]] = [None] * n
@@ -167,4 +117,27 @@ def donchian(ohlc: List[dict], period: int = 100) -> Tuple[List[Optional[float]]
             L = min(L, ohlc[j]["low"])
         hi[i] = H
         lo[i] = L
-    return hi, lo
+    return {"hi": hi, "lo": lo}
+
+
+def rsi(closes: Sequence[float], period: int = 14) -> List[Optional[float]]:
+    n = len(closes)
+    if n < period + 1:
+        return [None] * n
+    gains = [0.0]
+    losses = [0.0]
+    for i in range(1, n):
+        ch = closes[i] - closes[i - 1]
+        gains.append(max(0.0, ch))
+        losses.append(max(0.0, -ch))
+    avg_gain = rma(gains, period)
+    avg_loss = rma(losses, period)
+    out: List[Optional[float]] = [None] * n
+    for i in range(n):
+        ag = avg_gain[i]
+        al = avg_loss[i]
+        if ag is None or al is None:
+            continue
+        rs = ag / al if al > 0 else float("inf")
+        out[i] = 100.0 - (100.0 / (1.0 + rs))
+    return out
