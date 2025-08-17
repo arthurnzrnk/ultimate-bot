@@ -1,32 +1,34 @@
+# backend/app/strategies/trend_follow.py
 from .base import Strategy, Signal
 from ..ta import ema, atr, adx, donchian
 
 class TrendFollow(Strategy):
-    """Donchian breakout in direction of EMA200 bias; ATR stop/trail."""
+    """Donchian breakout in direction of EMA200 bias; ATR stop/take."""
     name = "Trend‑Following"
 
-    def evaluate(self, h1: list[dict], ctx: dict) -> Signal:
-        iC = ctx.get("iC_h1")
-        if iC is None or iC < ctx.get("min_h1_bars", 220):
-            return Signal(type="WAIT", reason="Need H1 history")
+    def evaluate(self, ohlc: list[dict], ctx: dict) -> Signal:
+        iC = ctx.get("iC")
+        # Need >=200 bars for EMA200 + a buffer
+        if iC is None or iC < ctx.get("min_bars", 220):
+            return Signal(type="WAIT", reason="Need history")
 
-        closes = [c["close"] for c in h1]
+        closes = [c["close"] for c in ohlc]
         ema200 = ema(closes, 200)
-        a14    = atr(h1, 14)
-        ax     = adx(h1, 14)
-        dc     = donchian(h1, ctx.get("donchian_len", 20))
+        a14    = atr(ohlc, 14)
+        ax     = adx(ohlc, 14)
+        dc     = donchian(ohlc, ctx.get("donchian_len", 20))
 
-        px     = h1[iC]["close"]
-        emaUp  = ema200[iC] and ema200[iC] > ema200[max(0, iC-5)]
-        emaDn  = ema200[iC] and ema200[iC] < ema200[max(0, iC-5)]
+        px     = ohlc[iC]["close"]
+        emaUp  = bool(ema200[iC] and ema200[iC] > ema200[max(0, iC - 5)])
+        emaDn  = bool(ema200[iC] and ema200[iC] < ema200[max(0, iC - 5)])
         adxOK  = (ax[iC] or 0.0) >= ctx.get("adx_trend_min", 25)
         stop   = (a14[iC] or 0.0) * ctx.get("trend_stop_atr", 2.0)
         take   = (a14[iC] or 0.0) * ctx.get("trend_take_atr", 1.5)
 
-        hi_prev = dc["hi"][max(0, iC-1)]
-        lo_prev = dc["lo"][max(0, iC-1)]
-        bkUp = (px > hi_prev) if hi_prev is not None else False
-        bkDn = (px < lo_prev) if lo_prev is not None else False
+        hi_prev = dc["hi"][iC - 1] if iC > 0 else None
+        lo_prev = dc["lo"][iC - 1] if iC > 0 else None
+        bkUp = bool(hi_prev is not None and px > hi_prev)
+        bkDn = bool(lo_prev is not None and px < lo_prev)
 
         if not adxOK:
             return Signal(type="WAIT", reason="Trend weak (ADX)")
