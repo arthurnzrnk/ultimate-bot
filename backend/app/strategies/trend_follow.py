@@ -1,48 +1,41 @@
-"""Simple trend-following strategy for higher timeframes.
-
-This strategy operates on one‑hour candles and looks for Donchian channel
-breakouts in the direction of the 200‑period EMA. When ADX is above 25,
-a new 100‑period high or low will trigger a buy or sell signal. The stop and
-take profit distances are multiples of ATR, similar to the classic Turtle
-trading system.
-"""
-
 from .base import Strategy, Signal
 from ..ta import ema, atr, adx, donchian
 
-
 class TrendFollow(Strategy):
-    """H1 trend-following breakout strategy."""
-
-    name = "Trend Follow (H1)"
+    """Donchian breakout in direction of EMA200 bias; ATR stop/trail."""
+    name = "Trend‑Following"
 
     def evaluate(self, h1: list[dict], ctx: dict) -> Signal:
-        iC = ctx.get("iC")
-        if iC is None or iC < ctx.get("min_bars_h1", 0):
-            return Signal(type="WAIT", reason="Need history")
-        if not ctx.get("daily_ok", True):
-            return Signal(type="WAIT", reason="Daily cap")
-        if not ctx.get("cooldown_ok", True):
-            return Signal(type="WAIT", reason="Pause after recent trade")
+        iC = ctx.get("iC_h1")
+        if iC is None or iC < ctx.get("min_h1_bars", 220):
+            return Signal(type="WAIT", reason="Need H1 history")
 
         closes = [c["close"] for c in h1]
         ema200 = ema(closes, 200)
-        a14 = atr(h1, 14)
-        hi, lo = donchian(h1, 100)
-        ax = adx(h1, 14)
-        ema_up = (ema200[iC] or 0) > (ema200[iC - 10] or 0)
-        ema_dn = (ema200[iC] or 0) < (ema200[iC - 10] or 0)
-        px = closes[iC]
-        bk_up = px > (hi[iC - 1] or 0)
-        bk_dn = px < (lo[iC - 1] or float("inf"))
-        adx_ok = (ax[iC] or 0) > 25.0
-        stop = 1.0 * (a14[iC] or 0)
-        take = 1.5 * (a14[iC] or 0)
-        fee_r = (2 * ctx.get("fee_taker", 0.0002) * px) / max(1.0, stop)
-        if fee_r > 0.15 or not adx_ok:
-            return Signal(type="WAIT", reason="ADX low" if not adx_ok else "Fees>limitR")
-        if ema_up and bk_up:
-            return Signal(type="BUY", reason="Donchian100 up + EMA200 up", stop_dist=stop, take_dist=take, score=4)
-        if ema_dn and bk_dn:
-            return Signal(type="SELL", reason="Donchian100 down + EMA200 down", stop_dist=stop, take_dist=take, score=4)
+        a14    = atr(h1, 14)
+        ax     = adx(h1, 14)
+        dc     = donchian(h1, ctx.get("donchian_len", 20))
+
+        px     = h1[iC]["close"]
+        emaUp  = ema200[iC] and ema200[iC] > ema200[max(0, iC-5)]
+        emaDn  = ema200[iC] and ema200[iC] < ema200[max(0, iC-5)]
+        adxOK  = (ax[iC] or 0.0) >= ctx.get("adx_trend_min", 25)
+        stop   = (a14[iC] or 0.0) * ctx.get("trend_stop_atr", 2.0)
+        take   = (a14[iC] or 0.0) * ctx.get("trend_take_atr", 1.5)
+
+        hi_prev = dc["hi"][max(0, iC-1)]
+        lo_prev = dc["lo"][max(0, iC-1)]
+        bkUp = (px > hi_prev) if hi_prev is not None else False
+        bkDn = (px < lo_prev) if lo_prev is not None else False
+
+        if not adxOK:
+            return Signal(type="WAIT", reason="Trend weak (ADX)")
+
+        if emaUp and bkUp:
+            return Signal(type="BUY", reason="Donchian break + EMA200 up",
+                          stop_dist=stop, take_dist=take, score=5)
+        if emaDn and bkDn:
+            return Signal(type="SELL", reason="Donchian break + EMA200 down",
+                          stop_dist=stop, take_dist=take, score=5)
+
         return Signal(type="WAIT", reason="Waiting Donchian break")
