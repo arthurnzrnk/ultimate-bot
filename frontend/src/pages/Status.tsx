@@ -1,40 +1,80 @@
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
+import { getLogs } from '../api'
 
-/**
- * Status Page
- *
- * This page is intended to display verbose reasoning and status logs from the
- * backend trading bot. Currently it's a simple placeholder that will
- * eventually subscribe to a stream of status updates once that API is
- * implemented. Keeping a dedicated page for the bot's thinking process
- * separates long-form status text from the main dashboard, preventing it from
- * cluttering the UI. In a future iteration this component could poll an
- * endpoint or listen to a WebSocket and render a list of log messages or
- * notifications explaining the bot's decisions.
- */
+type LogLine = { ts: number; text: string }
+
 export default function Status() {
-  const [logs, setLogs] = useState<string[]>([])
+  const [logs, setLogs] = useState<LogLine[]>([])
+  const [loading, setLoading] = useState(true)
+  const boxRef = useRef<HTMLDivElement | null>(null)
 
-  // Placeholder effect: this could be replaced with real polling or SSE once
-  // implemented on the server. For now it simply sets an empty array.
+  // Auto-scroll to bottom when new logs arrive (if already near bottom)
   useEffect(() => {
-    setLogs([])
+    const el = boxRef.current
+    if (!el) return
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+    if (nearBottom) {
+      el.scrollTop = el.scrollHeight
+    }
+  }, [logs])
+
+  useEffect(() => {
+    let alive = true
+
+    const fetchLogs = async () => {
+      try {
+        const data = await getLogs(300)
+        if (!alive) return
+        setLogs(data.logs || [])
+      } catch (err) {
+        console.error(err)
+      } finally {
+        if (alive) setLoading(false)
+      }
+    }
+
+    fetchLogs()
+    const id = setInterval(fetchLogs, 2000)
+    return () => {
+      alive = false
+      clearInterval(id)
+    }
   }, [])
 
   return (
     <div className="glass" style={{ padding: 12 }}>
       <h2 style={{ fontWeight: 600, marginBottom: 8 }}>Bot Status Feed</h2>
-      {logs.length === 0 ? (
+
+      {loading && logs.length === 0 ? (
+        <p style={{ opacity: 0.8, fontSize: 14 }}>Loading logs…</p>
+      ) : logs.length === 0 ? (
         <p style={{ opacity: 0.8, fontSize: 14 }}>
-          Status feed (explanations) will appear here when the backend exposes
-          detailed reasoning. Check back later.
+          No logs yet. Once the engine opens/closes trades or enters cool‑off,
+          messages will show up here.
         </p>
       ) : (
-        <ul style={{ listStyleType: 'none', paddingLeft: 0 }}>
-          {logs.map((line, idx) => (
-            <li key={idx} style={{ marginBottom: 4, fontSize: 14 }}>{line}</li>
-          ))}
-        </ul>
+        <div
+          ref={boxRef}
+          style={{
+            maxHeight: 420,
+            overflow: 'auto',
+            padding: 8,
+            borderRadius: 12,
+            background: 'rgba(0,0,0,0.25)',
+            border: '1px solid rgba(255,255,255,0.12)',
+          }}
+        >
+          <ul style={{ listStyleType: 'none', paddingLeft: 0, margin: 0 }}>
+            {logs.map((l, idx) => (
+              <li key={idx} style={{ marginBottom: 6, fontSize: 14 }}>
+                <span style={{ opacity: 0.7, marginRight: 8 }}>
+                  {new Date(l.ts * 1000).toLocaleTimeString()}
+                </span>
+                <span>{l.text}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
       )}
     </div>
   )
