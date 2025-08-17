@@ -1,0 +1,78 @@
+:root {
+  color-scheme: dark;
+}
+html, body, #root {
+  height: 100%;
+}
+body {
+  margin: 0;
+  font-family: ui-sans-serif, system-ui, Segoe UI, Roboto, Ubuntu, 'Helvetica Neue', Arial;
+}
+.bg {
+  position: fixed;
+  inset: 0;
+  background: #0a0f1a;
+}
+.glow {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 60vw;
+  height: 60vw;
+  border-radius: 9999px;
+  filter: blur(60px);
+  opacity: 0.35;
+  background: linear-gradient(135deg, #fbbf24, #f59e0b, #ef4444);
+}
+.glass {
+  position: relative;
+  border-radius: 22px;
+  background: rgba(220, 228, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  box-shadow: inset 1px 1px 0 rgba(255, 255, 255, 0.10), inset -1px -1px 0 rgba(10, 15, 25, 0.32), 0 12px 30px rgba(6, 10, 20, 0.30);
+  backdrop-filter: blur(22px) saturate(170%);
+}
+.chip {
+  display: inline-flex;
+  gap: 0.4rem;
+  align-items: center;
+  padding: 0.35rem 0.6rem;
+  border-radius: 9999px;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.28);
+}
+.chip.green {
+  background: rgba(125, 211, 252, 0.20);
+  border-color: rgba(125, 211, 252, 0.45);
+}
+.chip.red {
+  background: rgba(244, 63, 94, 0.18);
+  border-color: rgba(244, 63, 94, 0.35);
+}
+.btn {
+  cursor: pointer;
+  border: none;
+  border-radius: 12px;
+  padding: 0.6rem 1rem;
+  background: #111827;
+  color: #e5e7eb;
+}
+.btn:hover {
+  background: #1f2937;
+}
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+.table th, .table td {
+  padding: 0.35rem 0.5rem;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+.price-up {
+  color: #86efac;
+}
+.price-down {
+  color: #fca5a5;
+}
