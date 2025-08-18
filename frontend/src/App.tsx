@@ -14,7 +14,7 @@ export default function App({ children }: Props) {
         <div style={{ fontWeight: 700 }}>Ultimate Bot</div>
         <nav style={{ display: 'flex', gap: 12 }}>
           <Link to="/" className="chip" style={{ borderColor: loc.pathname === '/' ? '#7dd3fc' : '' }}>UI</Link>
-          <Link to="/status" className="chip" style={{ borderColor: loc.pathname === '/status' ? '#7dd3fc' : '' }}>Status</Link>
+          {/* Logs now live on the Dashboard, so we remove the separate Status route */}
           <Link to="/apikeys" className="chip" style={{ borderColor: loc.pathname === '/apikeys' ? '#7dd3fc' : '' }}>API</Link>
           <Link to="/learning" className="chip" style={{ borderColor: loc.pathname === '/learning' ? '#7dd3fc' : '' }}>Learning</Link>
         </nav>
