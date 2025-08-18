@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 from typing import Literal, Optional, List
 
 Side = Literal["long", "short"]
+ProfileMode = Literal["LIGHT", "HEAVY", "AUTO"]
 
 
 class Candle(BaseModel):
@@ -28,6 +29,13 @@ class Position(BaseModel):
     lo: float
     be: bool = False  # breakeven flag
 
+    # V2 additions
+    tf: Literal["m1", "h1"] = "m1"            # which timeframe strategy opened this
+    profile: Literal["LIGHT", "HEAVY"] = "LIGHT"
+    partial_taken: bool = False               # scalper partial at +0.5R taken?
+    # Optional scratch (HEAVY scalper): if +0.25R not hit within 5 min → move stop to BE
+    scratch_after_sec: int = 300
+
 
 class Trade(BaseModel):
     side: Side
@@ -39,10 +47,14 @@ class Trade(BaseModel):
 
 
 class Settings(BaseModel):
+    # kept for compatibility; hidden in UI now
     scalp_mode: bool = True
     auto_trade: bool = True
-    strategy: str = "Level King — Regime"
+    strategy: str = "Adaptive Router"
     macro_pause: bool = False
+
+    # V2: profile picker
+    profile_mode: ProfileMode = "AUTO"
 
 
 class Status(BaseModel):
@@ -55,19 +67,23 @@ class Status(BaseModel):
     history: List[Trade] = Field(default_factory=list)
     candles: List[Candle] = Field(default_factory=list)
 
-    # UI flags
+    # UI flags (legacy, still emitted; UI ignores toggles)
     scalpMode: bool = True
     autoTrade: bool = True
 
     # Strategy labels
-    strategy: str = "Level King — Regime"           # overall (from settings)
-    activeStrategy: Optional[str] = None            # router-selected sub-strategy
+    strategy: str = "Adaptive Router"          # overall (from settings)
+    activeStrategy: Optional[str] = None       # router-selected sub-strategy
 
     # Telemetry for explanations
-    regime: Optional[str] = None                    # Range | Trending | Breakout
-    bias: Optional[str] = None                      # Bullish | Bearish
+    regime: Optional[str] = None               # Range | Trending | Breakout
+    bias: Optional[str] = None                 # Bullish | Bearish
     adx: Optional[float] = None
-    atrPct: Optional[float] = None                  # e.g., 0.0043 (0.43%)
+    atrPct: Optional[float] = None             # e.g., 0.0043 (0.43%)
     fillsToday: int = 0
     pnlToday: float = 0.0
     unrealNet: float = 0.0
+
+    # V2 profile telemetry
+    profileMode: ProfileMode = "AUTO"          # user setting (AUTO/LIGHT/HEAVY)
+    profileModeActive: Literal["LIGHT", "HEAVY"] = "LIGHT"
