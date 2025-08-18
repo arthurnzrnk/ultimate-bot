@@ -1,11 +1,4 @@
-"""Core trading engine for the Ultimate Bot.
-
-The engine runs continuously, polling market data, updating candles,
-evaluating the unified adaptive strategy ("Adaptive Router") and
-executing trades via the ``PaperBroker``. It exposes methods to start
-the loop and to handle bar‑close logic for both scalping and higher TF
-modes. The router auto‑selects the sub‑strategy based on regime.
-"""
+"""Core trading engine for the Ultimate Bot (with regime status, vol overlay, trailing stops)."""
 
 from __future__ import annotations
 
@@ -56,7 +49,7 @@ class BotEngine:
             "SPREAD_BPS_MAX": 10,
             "TP_FLOOR": 0.0020,
             "FEE_R_MAX": 0.25,
-            "RISK_PCT_SCALP": 0.010,
+            "RISK_PCT_SCALP": 0.010,  # base risk per trade (scalp)
             "LEV_CAP": 8,
         }
 
@@ -86,7 +79,7 @@ class BotEngine:
         self.client = client
         m1_seed, h1_seed = await seed_klines(client)
 
-        # Convert Candle models -> dicts so we can use dict-style access everywhere
+        # Convert Candle models -> dicts
         self.m1 = [c.model_dump() if hasattr(c, "model_dump") else dict(c) for c in m1_seed]
         self.h1 = [c.model_dump() if hasattr(c, "model_dump") else dict(c) for c in h1_seed]
 
@@ -104,16 +97,7 @@ class BotEngine:
         bucket = (t_ms // 60000) * 60000
         t = bucket // 1000
         if not self.m1 or self.m1[-1]["time"] != t:
-            self.m1.append(
-                {
-                    "time": t,
-                    "open": price,
-                    "high": price,
-                    "low": price,
-                    "close": price,
-                    "volume": 0.0,
-                }
-            )
+            self.m1.append({"time": t, "open": price, "high": price, "low": price, "close": price, "volume": 0.0})
             self.m1 = self.m1[-3000:]
         else:
             c = self.m1[-1]
@@ -187,10 +171,30 @@ class BotEngine:
                     self._rebuild_vwap()
                     self._aggregate_h1()
 
-                # mark to market every second
+                # mark to market every second + trailing/BE logic
                 if self.broker.pos and self.price is not None:
                     _ = self.broker.mark(self.price)
                     p = self.broker.pos
+
+                    # --- Simple trailing & breakeven ---
+                    if p.side == "long":
+                        # move to BE after +1R
+                        if (self.price >= p.entry + p.stop_dist) and not p.be:
+                            p.stop = p.entry
+                            p.be = True
+                        # trail stop 1R behind current price
+                        new_stop = self.price - p.stop_dist
+                        if new_stop > p.stop:
+                            p.stop = new_stop
+                    else:  # short
+                        if (self.price <= p.entry - p.stop_dist) and not p.be:
+                            p.stop = p.entry
+                            p.be = True
+                        new_stop = self.price + p.stop_dist
+                        if new_stop < p.stop:
+                            p.stop = new_stop
+
+                    # close on stop/take
                     hit_stop = (self.price <= p.stop) if p.side == "long" else (self.price >= p.stop)
                     hit_take = (self.price >= p.take) if p.side == "long" else (self.price <= p.take)
                     if hit_stop or hit_take:
@@ -199,7 +203,7 @@ class BotEngine:
                             self._log(f"Closed on TAKE ({p.side}); PnL {net:+.2f}")
                         else:
                             self._log(f"Closed on STOP ({p.side}); PnL {net:+.2f}")
-                        # --- NEW: reset loss streak on win, increment on loss ---
+                        # reset/increment loss streak
                         if net is not None and net > 0:
                             self._loss_streak = 0
                         elif net is not None and net < 0:
@@ -242,7 +246,7 @@ class BotEngine:
         src = self.m1 if scalp else self.h1
         iC = (len(src) - 2) if len(src) >= 2 else None
 
-        # Also compute H1 index so Breakout/Trend can run even if scalp_mode=True
+        # Also compute H1/M1 indexes for strategies
         iC_h1 = (len(self.h1) - 2) if len(self.h1) >= 2 else None
         iC_m1 = (len(self.m1) - 2) if len(self.m1) >= 2 else None
 
@@ -264,25 +268,29 @@ class BotEngine:
             # series and indexes for both TFs
             "m1": self.m1,
             "h1": self.h1,
-            "iC": iC,            # index for the series passed to router.evaluate(...)
-            "iC_m1": iC_m1,      # explicit m1 index
-            "iC_h1": iC_h1,      # explicit h1 index
+            "iC": iC,
+            "iC_m1": iC_m1,
+            "iC_h1": iC_h1,
 
-            # warmup minimums used by strategies
+            # warmups
             "min_bars": 5,
-            "min_h1_bars": 240,  # satisfies Breakout/Trend warmups
+            "min_h1_bars": 240,
         }
 
         # Let the router decide and return a Signal
-        strategy = self.router.pick(scalp)
-        sig = strategy.evaluate(src, context)
+        strategy_router = self.router.pick(scalp)
+        sig = strategy_router.evaluate(src, context)
 
-        # update status text for the dashboard
-        self.status_text = "Considering entering now" if sig.type in ("BUY", "SELL") else sig.reason
+        # status line with regime + strategy + reason
+        adx_val = strategy_router.last_adx
+        atr_pct = strategy_router.last_atr_pct
+        reg = strategy_router.last_regime or "—"
+        bias = strategy_router.last_bias or "—"
+        active = strategy_router.last_strategy or "—"
+        self.status_text = f"Regime: {reg} (ADX={adx_val:.0f} | ATR%={(atr_pct or 0.0)*100:.2f}) | Bias: {bias} | Strat: {active} | {sig.reason}"
 
         # handle trade
         if sig.type in ("BUY", "SELL") and self.settings.get("auto_trade") and self.price is not None:
-            # Price reference from the series that produced the signal
             if iC is None or iC < 0 or iC >= len(src):
                 return
             entry = src[iC]["close"]
@@ -290,10 +298,18 @@ class BotEngine:
             stopd = sig.stop_dist or (entry * 0.005)
             taked = sig.take_dist or (entry * 0.005)
 
-            risk_pct = self.profile.get("RISK_PCT_SCALP", 0.01) if scalp else 0.003
-            risk_usd = self.broker.equity * risk_pct
+            # --- Volatility overlay: reduce risk as ATR% rises within allowed band ---
+            base_risk = self.profile.get("RISK_PCT_SCALP", 0.01) if scalp else 0.003
+            atr_min = self.profile.get("ATR_PCT_MIN", 0.0004)
+            atr_max = self.profile.get("ATR_PCT_MAX", 0.0200)
+            ap = max(atr_min, min(atr_max, atr_pct or atr_min))
+            norm = (ap - atr_min) / max(1e-8, (atr_max - atr_min))  # 0..1
+            risk_mult = 1.0 - 0.5 * norm  # high vol => ~0.5x; low vol => 1.0x
+            risk_pct = base_risk * risk_mult
 
+            risk_usd = self.broker.equity * risk_pct
             qty = max(0.0001, risk_usd / max(1.0, stopd))
+
             notional_cap = self.broker.equity * (self.profile.get("LEV_CAP", 8) if scalp else 1)
             qty = min(qty, max(0.0001, notional_cap / max(1.0, entry)))
 
