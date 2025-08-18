@@ -282,19 +282,19 @@ class BotEngine:
         sig = strategy_router.evaluate(src, context)
 
         # status line with regime + strategy + reason (safe formatting for warmup)
-adx_val = strategy_router.last_adx
-atr_pct = strategy_router.last_atr_pct
-reg = strategy_router.last_regime or "—"
-bias = strategy_router.last_bias or "—"
-active = strategy_router.last_strategy or "—"
+        adx_val = strategy_router.last_adx
+        atr_pct = strategy_router.last_atr_pct
+        reg = strategy_router.last_regime or "—"
+        bias = strategy_router.last_bias or "—"
+        active = strategy_router.last_strategy or "—"
 
-adx_str = f"{adx_val:.0f}" if isinstance(adx_val, (int, float)) else "—"
-atr_str = f"{((atr_pct or 0.0) * 100):.2f}%"
+        adx_str = f"{adx_val:.0f}" if isinstance(adx_val, (int, float)) else "—"
+        atr_str = f"{((atr_pct or 0.0) * 100):.2f}%"
 
-self.status_text = (
-    f"Regime: {reg} (ADX={adx_str} | ATR%={atr_str}) | "
-    f"Bias: {bias} | Strat: {active} | {sig.reason}"
-)
+        self.status_text = (
+            f"Regime: {reg} (ADX={adx_str} | ATR%={atr_str}) | "
+            f"Bias: {bias} | Strat: {active} | {sig.reason}"
+        )
 
         # handle trade
         if sig.type in ("BUY", "SELL") and self.settings.get("auto_trade") and self.price is not None:
