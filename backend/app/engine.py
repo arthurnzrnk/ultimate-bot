@@ -348,7 +348,15 @@ class BotEngine:
                         if not p.partial_taken:
                             hit_half = (self.price >= p.entry + 0.5 * R) if p.side == "long" else (self.price <= p.entry - 0.5 * R)
                             if hit_half:
-                                frac = 0.60 if p.profile == "HEAVY" else 0.50
+                                # Use per-profile partial fraction *at entry time*, with safety clamp
+                                frac_default = 0.60 if p.profile == "HEAVY" else 0.50
+                                prof_conf = self._PROFILES.get(p.profile, {})
+                                frac_conf = prof_conf.get("SCALP_PARTIAL_FRAC", frac_default)
+                                try:
+                                    frac = float(frac_conf)
+                                except Exception:
+                                    frac = frac_default
+                                frac = max(0.05, min(0.90, frac))
                                 self.broker.partial_close(frac, self.price)
                                 if self.broker.pos:  # remaining
                                     self.broker.pos.stop = self.broker.pos.entry
@@ -493,7 +501,7 @@ class BotEngine:
             # data
             "vwap": self.vwap,
             "bid": self.bid,
-            "ask": self.ask,
+            "ask": self.ask",
 
             # series and indexes
             "m1": self.m1,
