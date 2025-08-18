@@ -3,7 +3,7 @@ from .base import Strategy, Signal
 from ..ta import atr, donchian, adx
 
 class Breakout(Strategy):
-    """Volatility squeeze → expansion breakout with tight initial risk."""
+    """Volatility squeeze → expansion breakout with profile volume gate."""
     name = "Breakout"
 
     def evaluate(self, h1: list[dict], ctx: dict) -> Signal:
@@ -34,8 +34,16 @@ class Breakout(Strategy):
         bkUp = (px > hi_prev) if hi_prev is not None else False
         bkDn = (px < lo_prev) if lo_prev is not None else False
 
+        # Profile volume gate on the breakout candle
+        v_win = [c.get("volume", 0.0) for c in h1[max(0, iC-20):iC]]
+        v_med = median(v_win) if v_win else 0.0
+        vol_mult = float(ctx.get("breakout_vol_mult", 1.2))
+        vol_ok = (h1[iC].get("volume", 0.0) >= vol_mult * v_med) if v_med > 0 else True
+
         if not (squeeze and expand):
             return Signal(type="WAIT", reason="No squeeze→expand")
+        if not vol_ok:
+            return Signal(type="WAIT", reason="Breakout vol gate")
 
         stop_pad = ctx.get("bo_stop_pad_frac", 0.30)
         if bkUp:
