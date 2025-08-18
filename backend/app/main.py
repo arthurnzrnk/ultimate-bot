@@ -1,10 +1,4 @@
-"""API entry point for the Ultimate Bot backend.
-
-This module configures the FastAPI application, including CORS middleware,
-instantiates the ``BotEngine`` and defines routes for fetching status and
-updating settings. When run with Uvicorn, the app will start the engine
-and begin paper trading.
-"""
+"""API entry point for the Ultimate Bot backend."""
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Body, Query
@@ -20,7 +14,6 @@ engine = BotEngine()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Create and tear down shared resources cleanly."""
     client = httpx.AsyncClient()
     await engine.start(client)
     try:
@@ -43,23 +36,25 @@ if settings.cors_origins:
     )
 
 def _fmt(n: float | None, d: int = 2):
-    """Helper to format floats for the API response."""
     if n is None or (isinstance(n, float) and (math.isnan(n) or math.isinf(n))):
         return None
     return round(n, d)
 
 @app.get("/status", response_model=Status)
 def get_status() -> Status:
-    """Return a snapshot of the current engine state."""
     pos = engine.broker.pos
     unreal = engine.broker.mark(engine.price) if engine.price else 0.0
     sod = int((int(time.time()) // 86400) * 86400)
-    pnl_today = sum(
-        [t.pnl for t in engine.broker.history if (t.close_time or t.open_time) >= sod]
-    )
-    fills_today = sum(
-        1 for t in engine.broker.history if (t.close_time or t.open_time) >= sod
-    ) + (1 if pos else 0)
+    pnl_today = sum([t.pnl for t in engine.broker.history if (t.close_time or t.open_time) >= sod])
+    fills_today = sum(1 for t in engine.broker.history if (t.close_time or t.open_time) >= sod) + (1 if pos else 0)
+
+    # Telemetry from router (may be None during warmup)
+    reg = engine.router.last_regime
+    bias = engine.router.last_bias
+    adx = engine.router.last_adx
+    atr = engine.router.last_atr_pct
+    active = engine.router.last_strategy
+
     return Status(
         price=_fmt(engine.price, 2),
         bid=_fmt(engine.bid, 2),
@@ -71,7 +66,12 @@ def get_status() -> Status:
         candles=[c for c in engine.m1[-150:]],
         scalpMode=engine.settings.get("scalp_mode", True),
         autoTrade=engine.settings.get("auto_trade", True),
-        strategy=engine.settings.get("strategy", "Level King — Regime"),
+        strategy=engine.settings.get("strategy", "Adaptive Router"),
+        activeStrategy=active,
+        regime=reg,
+        bias=bias,
+        adx=_fmt(adx, 0),
+        atrPct=_fmt(atr, 4),
         fillsToday=fills_today,
         pnlToday=_fmt(pnl_today, 2) or 0.0,
         unrealNet=_fmt(unreal, 2) or 0.0,
@@ -79,12 +79,10 @@ def get_status() -> Status:
 
 @app.get("/logs")
 def get_logs(limit: int = Query(200, ge=1, le=500)) -> dict:
-    """Return recent engine log lines (for the Status page)."""
     return {"ok": True, "logs": engine.logs[-limit:]}
 
 @app.post("/settings")
 def update_settings(payload: dict = Body(...)) -> dict:
-    """Update engine settings from the frontend."""
     if "scalpMode" in payload:
         engine.settings["scalp_mode"] = bool(payload["scalpMode"])
     if "autoTrade" in payload:
@@ -95,23 +93,18 @@ def update_settings(payload: dict = Body(...)) -> dict:
 
 @app.post("/start")
 def start_bot() -> dict:
-    """Activate auto trading."""
     engine.settings["auto_trade"] = True
     return {"ok": True}
 
 @app.post("/stop")
 def stop_bot() -> dict:
-    """Deactivate auto trading."""
     engine.settings["auto_trade"] = False
     return {"ok": True}
 
 @app.post("/apikeys")
 def save_api_keys(payload: dict = Body(...)) -> dict:
-    """Placeholder for saving user API keys securely."""
-    # Real implementation would securely store API keys. We do not expose them.
     return {"ok": True}
 
 @app.get("/health")
 def health() -> dict:
-    """Simple health check endpoint."""
     return {"ok": True, "status": engine.status_text}
