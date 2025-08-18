@@ -1,12 +1,14 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { getStatus, postSettings } from '../api'
 
+type ProfileMode = 'LIGHT' | 'HEAVY' | 'AUTO'
+
 export default function Dashboard() {
   const [data, setData] = useState<any>({
     history: [],
     candles: [],
-    scalpMode: true,
-    autoTrade: true,
+    profileMode: 'AUTO',
+    profileModeActive: 'LIGHT',
     strategy: 'Adaptive Router',
   })
   const [dir, setDir] = useState<'up' | 'down' | null>(null)
@@ -36,13 +38,9 @@ export default function Dashboard() {
   const px = data?.price ?? null
   const headerClass = dir === 'up' ? 'price-up' : dir === 'down' ? 'price-down' : ''
 
-  async function toggleScalp() {
-    await postSettings({ scalpMode: !data.scalpMode })
-    setData((d: any) => ({ ...d, scalpMode: !d.scalpMode }))
-  }
-  async function toggleAuto() {
-    await postSettings({ autoTrade: !data.autoTrade })
-    setData((d: any) => ({ ...d, autoTrade: !d.autoTrade }))
+  async function setProfile(mode: ProfileMode) {
+    await postSettings({ profileMode: mode })
+    setData((d: any) => ({ ...d, profileMode: mode }))
   }
 
   return (
@@ -55,7 +53,7 @@ export default function Dashboard() {
           </div>
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
-          <span className={`chip ${data.scalpMode ? 'green' : ''}`}>{data.scalpMode ? '1m' : '1h'}</span>
+          <span className={`chip green`}>Profile: {data.profileModeActive ?? '—'}</span>
           <span className={`chip ${data.price ? 'green' : 'red'}`}>{data.price ? 'NET: LIVE' : 'NET: STALE'}</span>
         </div>
       </div>
@@ -74,6 +72,19 @@ export default function Dashboard() {
         </div>
       </div>
 
+      {/* Only 3 pickers remain: Light / Heavy / Auto */}
+      <div className="glass" style={{ padding: 12, marginTop: 12 }}>
+        <div style={{ fontWeight: 600, marginBottom: 8 }}>Profile Mode</div>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          <button className="chip" style={{ borderColor: data.profileMode === 'LIGHT' ? '#7dd3fc' : undefined }} onClick={() => setProfile('LIGHT')}>Light Mode</button>
+          <button className="chip" style={{ borderColor: data.profileMode === 'HEAVY' ? '#7dd3fc' : undefined }} onClick={() => setProfile('HEAVY')}>Heavy Mode</button>
+          <button className="chip" style={{ borderColor: data.profileMode === 'AUTO' ? '#7dd3fc' : undefined }} onClick={() => setProfile('AUTO')}>Auto Mode</button>
+        </div>
+        <div style={{ opacity: 0.8, fontSize: 12, marginTop: 8 }}>
+          Active today: <b>{data.profileModeActive}</b> {data.profileMode === 'AUTO' ? '(AUTO picks this based on safety triggers)' : '(Locked)'}
+        </div>
+      </div>
+
       <div style={{ display: 'grid', gridTemplateColumns: '1.2fr 1.8fr', gap: 12, marginTop: 12 }}>
         <div className="glass" style={{ padding: 12 }}>
           <div style={{ marginTop: 12, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
@@ -87,10 +98,6 @@ export default function Dashboard() {
                 {(data.unrealNet ?? 0) >= 0 ? '+' : ''}{fmt(data.unrealNet, 2)}
               </div>
             </div>
-          </div>
-          <div style={{ marginTop: 12, display: 'grid', gap: 8 }}>
-            <button className="btn" onClick={toggleScalp}>Mode: {data.scalpMode ? 'Scalper (1m)' : 'High-Hit (1h)'}</button>
-            <button className="btn" onClick={toggleAuto}>Auto Trading is {data.autoTrade ? 'ON' : 'OFF'}</button>
           </div>
         </div>
 
@@ -126,8 +133,9 @@ export default function Dashboard() {
       <div className="glass" style={{ padding: 12, marginTop: 12 }}>
         <div style={{ fontWeight: 600, marginBottom: 8 }}>Position</div>
         {data.pos ? (
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5,1fr)', gap: 6, fontSize: 13 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6,1fr)', gap: 6, fontSize: 13 }}>
             <div><div>Side</div><div style={{ fontWeight: 600, textTransform: 'capitalize' }}>{data.pos.side}</div></div>
+            <div><div>TF</div><div style={{ fontWeight: 600 }}>{data.pos.tf}</div></div>
             <div><div>Qty</div><div style={{ fontWeight: 600 }}>{fmt(data.pos.qty, 6)}</div></div>
             <div><div>Entry</div><div style={{ fontWeight: 600 }}>${fmt(data.pos.entry, 2)}</div></div>
             <div><div>Stop</div><div style={{ fontWeight: 600 }}>${fmt(data.pos.stop, 2)}</div></div>
