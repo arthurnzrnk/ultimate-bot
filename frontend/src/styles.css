@@ -76,3 +76,7 @@ body {
 .price-down {
   color: #fca5a5;
 }
+/* Added: used by Dashboard trade history */
+.capitalize {
+  text-transform: capitalize;
+}
