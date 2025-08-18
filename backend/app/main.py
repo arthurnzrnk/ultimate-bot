@@ -6,6 +6,7 @@ updating settings. When run with Uvicorn, the app will start the engine
 and begin paper trading.
 """
 
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Body, Query
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
@@ -15,8 +16,22 @@ from .config import settings
 from .engine import BotEngine
 from .models import Status
 
+engine = BotEngine()
 
-app = FastAPI(title="Ultimate Bot API")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Create and tear down shared resources cleanly."""
+    client = httpx.AsyncClient()
+    await engine.start(client)
+    try:
+        yield
+    finally:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+
+app = FastAPI(title="Ultimate Bot API", lifespan=lifespan)
 
 if settings.cors_origins:
     app.add_middleware(
@@ -27,22 +42,11 @@ if settings.cors_origins:
         allow_headers=["*"],
     )
 
-engine = BotEngine()
-
-
-@app.on_event("startup")
-async def startup_event() -> None:
-    """Start the bot engine on application startup."""
-    client = httpx.AsyncClient()
-    await engine.start(client)
-
-
 def _fmt(n: float | None, d: int = 2):
     """Helper to format floats for the API response."""
     if n is None or (isinstance(n, float) and (math.isnan(n) or math.isinf(n))):
         return None
     return round(n, d)
-
 
 @app.get("/status", response_model=Status)
 def get_status() -> Status:
@@ -73,12 +77,10 @@ def get_status() -> Status:
         unrealNet=_fmt(unreal, 2) or 0.0,
     )
 
-
 @app.get("/logs")
 def get_logs(limit: int = Query(200, ge=1, le=500)) -> dict:
     """Return recent engine log lines (for the Status page)."""
     return {"ok": True, "logs": engine.logs[-limit:]}
-
 
 @app.post("/settings")
 def update_settings(payload: dict = Body(...)) -> dict:
@@ -91,13 +93,11 @@ def update_settings(payload: dict = Body(...)) -> dict:
         engine.settings["strategy"] = str(payload["strategy"])
     return {"ok": True, "settings": engine.settings}
 
-
 @app.post("/start")
 def start_bot() -> dict:
     """Activate auto trading."""
     engine.settings["auto_trade"] = True
     return {"ok": True}
-
 
 @app.post("/stop")
 def stop_bot() -> dict:
@@ -105,13 +105,11 @@ def stop_bot() -> dict:
     engine.settings["auto_trade"] = False
     return {"ok": True}
 
-
 @app.post("/apikeys")
 def save_api_keys(payload: dict = Body(...)) -> dict:
     """Placeholder for saving user API keys securely."""
     # Real implementation would securely store API keys. We do not expose them.
     return {"ok": True}
-
 
 @app.get("/health")
 def health() -> dict:
