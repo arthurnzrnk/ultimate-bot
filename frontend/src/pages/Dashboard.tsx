@@ -1,40 +1,14 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { getStatus, postSettings } from '../api'
 
-interface Pos {
-  side: 'long' | 'short'
-  qty: number
-  entry: number
-  stop: number
-  take: number
-  stop_dist: number
-  open_time: number
-  fee_rate: number
-  hi: number
-  lo: number
-  be: boolean
-}
-
-interface Trade {
-  side: 'long' | 'short'
-  entry: number
-  close: number
-  pnl: number
-  open_time: number
-  close_time: number
-}
-
-interface Candle {
-  time: number
-  open: number
-  high: number
-  low: number
-  close: number
-  volume: number
-}
-
 export default function Dashboard() {
-  const [data, setData] = useState<any>({ history: [], candles: [], scalpMode: true, autoTrade: true, strategy: 'Level King — Regime' })
+  const [data, setData] = useState<any>({
+    history: [],
+    candles: [],
+    scalpMode: true,
+    autoTrade: true,
+    strategy: 'Adaptive Router',
+  })
   const [dir, setDir] = useState<'up' | 'down' | null>(null)
   const lastShown = useRef<number | undefined>(undefined)
 
@@ -81,15 +55,27 @@ export default function Dashboard() {
           </div>
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
-          <span className={`chip ${data.scalpMode ? 'green' : 'neutral'}`}>{data.scalpMode ? '1m' : '1h'}</span>
+          <span className={`chip ${data.scalpMode ? 'green' : ''}`}>{data.scalpMode ? '1m' : '1h'}</span>
           <span className={`chip ${data.price ? 'green' : 'red'}`}>{data.price ? 'NET: LIVE' : 'NET: STALE'}</span>
         </div>
       </div>
+
+      <div className="glass" style={{ padding: 12, marginTop: 12 }}>
+        <div style={{ fontWeight: 600, marginBottom: 6 }}>STATUS: {data.status}</div>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          <span className="chip">Regime: {data.regime ?? '—'}</span>
+          <span className="chip">Bias: {data.bias ?? '—'}</span>
+          <span className="chip">ADX: {fmt(data.adx, 0)}</span>
+          <span className="chip">ATR%: {fmt((data.atrPct ?? 0) * 100, 2)}%</span>
+          <span className="chip">Strategy: {data.activeStrategy ?? data.strategy}</span>
+        </div>
+        <div style={{ opacity: 0.8, fontSize: 12, marginTop: 10 }}>
+          P&amp;L today: {fmt(data.pnlToday, 2)} / cap ±$500; fills {data.fillsToday}/60
+        </div>
+      </div>
+
       <div style={{ display: 'grid', gridTemplateColumns: '1.2fr 1.8fr', gap: 12, marginTop: 12 }}>
         <div className="glass" style={{ padding: 12 }}>
-          <div style={{ fontWeight: 600 }}>STATUS: {data.status}</div>
-          <div style={{ marginTop: 8, fontWeight: 600 }}>CONDITIONS: {/* future: show reason text */}</div>
-          <div style={{ opacity: 0.8, fontSize: 12, marginTop: 4 }}>P&amp;L today: {fmt(data.pnlToday, 2)} / cap ±$500; fills {data.fillsToday}/60</div>
           <div style={{ marginTop: 12, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
             <div className="glass" style={{ padding: 12 }}>
               <div style={{ opacity: 0.8, fontSize: 12 }}>Equity</div>
@@ -107,6 +93,7 @@ export default function Dashboard() {
             <button className="btn" onClick={toggleAuto}>Auto Trading is {data.autoTrade ? 'ON' : 'OFF'}</button>
           </div>
         </div>
+
         <div className="glass" style={{ padding: 12, maxHeight: 320, overflow: 'auto' }}>
           <div style={{ fontWeight: 600, marginBottom: 8 }}>Trade History</div>
           <table className="table">
@@ -123,7 +110,7 @@ export default function Dashboard() {
               {[...(data.history || [])].reverse().map((t: any, i: number) => (
                 <tr key={i}>
                   <td>{new Date(((t.close_time ?? t.open_time) || 0) * 1000).toLocaleString()}</td>
-                  <td className="capitalize">{t.side}</td>
+                  <td style={{ textTransform: 'capitalize' }}>{t.side}</td>
                   <td style={{ textAlign: 'right' }}>{fmt(t.entry, 2)}</td>
                   <td style={{ textAlign: 'right' }}>{fmt(t.close, 2)}</td>
                   <td style={{ textAlign: 'right' }} className={(t.pnl ?? 0) >= 0 ? 'price-up' : 'price-down'}>
@@ -135,6 +122,7 @@ export default function Dashboard() {
           </table>
         </div>
       </div>
+
       <div className="glass" style={{ padding: 12, marginTop: 12 }}>
         <div style={{ fontWeight: 600, marginBottom: 8 }}>Position</div>
         {data.pos ? (
