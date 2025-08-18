@@ -1,21 +1,12 @@
-"""Data models for the Ultimate Bot backend.
-
-This module defines the Pydantic models that structure the data exchanged
-between the backend engine and the API. It includes candle definitions,
-position and trade records, user‑modifiable settings, and status snapshots
-sent to the frontend. Models ensure type safety and straightforward
-serialization/deserialization when communicating over HTTP.
-"""
+"""Data models for the Ultimate Bot backend."""
 
 from pydantic import BaseModel, Field
 from typing import Literal, Optional, List
 
-# Literal type for trade sides
 Side = Literal["long", "short"]
 
 
 class Candle(BaseModel):
-    """Represents a single market data candle."""
     time: int
     open: float
     high: float
@@ -25,7 +16,6 @@ class Candle(BaseModel):
 
 
 class Position(BaseModel):
-    """Represents an open trading position."""
     side: Side
     qty: float
     entry: float
@@ -40,7 +30,6 @@ class Position(BaseModel):
 
 
 class Trade(BaseModel):
-    """Represents a completed trade for the history."""
     side: Side
     entry: float
     close: float
@@ -50,7 +39,6 @@ class Trade(BaseModel):
 
 
 class Settings(BaseModel):
-    """User-configurable bot settings."""
     scalp_mode: bool = True
     auto_trade: bool = True
     strategy: str = "Level King — Regime"
@@ -58,7 +46,6 @@ class Settings(BaseModel):
 
 
 class Status(BaseModel):
-    """Snapshot of the bot state returned to the frontend."""
     price: Optional[float] = None
     bid: Optional[float] = None
     ask: Optional[float] = None
@@ -67,9 +54,20 @@ class Status(BaseModel):
     pos: Optional[Position] = None
     history: List[Trade] = Field(default_factory=list)
     candles: List[Candle] = Field(default_factory=list)
+
+    # UI flags
     scalpMode: bool = True
     autoTrade: bool = True
-    strategy: str = "Level King — Regime"
+
+    # Strategy labels
+    strategy: str = "Level King — Regime"           # overall (from settings)
+    activeStrategy: Optional[str] = None            # router-selected sub-strategy
+
+    # Telemetry for explanations
+    regime: Optional[str] = None                    # Range | Trending | Breakout
+    bias: Optional[str] = None                      # Bullish | Bearish
+    adx: Optional[float] = None
+    atrPct: Optional[float] = None                  # e.g., 0.0043 (0.43%)
     fillsToday: int = 0
     pnlToday: float = 0.0
     unrealNet: float = 0.0
