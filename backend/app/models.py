@@ -7,7 +7,7 @@ sent to the frontend. Models ensure type safety and straightforward
 serialization/deserialization when communicating over HTTP.
 """
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Literal, Optional, List
 
 # Literal type for trade sides
@@ -65,8 +65,8 @@ class Status(BaseModel):
     status: str = "Loading..."
     equity: float
     pos: Optional[Position] = None
-    history: List[Trade] = []
-    candles: List[Candle] = []
+    history: List[Trade] = Field(default_factory=list)
+    candles: List[Candle] = Field(default_factory=list)
     scalpMode: bool = True
     autoTrade: bool = True
     strategy: str = "Level King — Regime"
