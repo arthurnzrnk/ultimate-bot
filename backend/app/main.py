@@ -75,6 +75,8 @@ def get_status() -> Status:
         fillsToday=fills_today,
         pnlToday=_fmt(pnl_today, 2) or 0.0,
         unrealNet=_fmt(unreal, 2) or 0.0,
+        profileMode=engine.settings.get("profile_mode", "AUTO"),
+        profileModeActive=engine.profile_active,
     )
 
 @app.get("/logs")
@@ -83,6 +85,15 @@ def get_logs(limit: int = Query(200, ge=1, le=500)) -> dict:
 
 @app.post("/settings")
 def update_settings(payload: dict = Body(...)) -> dict:
+    # Only profile pickers are exposed in UI now; others still accepted but hidden
+    if "profileMode" in payload:
+        v = str(payload["profileMode"]).upper()
+        if v not in ("AUTO", "LIGHT", "HEAVY"):
+            v = "AUTO"
+        engine.settings["profile_mode"] = v
+    if "macroPause" in payload:
+        engine.settings["macro_pause"] = bool(payload["macroPause"])
+    # keep legacy toggles to avoid breaking clients (not used in current UI)
     if "scalpMode" in payload:
         engine.settings["scalp_mode"] = bool(payload["scalpMode"])
     if "autoTrade" in payload:
