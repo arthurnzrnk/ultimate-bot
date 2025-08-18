@@ -501,7 +501,7 @@ class BotEngine:
             # data
             "vwap": self.vwap,
             "bid": self.bid,
-            "ask": self.ask",
+            "ask": self.ask,
 
             # series and indexes
             "m1": self.m1,
