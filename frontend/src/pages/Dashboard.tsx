@@ -1,7 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react'
-import { getStatus, postSettings } from '../api'
+import { getStatus, postSettings, getLogs } from '../api'
 
 type ProfileMode = 'LIGHT' | 'HEAVY' | 'AUTO'
+type LogLine = { ts: number; text: string }
 
 export default function Dashboard() {
   const [data, setData] = useState<any>({
@@ -14,15 +15,30 @@ export default function Dashboard() {
   const [dir, setDir] = useState<'up' | 'down' | null>(null)
   const lastShown = useRef<number | undefined>(undefined)
 
+  // Logs state (moved here from the old Status page)
+  const [logs, setLogs] = useState<LogLine[]>([])
+  const [loadingLogs, setLoadingLogs] = useState(true)
+  const logBoxRef = useRef<HTMLDivElement | null>(null)
+
+  // Price/status polling
   useEffect(() => {
     let alive = true
     const tick = async () => {
       const s = await getStatus()
+      if (!alive) return
       setData(s)
       const shown = s.price ?? (s.bid && s.ask ? (s.bid + s.ask) / 2 : null)
       if (typeof shown === 'number') {
         const prev = lastShown.current
-        setDir(prev == null ? null : Math.round(shown * 100) > Math.round(prev * 100) ? 'up' : Math.round(shown * 100) < Math.round(prev * 100) ? 'down' : null)
+        setDir(
+          prev == null
+            ? null
+            : Math.round(shown * 100) > Math.round(prev * 100)
+            ? 'up'
+            : Math.round(shown * 100) < Math.round(prev * 100)
+            ? 'down'
+            : null
+        )
         lastShown.current = shown
       }
     }
@@ -34,7 +50,38 @@ export default function Dashboard() {
     }
   }, [])
 
-  const fmt = (n: any, d = 2) => (n == null || isNaN(n) ? '—' : Number(n).toLocaleString(undefined, { maximumFractionDigits: d, minimumFractionDigits: d }))
+  // Logs polling (every 2s), auto-scroll when near bottom
+  useEffect(() => {
+    let alive = true
+    const fetchLogs = async () => {
+      try {
+        const data = await getLogs(300)
+        if (!alive) return
+        setLogs(data.logs || [])
+      } catch (err) {
+        console.error(err)
+      } finally {
+        if (alive) setLoadingLogs(false)
+      }
+    }
+    fetchLogs()
+    const id = setInterval(fetchLogs, 2000)
+    return () => {
+      alive = false
+      clearInterval(id)
+    }
+  }, [])
+
+  useEffect(() => {
+    const el = logBoxRef.current
+    if (!el) return
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+    if (nearBottom) el.scrollTop = el.scrollHeight
+  }, [logs])
+
+  const fmt = (n: any, d = 2) =>
+    n == null || isNaN(n) ? '—' : Number(n).toLocaleString(undefined, { maximumFractionDigits: d, minimumFractionDigits: d })
+
   const px = data?.price ?? null
   const headerClass = dir === 'up' ? 'price-up' : dir === 'down' ? 'price-down' : ''
 
@@ -142,6 +189,42 @@ export default function Dashboard() {
             <div><div>Take</div><div style={{ fontWeight: 600 }}>${fmt(data.pos.take, 2)}</div></div>
           </div>
         ) : <div style={{ opacity: 0.8, fontSize: 13 }}>No open position.</div>}
+      </div>
+
+      {/* Logs moved here from the old Status page */}
+      <div id="logs" className="glass" style={{ padding: 12, marginTop: 12 }}>
+        <div style={{ fontWeight: 600, marginBottom: 8 }}>Bot Status Feed</div>
+        {loadingLogs && logs.length === 0 ? (
+          <p style={{ opacity: 0.8, fontSize: 14 }}>Loading logs…</p>
+        ) : logs.length === 0 ? (
+          <p style={{ opacity: 0.8, fontSize: 14 }}>
+            No logs yet. Once the engine opens/closes trades or enters cool‑off,
+            messages will show up here.
+          </p>
+        ) : (
+          <div
+            ref={logBoxRef}
+            style={{
+              maxHeight: 420,
+              overflow: 'auto',
+              padding: 8,
+              borderRadius: 12,
+              background: 'rgba(0,0,0,0.25)',
+              border: '1px solid rgba(255,255,255,0.12)',
+            }}
+          >
+            <ul style={{ listStyleType: 'none', paddingLeft: 0, margin: 0 }}>
+              {logs.map((l, idx) => (
+                <li key={idx} style={{ marginBottom: 6, fontSize: 14 }}>
+                  <span style={{ opacity: 0.7, marginRight: 8 }}>
+                    {new Date(l.ts * 1000).toLocaleTimeString()}
+                  </span>
+                  <span>{l.text}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
       </div>
     </div>
   )
