@@ -1,14 +1,12 @@
 # backend/app/strategies/router.py
 """Adaptive router-as-a-strategy with hysteresis and status telemetry.
 
-It detects market regime and delegates to the correct sub-strategy:
-- Range (low ADX, flat slope): Level King — Regime (m1 scalper) or MeanReversion (H1)
-- Breakout transition: Breakout (H1)
-- Established trend: TrendFollow (H1)
+Regimes:
+- Range (low ADX): Level King — Profiled (m1) or Mean-Reversion (H1) by gates
+- Breakout (ADX ≤ 25 + Donchian break + ATR% in band): Breakout (H1)
+- Trend (ADX ≥ 27, exit ≤ 23): TrendFollow (H1)
 
-Adds:
-- ADX hysteresis: enter trend at adx_on, exit at adx_off to avoid flip-flops
-- last_regime / last_bias / last_adx / last_atr_pct / last_strategy for UI/telemetry
+Telemetry: last_regime / last_bias / last_adx / last_atr_pct / last_strategy
 """
 
 from typing import List, Dict, Any, Optional
@@ -17,7 +15,6 @@ from ..ta import adx, atr, donchian, ema
 
 
 def _aggregate(ohlc: List[Dict[str, Any]], step_sec: int) -> List[Dict[str, Any]]:
-    """Aggregate candles (e.g., 1m → 5m)."""
     if not ohlc:
         return []
     out: List[Dict[str, Any]] = []
@@ -72,10 +69,10 @@ class StrategyRouter(Strategy):
         self.breakout = Breakout()
         self.trend = TrendFollow()
 
-        # ADX thresholds
-        self.adx_thr = 25      # general pivot (literature common)
-        self.adx_on = 27       # enter "trend" regime if >= this
-        self.adx_off = 23      # leave "trend" regime if <= this
+        # ADX thresholds with hysteresis
+        self.adx_thr = 25      # breakout threshold
+        self.adx_on = 27       # enter trend
+        self.adx_off = 23      # exit trend
 
         # Internal state
         self._scalp_mode = True
@@ -83,7 +80,7 @@ class StrategyRouter(Strategy):
 
         # Telemetry for UI
         self.last_regime: Optional[str] = None
-        self.last_bias: Optional[str] = None    # "Bullish" | "Bearish" | None
+        self.last_bias: Optional[str] = None
         self.last_adx: Optional[float] = None
         self.last_atr_pct: Optional[float] = None
         self.last_strategy: Optional[str] = None
@@ -110,10 +107,7 @@ class StrategyRouter(Strategy):
         if iC is None or iC < ctx.get("min_bars", 0):
             return Signal(type="WAIT", reason="Loading...")
 
-        px = ohlc[iC]["close"]
-        p = ctx.get("profile", {}) or {}
-
-        # --- Regime features on active TF (m1 if scalp, else h1) ---
+        # --- Regime features ---
         if self._scalp_mode:
             m5 = _aggregate(m1, 300)
             a = adx(m5, 14)
@@ -139,29 +133,16 @@ class StrategyRouter(Strategy):
         self.last_atr_pct = atr_pct
         self.last_bias = self._calc_bias(h1, ctx.get("iC_h1"))
 
-        # VWAP slope gate for scalping (skip range trades during steep slope)
-        slope_ok = True
-        if ctx.get("vwap") and ctx.get("iC_m1") is not None:
-            v10 = ema(ctx["vwap"], 10)
-            i_m1 = ctx["iC_m1"]
-            vcur = v10[i_m1] if i_m1 < len(v10) else ctx["vwap"][i_m1]
-            vprev = v10[i_m1 - 3] if (i_m1 - 3) >= 0 and (i_m1 - 3) < len(v10) else (
-                ctx["vwap"][i_m1 - 1] if i_m1 > 0 else vcur
-            )
-            slope = abs((vcur or px) - (vprev or px)) / max(1.0, px)
-            slope_mx = p.get("VWAP_SLOPE_MAX", 0.00060)
-            slope_ok = slope <= slope_mx
-
-        # Volatility guard
-        atr_min = p.get("ATR_PCT_MIN", 0.0004)
-        atr_max = p.get("ATR_PCT_MAX", 0.0200)
+        # ATR% band guard (uses profile band via strategies too; this is coarse)
+        atr_min = (ctx.get("profile") or {}).get("ATR_PCT_MIN", 0.0004)
+        atr_max = (ctx.get("profile") or {}).get("ATR_PCT_MAX", 0.0200)
         atr_ok = (atr_pct >= atr_min) and (atr_pct <= atr_max)
 
-        # Donchian break flags (explicit None checks to avoid truthiness traps)
-        bk_up = (hi_prev is not None) and (px > hi_prev)
-        bk_dn = (lo_prev is not None) and (px < lo_prev)
+        # Donchian break flags
+        bk_up = (hi_prev is not None) and ( (m1 if self._scalp_mode else h1)[ctx.get("iC_m1") if self._scalp_mode else ctx.get("iC_h1")]["close"] > hi_prev )
+        bk_dn = (lo_prev is not None) and ( (m1 if self._scalp_mode else h1)[ctx.get("iC_m1") if self._scalp_mode else ctx.get("iC_h1")]["close"] < lo_prev )
 
-        # --- Hysteresis regime logic ---
+        # Hysteresis regime logic
         mode = self._mode
         if adx_val is not None:
             if mode in ("trend", "breakout") and adx_val <= self.adx_off:
@@ -169,7 +150,7 @@ class StrategyRouter(Strategy):
             elif mode == "range" and adx_val >= self.adx_on:
                 mode = "trend"
 
-        # Breakout takes precedence when ADX is low and we see a break
+        # Breakout priority when ADX low and Donchian break occurs and ATR% within band
         if adx_val is not None and adx_val <= self.adx_thr and (bk_up or bk_dn) and atr_ok:
             mode = "breakout"
 
@@ -187,14 +168,12 @@ class StrategyRouter(Strategy):
 
         # Range:
         if self._scalp_mode:
-            if slope_ok and atr_ok:
-                self.last_strategy = self.scalper.name
-                return self.scalper.evaluate(m1, ctx)
             self.last_strategy = self.scalper.name
-            return Signal(type="WAIT", reason="Trend regime")
-        else:
             if atr_ok:
-                self.last_strategy = self.revert.name
-                return self.revert.evaluate(h1, ctx)
+                return self.scalper.evaluate(m1, ctx)
+            return Signal(type="WAIT", reason="ATR range")
+        else:
             self.last_strategy = self.revert.name
+            if atr_ok:
+                return self.revert.evaluate(h1, ctx)
             return Signal(type="WAIT", reason="ATR range")
