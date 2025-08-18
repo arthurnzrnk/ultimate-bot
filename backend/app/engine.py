@@ -146,13 +146,22 @@ class BotEngine:
         self.vwap = out
 
     def _aggregate_h1(self) -> None:
-        """Aggregate the m1 candles into h1 candles."""
-        bars: dict[int, dict[str, Any]] = {}
+        """Aggregate M1 into H1 and MERGE into existing H1 (preserve seed history).
+
+        Why: H1 strategies need long history (200–240 bars). We aggregate the
+        hours covered by the current M1 window and update/append those buckets
+        into the seeded H1 series instead of replacing it.
+        """
+        if not self.m1:
+            return
+
+        # Build aggregates for the hours covered by current M1 window.
+        agg: dict[int, dict[str, Any]] = {}
         for c in self.m1:
             bucket = (c["time"] // 3600) * 3600
-            b = bars.get(bucket)
+            b = agg.get(bucket)
             if not b:
-                bars[bucket] = {
+                agg[bucket] = {
                     "time": bucket,
                     "open": c["open"],
                     "high": c["high"],
@@ -165,7 +174,17 @@ class BotEngine:
                 b["low"] = min(b["low"], c["low"])
                 b["close"] = c["close"]
                 b["volume"] += c.get("volume", 0.0)
-        self.h1 = sorted(bars.values(), key=lambda x: x["time"])
+
+        # Merge: replace existing hours with fresh aggregates; keep older H1 intact.
+        if not self.h1:
+            # If no seed exists (rare), just use the aggregates we have.
+            self.h1 = sorted(agg.values(), key=lambda x: x["time"])
+            return
+
+        by_time = {bar["time"]: dict(bar) for bar in self.h1}
+        for t, bar in agg.items():
+            by_time[t] = bar  # upsert
+        self.h1 = sorted(by_time.values(), key=lambda x: x["time"])
 
     def _day_pnl(self) -> float:
         sod = sod_sec()
