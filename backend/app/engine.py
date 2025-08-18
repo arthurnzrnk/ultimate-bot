@@ -45,8 +45,7 @@ class BotEngine:
         # UI/status
         self.status_text: str = "Loading..."
 
-        # --- NEW: in‑memory log buffer shown on the Status page ---
-        # Each item: {"ts": int (unix seconds), "text": str}
+        # In‑memory log buffer (displayed on the Status page)
         self.logs: list[dict[str, Any]] = []
 
         # Risk/profile knobs (read by strategies via context)
@@ -65,7 +64,7 @@ class BotEngine:
         self.settings: dict[str, Any] = {
             "scalp_mode": True,
             "auto_trade": True,
-            "strategy": "Adaptive Router",  # <- unified strategy label
+            "strategy": "Adaptive Router",
             "macro_pause": False,
         }
 
@@ -76,13 +75,11 @@ class BotEngine:
         self._cool_until: int = 0
         self._loss_streak: int = 0
 
-    # --- NEW: small helper to push messages into the status/log buffer ---
     def _log(self, text: str, set_status: bool = True) -> None:
         if set_status:
             self.status_text = text
         self.logs.append({"ts": int(time.time()), "text": text})
-        # keep only the last ~500 messages
-        self.logs = self.logs[-500:]
+        self.logs = self.logs[-500:]  # keep last 500
 
     async def start(self, client) -> None:
         """Begin polling and trading loop using the provided HTTP client."""
@@ -202,11 +199,14 @@ class BotEngine:
                             self._log(f"Closed on TAKE ({p.side}); PnL {net:+.2f}")
                         else:
                             self._log(f"Closed on STOP ({p.side}); PnL {net:+.2f}")
-                        if net is not None and net < 0:
+                        # --- NEW: reset loss streak on win, increment on loss ---
+                        if net is not None and net > 0:
+                            self._loss_streak = 0
+                        elif net is not None and net < 0:
                             self._loss_streak += 1
                         if self._loss_streak >= 3:
                             self._cool_until = int(time.time()) + 1800
-                            self._log("Cooling off after losses (30 min).")
+                            self._log("Cooling off after 3 losses (30 min).")
                             self._loss_streak = 0
 
                 # on closed bars trigger evaluations
