@@ -112,21 +112,21 @@ class StrategyRouter(Strategy):
             m5 = _aggregate(m1, 300)
             a = adx(m5, 14)
             adx_val = a[-2] if len(a) >= 2 else None
-            A = atr(m1, 14)
-            i_m1 = ctx.get("iC_m1")
-            atr_pct = ((A[i_m1] or 0.0) / max(1.0, m1[i_m1]["close"])) if i_m1 is not None else 0.0
+
+            A_m1 = atr(m1, 14)
+            idx = ctx.get("iC_m1")
+            atr_pct = ((A_m1[idx] or 0.0) / max(1.0, m1[idx]["close"])) if isinstance(idx, int) and idx >= 0 else 0.0
+
             dc = donchian(m1, 20)
-            hi_prev = dc["hi"][i_m1 - 1] if (i_m1 is not None and i_m1 > 0) else None
-            lo_prev = dc["lo"][i_m1 - 1] if (i_m1 is not None and i_m1 > 0) else None
         else:
             a = adx(h1, 14)
             adx_val = a[-2] if len(a) >= 2 else None
-            A = atr(h1, 14)
-            i_h1 = ctx.get("iC_h1")
-            atr_pct = ((A[i_h1] or 0.0) / max(1.0, h1[i_h1]["close"])) if i_h1 is not None else 0.0
+
+            A_h1 = atr(h1, 14)
+            idx = ctx.get("iC_h1")
+            atr_pct = ((A_h1[idx] or 0.0) / max(1.0, h1[idx]["close"])) if isinstance(idx, int) and idx >= 0 else 0.0
+
             dc = donchian(h1, 20)
-            hi_prev = dc["hi"][i_h1 - 1] if (i_h1 is not None and i_h1 > 0) else None
-            lo_prev = dc["lo"][i_h1 - 1] if (i_h1 is not None and i_h1 > 0) else None
 
         # Telemetry
         self.last_adx = adx_val
@@ -134,13 +134,21 @@ class StrategyRouter(Strategy):
         self.last_bias = self._calc_bias(h1, ctx.get("iC_h1"))
 
         # ATR% band guard (uses profile band via strategies too; this is coarse)
-        atr_min = (ctx.get("profile") or {}).get("ATR_PCT_MIN", 0.0004)
-        atr_max = (ctx.get("profile") or {}).get("ATR_PCT_MAX", 0.0200)
+        profile = ctx.get("profile") or {}
+        atr_min = profile.get("ATR_PCT_MIN", 0.0004)
+        atr_max = profile.get("ATR_PCT_MAX", 0.0200)
         atr_ok = (atr_pct >= atr_min) and (atr_pct <= atr_max)
 
-        # Donchian break flags
-        bk_up = (hi_prev is not None) and ( (m1 if self._scalp_mode else h1)[ctx.get("iC_m1") if self._scalp_mode else ctx.get("iC_h1")]["close"] > hi_prev )
-        bk_dn = (lo_prev is not None) and ( (m1 if self._scalp_mode else h1)[ctx.get("iC_m1") if self._scalp_mode else ctx.get("iC_h1")]["close"] < lo_prev )
+        # Donchian break flags — SAFE indexing with warmup guard
+        series = m1 if self._scalp_mode else h1
+        if isinstance(idx, int) and idx > 0 and idx < len(series):
+            hi_prev = dc["hi"][idx - 1]
+            lo_prev = dc["lo"][idx - 1]
+            px_now = series[idx]["close"]
+            bk_up = (hi_prev is not None) and (px_now > hi_prev)
+            bk_dn = (lo_prev is not None) and (px_now < lo_prev)
+        else:
+            bk_up = bk_dn = False
 
         # Hysteresis regime logic
         mode = self._mode
