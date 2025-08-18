@@ -1,4 +1,11 @@
-"""Core trading engine for the Ultimate Bot (with regime status, vol overlay, trailing stops)."""
+"""Core trading engine for the Ultimate Bot — Strategy V2 (profile-aware).
+
+Implements:
+- Profiles: LIGHT / HEAVY / AUTO (auto-escalate & revert rules).
+- Global daily caps ±$500 and fills cap for scalper (≤60).
+- 1R constant trailing, partials at +0.5R (scalper), BE handling.
+- Loss streak guard: 3 consecutive net losers → 30 min cooldown.
+"""
 
 from __future__ import annotations
 
@@ -6,15 +13,17 @@ import asyncio
 import time
 from datetime import datetime
 from typing import Any
+from statistics import median
 
 from .config import settings
 from .datafeed import seed_klines, poll_coinbase_tick
 from .broker import PaperBroker, FEE_MAKER, FEE_TAKER
 from .strategies.router import StrategyRouter
+from .ta import atr, ema
 
 
 def sod_sec() -> int:
-    """Return the current day's start timestamp in seconds."""
+    """Return the current day's start timestamp in seconds (UTC)."""
     return int((int(time.time()) // 86400) * 86400)
 
 
@@ -23,7 +32,7 @@ class BotEngine:
 
     def __init__(self) -> None:
         self.client = None
-        # Candles as lists of DICTS (we convert from Pydantic models on seed)
+        # Candles as lists of dicts
         self.m1: list[dict[str, Any]] = []
         self.h1: list[dict[str, Any]] = []
 
@@ -38,28 +47,58 @@ class BotEngine:
         # UI/status
         self.status_text: str = "Loading..."
 
-        # In‑memory log buffer (displayed on the Status page)
+        # In‑memory log buffer
         self.logs: list[dict[str, Any]] = []
 
-        # Risk/profile knobs (read by strategies via context)
-        self.profile: dict[str, Any] = {
-            "ATR_PCT_MIN": 0.0004,
-            "ATR_PCT_MAX": 0.0200,
-            "VWAP_SLOPE_MAX": 0.00060,
+        # Profile configuration (immutable per profile)
+        self._PROFILES = {
+            "LIGHT": {
+                "ATR_PCT_MIN": 0.0004,   # 0.04%
+                "ATR_PCT_MAX": 0.0200,   # 2.00%
+                "VWAP_SLOPE_MAX": 0.00060,   # 0.060%
+                "SCALP_VOL_MULT": 1.5,       # m1 reclaim volume multiple (median 20)
+                "MR_ADX_CAP": 18,            # H1 Mean-Reversion ADX ≤ cap
+                "TREND_ADX_MIN": 25,         # H1 Trend ADX ≥ min
+                "BRK_VOL_MULT": 1.2,         # H1 Breakout volume multiple
+                "SCALP_PARTIAL_FRAC": 0.50,
+                "VOL_PAUSE_RATIO": 1.5,      # pause scalper if m1 ATR% > 1.5× 50-med
+            },
+            "HEAVY": {
+                "ATR_PCT_MIN": 0.0006,   # 0.06%
+                "ATR_PCT_MAX": 0.0150,   # 1.50%
+                "VWAP_SLOPE_MAX": 0.00045,   # 0.045%
+                "SCALP_VOL_MULT": 2.0,
+                "MR_ADX_CAP": 16,
+                "TREND_ADX_MIN": 30,
+                "BRK_VOL_MULT": 1.5,
+                "SCALP_PARTIAL_FRAC": 0.60,
+                "VOL_PAUSE_RATIO": 1.3,      # pause ALL if m1 ATR% > 1.3× 50-med
+            },
+        }
+
+        # Shared risk knobs (not profile-specific)
+        self._BASE = {
             "SPREAD_BPS_MAX": 10,
             "TP_FLOOR": 0.0020,
             "FEE_R_MAX": 0.25,
-            "RISK_PCT_SCALP": 0.010,  # base risk per trade (scalp)
-            "LEV_CAP": 8,
+            "RISK_PCT_SCALP": 0.010,  # base risk per trade (scalper)
+            "RISK_PCT_H1": 0.003,     # 0.3%
+            "LEV_CAP_SCALP": 8,
+            "LEV_CAP_H1": 1,
         }
 
-        # Engine settings (shown in UI)
+        # Engine settings (UI shows only profile picker; other toggles hidden)
         self.settings: dict[str, Any] = {
-            "scalp_mode": True,
+            "scalp_mode": True,          # default true (router decides h1 entries)
             "auto_trade": True,
             "strategy": "Adaptive Router",
             "macro_pause": False,
+            "profile_mode": "AUTO",      # LIGHT | HEAVY | AUTO
         }
+
+        # Active profile (what gates actually apply right now)
+        self.profile_active: str = "LIGHT"
+        self.profile: dict[str, Any] = self._compose_profile(self.profile_active)
 
         self.router = StrategyRouter()
         self.broker = PaperBroker(start_equity=settings.start_equity)
@@ -68,42 +107,43 @@ class BotEngine:
         self._cool_until: int = 0
         self._loss_streak: int = 0
 
+        # AUTO mode book-keeping
+        self._heavy_locked_until: int | None = None   # rest of UTC day when escalated
+        self._last_trade_was_loss: bool = False
+        self._last_close_ts: int | None = None
+        self._entered_heavy_at: int | None = None
+
+    # ---------------- internal helpers ----------------
+
+    def _compose_profile(self, name: str) -> dict[str, Any]:
+        p = self._PROFILES["HEAVY" if name == "HEAVY" else "LIGHT"].copy()
+        p.update(self._BASE)
+        return p
+
     def _log(self, text: str, set_status: bool = True) -> None:
         if set_status:
             self.status_text = text
         self.logs.append({"ts": int(time.time()), "text": text})
         self.logs = self.logs[-500:]  # keep last 500
 
-    async def start(self, client) -> None:
-        """Begin polling and trading loop using the provided HTTP client."""
-        self.client = client
-        m1_seed, h1_seed = await seed_klines(client)
-
-        # Convert Candle models -> dicts
-        self.m1 = [c.model_dump() if hasattr(c, "model_dump") else dict(c) for c in m1_seed]
-        self.h1 = [c.model_dump() if hasattr(c, "model_dump") else dict(c) for c in h1_seed]
-
-        self._rebuild_vwap()
-        self._log(f"Engine initialized. Seeded m1={len(self.m1)} bars, h1={len(self.h1)} bars.")
-        asyncio.create_task(self._run())
-
-    def _push_trade_to_m1(self, price: float, iso: str) -> None:
-        """Push a new trade tick into the m1 candle series."""
-        if "T" in iso:
-            ts = datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
-        else:
-            ts = float(iso)
-        t_ms = int(ts * 1000)
-        bucket = (t_ms // 60000) * 60000
-        t = bucket // 1000
-        if not self.m1 or self.m1[-1]["time"] != t:
-            self.m1.append({"time": t, "open": price, "high": price, "low": price, "close": price, "volume": 0.0})
-            self.m1 = self.m1[-3000:]
-        else:
-            c = self.m1[-1]
-            c["high"] = max(c["high"], price)
-            c["low"] = min(c["low"], price)
-            c["close"] = price
+    def _rebuild_vwap(self) -> None:
+        """Recompute VWAP for the current m1 series (reset each UTC day)."""
+        out: list[float | None] = []
+        day = None
+        pv = 0.0
+        vv = 0.0
+        for c in self.m1:
+            d = datetime.utcfromtimestamp(c["time"]).strftime("%Y-%m-%d")
+            if day != d:
+                day = d
+                pv = 0.0
+                vv = 0.0
+            tp = (c["high"] + c["low"] + c["close"]) / 3.0
+            v = max(1e-8, c.get("volume", 0.0))
+            pv += tp * v
+            vv += v
+            out.append(pv / max(1e-8, vv))
+        self.vwap = out
 
     def _aggregate_h1(self) -> None:
         """Aggregate the m1 candles into h1 candles."""
@@ -127,25 +167,6 @@ class BotEngine:
                 b["volume"] += c.get("volume", 0.0)
         self.h1 = sorted(bars.values(), key=lambda x: x["time"])
 
-    def _rebuild_vwap(self) -> None:
-        """Recompute VWAP for the current m1 series (reset each UTC day)."""
-        out: list[float | None] = []
-        day = None
-        pv = 0.0
-        vv = 0.0
-        for c in self.m1:
-            d = datetime.utcfromtimestamp(c["time"]).strftime("%Y-%m-%d")
-            if day != d:
-                day = d
-                pv = 0.0
-                vv = 0.0
-            tp = (c["high"] + c["low"] + c["close"]) / 3.0
-            v = max(1e-8, c.get("volume", 0.0))
-            pv += tp * v
-            vv += v
-            out.append(pv / max(1e-8, vv))
-        self.vwap = out
-
     def _day_pnl(self) -> float:
         sod = sod_sec()
         return sum([t.pnl for t in self.broker.history if (t.close_time or t.open_time) >= sod])
@@ -154,8 +175,126 @@ class BotEngine:
         sod = sod_sec()
         return sum(1 for t in self.broker.history if (t.close_time or t.open_time) >= sod) + (1 if self.broker.pos else 0)
 
+    def _atr_pct_m1(self) -> float | None:
+        """Current m1 ATR% (using last closed m1 bar)."""
+        if len(self.m1) < 16:
+            return None
+        a14 = atr(self.m1, 14)
+        i = len(self.m1) - 2
+        px = self.m1[i]["close"]
+        return (a14[i] or 0.0) / max(1.0, px)
+
+    def _atr_pct_m1_ratio_to_med50(self) -> float | None:
+        """Return current m1 ATR% divided by rolling median of last 50 ATR% values."""
+        if len(self.m1) < 65:
+            return None
+        a14 = atr(self.m1, 14)
+        vals = []
+        for k in range(len(self.m1) - 52, len(self.m1) - 2):
+            px = self.m1[k]["close"]
+            vals.append((a14[k] or 0.0) / max(1.0, px))
+        med = median(vals) if vals else None
+        cur = self._atr_pct_m1()
+        if med is None or not cur:
+            return None
+        return cur / max(1e-8, med)
+
+    # ---------------- lifecycle ----------------
+
+    async def start(self, client) -> None:
+        """Begin polling and trading loop using the provided HTTP client."""
+        self.client = client
+        m1_seed, h1_seed = await seed_klines(client)
+        # Convert models -> dicts
+        self.m1 = [c.model_dump() if hasattr(c, "model_dump") else dict(c) for c in m1_seed]
+        self.h1 = [c.model_dump() if hasattr(c, "model_dump") else dict(c) for c in h1_seed]
+        self._rebuild_vwap()
+        self._log(f"Engine initialized. Seeded m1={len(self.m1)} bars, h1={len(self.h1)} bars.")
+        asyncio.create_task(self._run())
+
+    def _push_trade_to_m1(self, price: float, iso: str) -> None:
+        """Push a new trade tick into the m1 candle series (volume = tick count)."""
+        if "T" in iso:
+            ts = datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+        else:
+            ts = float(iso)
+        t = int(ts // 60) * 60
+        if not self.m1 or self.m1[-1]["time"] != t:
+            self.m1.append({"time": t, "open": price, "high": price, "low": price, "close": price, "volume": 1.0})
+            self.m1 = self.m1[-3000:]
+        else:
+            c = self.m1[-1]
+            c["high"] = max(c["high"], price)
+            c["low"] = min(c["low"], price)
+            c["close"] = price
+            c["volume"] = (c.get("volume", 0.0) or 0.0) + 1.0  # tick-count fallback
+
+    def _apply_profile(self, name: str) -> None:
+        if name not in ("LIGHT", "HEAVY"):
+            name = "LIGHT"
+        self.profile_active = name
+        self.profile = self._compose_profile(name)
+
+    def _maybe_auto_switch(self) -> None:
+        """AUTO mode profile escalation/reversion logic."""
+        if self.settings.get("profile_mode") != "AUTO":
+            # hard lock if user picked LIGHT or HEAVY
+            self._apply_profile("HEAVY" if self.settings["profile_mode"] == "HEAVY" else "LIGHT")
+            return
+
+        now = int(time.time())
+        sod = sod_sec()
+
+        # If end of day crossed, allow reset back to LIGHT
+        if self._heavy_locked_until and now >= self._heavy_locked_until:
+            self._heavy_locked_until = None
+            self._apply_profile("LIGHT")
+            self._entered_heavy_at = None
+
+        # Compute triggers
+        day_pnl = self._day_pnl()
+        atr_ratio = self._atr_pct_m1_ratio_to_med50()
+        macro_pause = bool(self.settings.get("macro_pause"))
+
+        escalate = False
+        if self._loss_streak >= 2:
+            escalate = True
+        if day_pnl <= -200:
+            escalate = True
+        if atr_ratio is not None and atr_ratio > 1.5:
+            escalate = True
+        if macro_pause:
+            escalate = True
+
+        # Escalate to HEAVY for the rest of UTC day
+        if escalate and self.profile_active != "HEAVY":
+            self._apply_profile("HEAVY")
+            self._entered_heavy_at = now
+            self._heavy_locked_until = sod + 86400
+            self._log("AUTO: Escalated to HEAVY for safety (rest of UTC day).", set_status=False)
+
+        # Reversion rules: allow intra-day revert after 60 minutes if conditions good
+        if self.profile_active == "HEAVY" and self._entered_heavy_at:
+            elapsed = now - self._entered_heavy_at
+            if elapsed >= 3600:
+                # Revert only if PnL >= 0 and ATR ratio calmed down (≤ 1.2)
+                # and no "consecutive losses" in last 30 minutes (approx check)
+                revert_ok = True
+                if day_pnl < 0:
+                    revert_ok = False
+                if atr_ratio is None or atr_ratio > 1.2:
+                    revert_ok = False
+                # "No consecutive losses in the last 30 minutes"
+                recent = [t for t in self.broker.history if t.close_time >= (now - 1800)]
+                # if last two in that window are both losses → not ok
+                if len(recent) >= 2 and (recent[-1].pnl < 0 and recent[-2].pnl < 0):
+                    revert_ok = False
+                if revert_ok:
+                    self._apply_profile("LIGHT")
+                    self._entered_heavy_at = None
+                    self._log("AUTO: Reverted to LIGHT (conditions normalized).", set_status=False)
+
     async def _run(self) -> None:
-        """Main loop: poll data, update series, evaluate strategies and execute."""
         last_m1_closed = 0
         last_h1_closed = 0
         while True:
@@ -171,47 +310,84 @@ class BotEngine:
                     self._rebuild_vwap()
                     self._aggregate_h1()
 
-                # mark to market every second + trailing/BE logic
+                # mark to market every second + management
                 if self.broker.pos and self.price is not None:
                     _ = self.broker.mark(self.price)
                     p = self.broker.pos
+                    R = p.stop_dist
 
-                    # --- Simple trailing & breakeven ---
-                    if p.side == "long":
-                        # move to BE after +1R
-                        if (self.price >= p.entry + p.stop_dist) and not p.be:
-                            p.stop = p.entry
-                            p.be = True
-                        # trail stop 1R behind current price
-                        new_stop = self.price - p.stop_dist
-                        if new_stop > p.stop:
-                            p.stop = new_stop
-                    else:  # short
-                        if (self.price <= p.entry - p.stop_dist) and not p.be:
-                            p.stop = p.entry
-                            p.be = True
-                        new_stop = self.price + p.stop_dist
-                        if new_stop < p.stop:
-                            p.stop = new_stop
+                    # --- Scalper partials & BE/trailing per profile ---
+                    if p.tf == "m1":
+                        # Heavy optional scratch: if +0.25R NOT reached in 5 min → move stop to BE
+                        if p.profile == "HEAVY" and not p.be and (int(time.time()) - p.open_time) >= p.scratch_after_sec:
+                            hit_qtr = (self.price >= p.entry + 0.25 * R) if p.side == "long" else (self.price <= p.entry - 0.25 * R)
+                            if not hit_qtr:
+                                p.stop = p.entry
+                                p.be = True
 
-                    # close on stop/take
-                    hit_stop = (self.price <= p.stop) if p.side == "long" else (self.price >= p.stop)
-                    hit_take = (self.price >= p.take) if p.side == "long" else (self.price <= p.take)
-                    if hit_stop or hit_take:
-                        net = self.broker.close(p.take if hit_take else self.price)
-                        if hit_take:
-                            self._log(f"Closed on TAKE ({p.side}); PnL {net:+.2f}")
+                        # Partial at +0.5R (once), then BE on remainder
+                        if not p.partial_taken:
+                            hit_half = (self.price >= p.entry + 0.5 * R) if p.side == "long" else (self.price <= p.entry - 0.5 * R)
+                            if hit_half:
+                                frac = 0.60 if p.profile == "HEAVY" else 0.50
+                                self.broker.partial_close(frac, self.price)
+                                if self.broker.pos:  # remaining
+                                    self.broker.pos.stop = self.broker.pos.entry
+                                    self.broker.pos.be = True
+                                    self.broker.pos.partial_taken = True
+
+                        # Constant 1R trailing on remainder
+                        if self.broker.pos:
+                            p = self.broker.pos
+                            if p.side == "long":
+                                new_stop = self.price - R
+                                if new_stop > p.stop:
+                                    p.stop = new_stop
+                            else:
+                                new_stop = self.price + R
+                                if new_stop < p.stop:
+                                    p.stop = new_stop
+
+                    else:
+                        # H1: keep V1 style — move to BE after +1R then trail at 1R
+                        if p.side == "long":
+                            if (self.price >= p.entry + R) and not p.be:
+                                p.stop = p.entry
+                                p.be = True
+                            new_stop = self.price - R
+                            if new_stop > p.stop:
+                                p.stop = new_stop
                         else:
-                            self._log(f"Closed on STOP ({p.side}); PnL {net:+.2f}")
-                        # reset/increment loss streak
-                        if net is not None and net > 0:
-                            self._loss_streak = 0
-                        elif net is not None and net < 0:
-                            self._loss_streak += 1
-                        if self._loss_streak >= 3:
-                            self._cool_until = int(time.time()) + 1800
-                            self._log("Cooling off after 3 losses (30 min).")
-                            self._loss_streak = 0
+                            if (self.price <= p.entry - R) and not p.be:
+                                p.stop = p.entry
+                                p.be = True
+                            new_stop = self.price + R
+                            if new_stop < p.stop:
+                                p.stop = new_stop
+
+                    # close on stop/take (take priority)
+                    p = self.broker.pos
+                    if p:
+                        hit_stop = (self.price <= p.stop) if p.side == "long" else (self.price >= p.stop)
+                        hit_take = (self.price >= p.take) if p.side == "long" else (self.price <= p.take)
+                        if hit_take or hit_stop:
+                            net = self.broker.close(p.take if hit_take else self.price)
+                            if hit_take:
+                                self._log(f"Closed on TAKE ({p.side}); PnL {net:+.2f}")
+                            else:
+                                self._log(f"Closed on STOP ({p.side}); PnL {net:+.2f}")
+                            # update loss streak + potential cooldown + AUTO switching memory
+                            if net is not None and net > 0:
+                                self._loss_streak = 0
+                                self._last_trade_was_loss = False
+                            elif net is not None and net < 0:
+                                self._loss_streak += 1
+                                self._last_trade_was_loss = True
+                            self._last_close_ts = int(time.time())
+                            if self._loss_streak >= 3:
+                                self._cool_until = int(time.time()) + 1800
+                                self._log("Cooling off after 3 losses (30 min).")
+                                self._loss_streak = 0
 
                 # on closed bars trigger evaluations
                 if len(self.m1) >= 2 and self.m1[-2]["time"] != last_m1_closed:
@@ -223,6 +399,10 @@ class BotEngine:
             except Exception as e:
                 self.status_text = f"Error loop: {e}"
                 self._log(f"Error in loop: {e}", set_status=False)
+
+            # Profile auto-switch
+            self._maybe_auto_switch()
+
             await asyncio.sleep(1.0)
 
     async def _maybe_signal(self, tf: str) -> None:
@@ -239,16 +419,27 @@ class BotEngine:
 
         last_open = self.broker.history[-1].open_time if self.broker.history else 0
         now = int(time.time())
+        # Cooldown by tf: scalper ≥ 60s; h1 ≥ 3600s
         cooldown_ok = (now - last_open) > (60 if self.settings.get("scalp_mode") else 3600)
 
-        # Select the main series for this tick (used by router for regime calc)
+        # Active TF decision for this evaluation
         scalp = bool(self.settings.get("scalp_mode"))
         src = self.m1 if scalp else self.h1
         iC = (len(src) - 2) if len(src) >= 2 else None
 
-        # Also compute H1/M1 indexes for strategies
+        # Indexes for strategies
         iC_h1 = (len(self.h1) - 2) if len(self.h1) >= 2 else None
         iC_m1 = (len(self.m1) - 2) if len(self.m1) >= 2 else None
+
+        # Volatility pause by profile (LIGHT: pause scalper if >1.5×; HEAVY: pause all if >1.3×)
+        atr_ratio = self._atr_pct_m1_ratio_to_med50()
+        if atr_ratio is not None:
+            if self.profile_active == "LIGHT" and scalp and atr_ratio > self._PROFILES["LIGHT"]["VOL_PAUSE_RATIO"]:
+                self.status_text = "Volatility pause (m1 ATR spike)"
+                return
+            if self.profile_active == "HEAVY" and atr_ratio > self._PROFILES["HEAVY"]["VOL_PAUSE_RATIO"]:
+                self.status_text = "Volatility pause (HEAVY)"
+                return
 
         context = {
             # gates / limits
@@ -258,14 +449,27 @@ class BotEngine:
             "max_fills": 60,
             "fee_rate": FEE_MAKER,
             "fee_taker": FEE_TAKER,
-            "profile": self.profile,
+
+            # profile params (used by strategies)
+            "profile": {
+                "ATR_PCT_MIN": self.profile["ATR_PCT_MIN"],
+                "ATR_PCT_MAX": self.profile["ATR_PCT_MAX"],
+                "VWAP_SLOPE_MAX": self.profile["VWAP_SLOPE_MAX"],
+                "SPREAD_BPS_MAX": self.profile["SPREAD_BPS_MAX"],
+                "TP_FLOOR": self.profile["TP_FLOOR"],
+                "FEE_R_MAX": self.profile["FEE_R_MAX"],
+                "SCALP_VOL_MULT": self.profile["SCALP_VOL_MULT"],
+            },
+            "adx_trend_min": self.profile["TREND_ADX_MIN"],
+            "adx_range_max": self.profile["MR_ADX_CAP"],
+            "breakout_vol_mult": self.profile["BRK_VOL_MULT"],
 
             # data
             "vwap": self.vwap,
             "bid": self.bid,
             "ask": self.ask,
 
-            # series and indexes for both TFs
+            # series and indexes
             "m1": self.m1,
             "h1": self.h1,
             "iC": iC,
@@ -275,6 +479,11 @@ class BotEngine:
             # warmups
             "min_bars": 5,
             "min_h1_bars": 240,
+
+            # profile flags for router explanations
+            "profile_mode_active": self.profile_active,
+            "scalp_mode": scalp,
+            "macro_pause": self.settings.get("macro_pause"),
         }
 
         # Let the router decide and return a Signal
@@ -292,7 +501,7 @@ class BotEngine:
         atr_str = f"{((atr_pct or 0.0) * 100):.2f}%"
 
         self.status_text = (
-            f"Regime: {reg} (ADX={adx_str} | ATR%={atr_str}) | "
+            f"{self.profile_active} | Regime: {reg} (ADX={adx_str} | ATR%={atr_str}) | "
             f"Bias: {bias} | Strat: {active} | {sig.reason}"
         )
 
@@ -306,18 +515,30 @@ class BotEngine:
             taked = sig.take_dist or (entry * 0.005)
 
             # --- Volatility overlay: reduce risk as ATR% rises within allowed band ---
-            base_risk = self.profile.get("RISK_PCT_SCALP", 0.01) if scalp else 0.003
+            base_risk = self.profile.get("RISK_PCT_SCALP") if scalp else self.profile.get("RISK_PCT_H1")
+            # compute ATR% on active TF
+            if scalp:
+                A = atr(self.m1, 14)
+                ap = (A[iC_m1] or 0.0) / max(1.0, self.m1[iC_m1]["close"])
+            else:
+                A = atr(self.h1, 14)
+                ap = (A[iC_h1] or 0.0) / max(1.0, self.h1[iC_h1]["close"])
+
             atr_min = self.profile.get("ATR_PCT_MIN", 0.0004)
             atr_max = self.profile.get("ATR_PCT_MAX", 0.0200)
-            ap = max(atr_min, min(atr_max, atr_pct or atr_min))
+            ap = max(atr_min, min(atr_max, ap))
             norm = (ap - atr_min) / max(1e-8, (atr_max - atr_min))  # 0..1
             risk_mult = 1.0 - 0.5 * norm  # high vol => ~0.5x; low vol => 1.0x
             risk_pct = base_risk * risk_mult
 
+            # HEAVY additional clamp: ≤ 75% of base
+            if self.profile_active == "HEAVY":
+                risk_pct = min(risk_pct, 0.75 * base_risk)
+
             risk_usd = self.broker.equity * risk_pct
             qty = max(0.0001, risk_usd / max(1.0, stopd))
 
-            notional_cap = self.broker.equity * (self.profile.get("LEV_CAP", 8) if scalp else 1)
+            notional_cap = self.broker.equity * (self.profile.get("LEV_CAP_SCALP") if scalp else self.profile.get("LEV_CAP_H1"))
             qty = min(qty, max(0.0001, notional_cap / max(1.0, entry)))
 
             stop = (entry - stopd) if sig.type == "BUY" else (entry + stopd)
@@ -331,7 +552,12 @@ class BotEngine:
                     self._log(f"Reversed position at {entry:.2f}")
 
             if not self.broker.pos:
-                self.broker.open(sig.type, entry, qty, stop, take, stopd, maker=True)
+                self.broker.open(
+                    sig.type, entry, qty, stop, take, stopd, maker=True,
+                    tf=("m1" if scalp else "h1"),
+                    profile=self.profile_active,
+                    scratch_after_sec=300,
+                )
                 self._log(
                     f"Open {sig.type} @ {entry:.2f} | qty={qty:.6f} stop={stop:.2f} take={take:.2f} score={sig.score}",
                     set_status=False,
