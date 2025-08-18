@@ -413,16 +413,18 @@ class BotEngine:
         if int(time.time()) < self._cool_until:
             return
 
+        # --- Global daily P&L cap (±$500) for ALL strategies ---
         pnl = self._day_pnl()
         fills = self._fills_today()
-        daily_ok = (pnl < 500) and (pnl > -500) and (fills < 60)
-
-        last_open = self.broker.history[-1].open_time if self.broker.history else 0
         now = int(time.time())
-        # Cooldown by tf: scalper ≥ 60s; h1 ≥ 3600s
-        cooldown_ok = (now - last_open) > (60 if self.settings.get("scalp_mode") else 3600)
 
-        # Active TF decision for this evaluation
+        pnl_ok = (-500 < pnl < 500)
+        if not pnl_ok:
+            # Block new entries globally; let existing positions manage/close.
+            self.status_text = "Daily cap reached (±$500) — blocking new entries."
+            return
+
+        # Active TF decision (for routing & context)
         scalp = bool(self.settings.get("scalp_mode"))
         src = self.m1 if scalp else self.h1
         iC = (len(src) - 2) if len(src) >= 2 else None
@@ -441,10 +443,15 @@ class BotEngine:
                 self.status_text = "Volatility pause (HEAVY)"
                 return
 
+        # Pre-signal cooldown hint for scalper strategy; H1 will be enforced post-pick.
+        last_open = self.broker.history[-1].open_time if self.broker.history else 0
+        cooldown_ok_ctx = (now - last_open) > (60 if scalp else 3600)
+
+        # --- Strategy context (fills cap is scalper-only) ---
         context = {
             # gates / limits
-            "daily_ok": daily_ok,
-            "cooldown_ok": cooldown_ok,
+            "daily_ok": (pnl_ok and (fills < 60 if scalp else True)),
+            "cooldown_ok": cooldown_ok_ctx,
             "fills": fills,
             "max_fills": 60,
             "fee_rate": FEE_MAKER,
@@ -505,24 +512,35 @@ class BotEngine:
             f"Bias: {bias} | Strat: {active} | {sig.reason}"
         )
 
-        # handle trade
+        # --- Handle trade (apply strategy-chosen TF + cooldown) ---
         if sig.type in ("BUY", "SELL") and self.settings.get("auto_trade") and self.price is not None:
-            if iC is None or iC < 0 or iC >= len(src):
+            # Determine intended trade timeframe by picked strategy (not scalp_mode)
+            active_name = strategy_router.last_strategy or ""
+            is_h1 = active_name in ("Mean Reversion (H1)", "Breakout", "Trend‑Following")
+            trade_tf = "h1" if is_h1 else "m1"
+
+            # Enforce cooldown by TF of intended trade
+            last_open = self.broker.history[-1].open_time if self.broker.history else 0
+            cooldown_ok = (now - last_open) > (3600 if trade_tf == "h1" else 60)
+            if not cooldown_ok:
                 return
-            entry = src[iC]["close"]
+
+            # Select proper series/index for entry
+            series = self.h1 if is_h1 else self.m1
+            i_entry = (len(series) - 2)
+            if i_entry is None or i_entry < 0 or i_entry >= len(series):
+                return
+            entry = series[i_entry]["close"]
 
             stopd = sig.stop_dist or (entry * 0.005)
             taked = sig.take_dist or (entry * 0.005)
 
             # --- Volatility overlay: reduce risk as ATR% rises within allowed band ---
-            base_risk = self.profile.get("RISK_PCT_SCALP") if scalp else self.profile.get("RISK_PCT_H1")
-            # compute ATR% on active TF
-            if scalp:
-                A = atr(self.m1, 14)
-                ap = (A[iC_m1] or 0.0) / max(1.0, self.m1[iC_m1]["close"])
-            else:
-                A = atr(self.h1, 14)
-                ap = (A[iC_h1] or 0.0) / max(1.0, self.h1[iC_h1]["close"])
+            scalp_trade = (trade_tf == "m1")
+            base_risk = self.profile.get("RISK_PCT_SCALP") if scalp_trade else self.profile.get("RISK_PCT_H1")
+
+            A = atr(series, 14)
+            ap = (A[i_entry] or 0.0) / max(1.0, series[i_entry]["close"])
 
             atr_min = self.profile.get("ATR_PCT_MIN", 0.0004)
             atr_max = self.profile.get("ATR_PCT_MAX", 0.0200)
@@ -538,7 +556,7 @@ class BotEngine:
             risk_usd = self.broker.equity * risk_pct
             qty = max(0.0001, risk_usd / max(1.0, stopd))
 
-            notional_cap = self.broker.equity * (self.profile.get("LEV_CAP_SCALP") if scalp else self.profile.get("LEV_CAP_H1"))
+            notional_cap = self.broker.equity * (self.profile.get("LEV_CAP_SCALP") if scalp_trade else self.profile.get("LEV_CAP_H1"))
             qty = min(qty, max(0.0001, notional_cap / max(1.0, entry)))
 
             stop = (entry - stopd) if sig.type == "BUY" else (entry + stopd)
@@ -554,7 +572,7 @@ class BotEngine:
             if not self.broker.pos:
                 self.broker.open(
                     sig.type, entry, qty, stop, take, stopd, maker=True,
-                    tf=("m1" if scalp else "h1"),
+                    tf=trade_tf,
                     profile=self.profile_active,
                     scratch_after_sec=300,
                 )
