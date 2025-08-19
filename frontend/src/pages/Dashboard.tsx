@@ -29,7 +29,7 @@ export default function Dashboard() {
   const [dir, setDir] = useState<'up' | 'down' | null>(null)
   const lastShown = useRef<number | undefined>(undefined)
 
-  // Logs (feed now lives under Paper Account on the right)
+  // Logs (feed lives under Paper Account on the right)
   const [logs, setLogs] = useState<LogLine[]>([])
   const [loadingLogs, setLoadingLogs] = useState(true)
   const logBoxRef = useRef<HTMLDivElement | null>(null)
@@ -159,7 +159,8 @@ export default function Dashboard() {
     const y = (p: number) => padT + (hi - p) * (chartH / Math.max(1e-8, (hi - lo)))
 
     // grid
-    ctx.strokeStyle = 'rgba(255,255,255,0.06)'
+    const grid = 'rgba(255,255,255,0.06)'
+    ctx.strokeStyle = grid
     ctx.lineWidth = 1
     ctx.beginPath()
     for (let i = 0; i <= 5; i++) {
@@ -231,11 +232,12 @@ export default function Dashboard() {
     const canvas = canvasRef.current
     if (!canvas) return
     const overlays: Overlay[] = []
-    overlays.push({ data: vwap, color: '#60a5fa', dashed: true }) // VWAP on 1m like V1
+    const vwap = buildSessionVWAPArray((data.candles || []) as Candle[])
+    overlays.push({ data: vwap, color: '#60a5fa', dashed: true }) // VWAP on 1m
     const pos = data?.pos
     const hl = pos ? (pos.side === 'long' ? 'BUY' : 'SELL') : null
     drawChart(canvas, (data.candles || []) as Candle[], overlays, hl, barCount)
-  }, [data.candles, data.pos, vwap, barCount])
+  }, [data.candles, data.pos, barCount])
 
   // ---------- UI actions ----------
   async function toggleScalp() {
@@ -259,7 +261,6 @@ export default function Dashboard() {
   const fills = data?.fillsToday ?? 0
   const pnlToday = data?.pnlToday ?? 0
 
-  // Friendly CONDITIONS line (unchanged)
   const conditionsText = [
     data.activeStrategy ?? data.strategy ?? '—',
     data.regime ? `Regime: ${data.regime}` : null,
@@ -268,12 +269,12 @@ export default function Dashboard() {
     data.atrPct != null ? `ATR%: ${fmt((data.atrPct || 0) * 100, 2)}%` : null,
   ].filter(Boolean).join(' • ')
 
-  // ----- Dynamic glow tone (match V1) -----
+  // Dynamic glow tone
   const glowTone = !data.autoTrade ? 'gray' : data.pos ? (data.pos.side === 'long' ? 'green' : 'red') : 'orange'
 
   return (
     <div>
-      {/* Dynamic background glow like V1 */}
+      {/* Dynamic background glow */}
       <div className={`glow-dynamic tone-${glowTone}`} />
 
       {/* HEADER */}
@@ -339,7 +340,7 @@ export default function Dashboard() {
           </section>
         </div>
 
-        {/* Right: Controls + Account + Logs (moved here) */}
+        {/* Right: Controls + Account + Logs */}
         <div className="right-col">
           <section className="glass pcard">
             <h2 className="card-title">Toggles</h2>
@@ -355,7 +356,7 @@ export default function Dashboard() {
             <h2 className="card-title">Profile Mode</h2>
             <select
               className="select"
-              value={data.profileMode ?? 'AUTO'}
+              value={(data.profileMode as ProfileMode) ?? 'AUTO'}
               onChange={e => setProfileMode(e.target.value as ProfileMode)}
             >
               <option value="AUTO">AUTO (recommended)</option>
@@ -393,7 +394,6 @@ export default function Dashboard() {
             ) : <div className="muted-xs" style={{ marginTop: 8 }}>No open position.</div>}
           </section>
 
-          {/* Bot Status Feed — moved under Paper Account */}
           <section className="glass pcard">
             <h2 className="card-title">Bot Status Feed</h2>
             {loadingLogs && logs.length === 0 ? (
