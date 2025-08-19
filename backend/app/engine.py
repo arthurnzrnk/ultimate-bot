@@ -19,12 +19,25 @@ from .config import settings
 from .datafeed import seed_klines, poll_coinbase_tick
 from .broker import PaperBroker, FEE_MAKER, FEE_TAKER
 from .strategies.router import StrategyRouter
-from .ta import atr, ema
+from .ta import atr  # removed unused: ema
 
 
 def sod_sec() -> int:
     """Return the current day's start timestamp in seconds (UTC)."""
     return int((int(time.time()) // 86400) * 86400)
+
+
+def _normalize_hyphens(s: str) -> str:
+    """Normalize dash-like Unicode characters to ASCII hyphen for robust matching."""
+    if not isinstance(s, str):
+        return s
+    return (
+        s.replace("\u2011", "-")  # non-breaking hyphen
+         .replace("\u2013", "-")  # en dash
+         .replace("\u2014", "-")  # em dash
+         .replace("\u2010", "-")  # hyphen
+         .replace("\u2212", "-")  # minus sign, just in case
+    )
 
 
 class BotEngine:
@@ -541,10 +554,16 @@ class BotEngine:
 
         # --- Handle trade (apply strategy-chosen TF + cooldown) ---
         if sig.type in ("BUY", "SELL") and self.settings.get("auto_trade") and self.price is not None:
-            # Determine intended trade timeframe by picked strategy (not scalp_mode)
-            active_name = strategy_router.last_strategy or ""
-            is_h1 = active_name in ("Mean Reversion (H1)", "Breakout", "Trend‑Following")
-            trade_tf = "h1" if is_h1 else "m1"
+            # Prefer explicit TF from signal if available; else fall back to robust name check
+            tf_from_sig = getattr(sig, "tf", None)
+            if tf_from_sig in ("m1", "h1"):
+                trade_tf = tf_from_sig
+                is_h1 = (trade_tf == "h1")
+            else:
+                active_name = strategy_router.last_strategy or ""
+                active_name_norm = _normalize_hyphens(active_name)
+                is_h1 = active_name_norm in {"Mean Reversion (H1)", "Breakout", "Trend-Following"}
+                trade_tf = "h1" if is_h1 else "m1"
 
             # Enforce cooldown by TF of intended trade
             last_open = self.broker.history[-1].open_time if self.broker.history else 0
