@@ -5,6 +5,9 @@ Implements:
 - Global daily caps ±$500 and fills cap for scalper (≤60).
 - 1R constant trailing, partials at +0.5R (scalper), BE handling.
 - Loss streak guard: 3 consecutive net losers → 30 min cooldown.
+
+This version updates ONLY the user-facing status text to be human‑friendly
+in the style of V1. Strategy logic is unchanged.
 """
 
 from __future__ import annotations
@@ -19,7 +22,7 @@ from .config import settings
 from .datafeed import seed_klines, poll_coinbase_tick
 from .broker import PaperBroker, FEE_MAKER, FEE_TAKER
 from .strategies.router import StrategyRouter
-from .ta import atr  # removed unused: ema
+from .ta import atr, donchian  # (ema removed as unused)
 
 
 def sod_sec() -> int:
@@ -36,8 +39,15 @@ def _normalize_hyphens(s: str) -> str:
          .replace("\u2013", "-")  # en dash
          .replace("\u2014", "-")  # em dash
          .replace("\u2010", "-")  # hyphen
-         .replace("\u2212", "-")  # minus sign, just in case
+         .replace("\u2212", "-")  # minus sign
     )
+
+
+def _mmss(sec: int) -> str:
+    sec = max(0, int(sec))
+    m = sec // 60
+    s = sec % 60
+    return f"{m}:{s:02d}"
 
 
 class BotEngine:
@@ -159,16 +169,10 @@ class BotEngine:
         self.vwap = out
 
     def _aggregate_h1(self) -> None:
-        """Aggregate M1 into H1 and MERGE into existing H1 (preserve seed history).
-
-        Why: H1 strategies need long history (200–240 bars). We aggregate the
-        hours covered by the current M1 window and update/append those buckets
-        into the seeded H1 series instead of replacing it.
-        """
+        """Aggregate M1 into H1 and MERGE into existing H1 (preserve seed history)."""
         if not self.m1:
             return
 
-        # Build aggregates for the hours covered by current M1 window.
         agg: dict[int, dict[str, Any]] = {}
         for c in self.m1:
             bucket = (c["time"] // 3600) * 3600
@@ -188,9 +192,7 @@ class BotEngine:
                 b["close"] = c["close"]
                 b["volume"] += c.get("volume", 0.0)
 
-        # Merge: replace existing hours with fresh aggregates; keep older H1 intact.
         if not self.h1:
-            # If no seed exists (rare), just use the aggregates we have.
             self.h1 = sorted(agg.values(), key=lambda x: x["time"])
             return
 
@@ -316,15 +318,101 @@ class BotEngine:
                     revert_ok = False
                 if atr_ratio is None or atr_ratio > 1.2:
                     revert_ok = False
-                # "No consecutive losses in the last 30 minutes"
                 recent = [t for t in self.broker.history if t.close_time >= (now - 1800)]
-                # if last two in that window are both losses → not ok
                 if len(recent) >= 2 and (recent[-1].pnl < 0 and recent[-2].pnl < 0):
                     revert_ok = False
                 if revert_ok:
                     self._apply_profile("LIGHT")
                     self._entered_heavy_at = None
                     self._log("AUTO: Reverted to LIGHT (conditions normalized).", set_status=False)
+
+    def _friendly_status(self, *, sig_reason: str | None, tf: str, now: int) -> str:
+        """Generate human‑readable status like V1, without changing trading logic."""
+        # Off?
+        if not self.settings.get("auto_trade"):
+            return "Off"
+
+        # Position open?
+        p = self.broker.pos
+        if p:
+            when = datetime.utcfromtimestamp(p.open_time).strftime("%H:%M:%S")
+            side = "Entered long" if p.side == "long" else "Entered short"
+            return f"{side} @ ${p.entry:.2f} • {when} UTC"
+
+        # Cooldown from loss streak?
+        if now < self._cool_until:
+            return f"Pausing {_mmss(self._cool_until - now)} to avoid chop"
+
+        # Macro pause
+        if self.settings.get("macro_pause"):
+            return "Macro pause"
+
+        # Daily caps?
+        pnl = self._day_pnl()
+        fills = self._fills_today()
+        if pnl <= -500 or pnl >= 500 or (tf == "m1" and fills >= 60):
+            return "Day guardrail on"
+
+        # Warmups and data availability
+        if tf == "m1":
+            if len(self.m1) < 5:
+                return "Loading recent prices"
+            if not self.vwap or self.vwap[-2] is None:
+                return "Building average line"
+        else:
+            if len(self.h1) < 240:
+                return "Need H1 history"
+
+        # Volatility pause by profile (mirrors enforce logic)
+        atr_ratio = self._atr_pct_m1_ratio_to_med50()
+        if atr_ratio is not None:
+            if self.profile_active == "LIGHT" and tf == "m1" and atr_ratio > self._PROFILES["LIGHT"]["VOL_PAUSE_RATIO"]:
+                return "Volatility pause"
+            if self.profile_active == "HEAVY" and atr_ratio > self._PROFILES["HEAVY"]["VOL_PAUSE_RATIO"]:
+                return "Volatility pause"
+
+        # Map strategy reasons into UX phrases (best‑effort; keeps V2 logic intact)
+        r = (sig_reason or "").lower()
+
+        # ATR band mapping
+        if "atr range" in r:
+            ap = self._atr_pct_m1() or 0.0
+            mn = self.profile.get("ATR_PCT_MIN", 0.0004)
+            mx = self.profile.get("ATR_PCT_MAX", 0.02)
+            return "Movement too small" if ap < mn else "Movement too wild"
+
+        if "spread" in r:
+            return "Spread too wide"
+        if "fee" in r:
+            return "Thinking fees will eat this one"
+        if "pause" in r or "cooldown" in r:
+            return "Pausing to avoid chop"
+        if "vwap" in r or "slope" in r or "trend" in r:
+            return "One-way move. Waiting pullback"
+
+        # Inside bands → directional nudge toward VWAP (scalper only)
+        if "inside bands" in r and tf == "m1" and self.vwap and len(self.m1) >= 2:
+            i = len(self.m1) - 2
+            px = self.m1[i]["close"]
+            vw = self.vwap[i]
+            if vw is not None:
+                return "Need red close toward average" if px > vw else "Need green close toward average"
+
+        # H1 Donchian break helper
+        if "waiting donchian break" in r and len(self.h1) >= 2:
+            dc = donchian(self.h1, 20)
+            i = len(self.h1) - 2
+            hi = dc["hi"][i - 1] if i - 1 >= 0 else None
+            lo = dc["lo"][i - 1] if i - 1 >= 0 else None
+            px = self.h1[i]["close"]
+            if hi is not None and lo is not None:
+                if abs(px - hi) < abs(px - lo):
+                    return "Need break above last high"
+                else:
+                    return "Need break below last low"
+
+        # Default
+        return "Waiting for the next trade"
 
     async def _run(self) -> None:
         last_m1_closed = 0
@@ -361,7 +449,6 @@ class BotEngine:
                         if not p.partial_taken:
                             hit_half = (self.price >= p.entry + 0.5 * R) if p.side == "long" else (self.price <= p.entry - 0.5 * R)
                             if hit_half:
-                                # Use per-profile partial fraction *at entry time*, with safety clamp
                                 frac_default = 0.60 if p.profile == "HEAVY" else 0.50
                                 prof_conf = self._PROFILES.get(p.profile, {})
                                 frac_conf = prof_conf.get("SCALP_PARTIAL_FRAC", frac_default)
@@ -416,7 +503,6 @@ class BotEngine:
                                 self._log(f"Closed on TAKE ({p.side}); PnL {net:+.2f}")
                             else:
                                 self._log(f"Closed on STOP ({p.side}); PnL {net:+.2f}")
-                            # update loss streak + potential cooldown + AUTO switching memory
                             if net is not None and net > 0:
                                 self._loss_streak = 0
                                 self._last_trade_was_loss = False
@@ -447,21 +533,22 @@ class BotEngine:
 
     async def _maybe_signal(self, tf: str) -> None:
         """Evaluate the adaptive strategy and open/close trades."""
+        now = int(time.time())
+
         if self.settings.get("macro_pause"):
             self.status_text = "Macro pause"
             return
-        if int(time.time()) < self._cool_until:
+        if now < self._cool_until:
+            self.status_text = f"Pausing {_mmss(self._cool_until - now)} to avoid chop"
             return
 
         # --- Global daily P&L cap (±$500) for ALL strategies ---
         pnl = self._day_pnl()
         fills = self._fills_today()
-        now = int(time.time())
 
         pnl_ok = (-500 < pnl < 500)
         if not pnl_ok:
-            # Block new entries globally; let existing positions manage/close.
-            self.status_text = "Daily cap reached (±$500) — blocking new entries."
+            self.status_text = "Day guardrail on"
             return
 
         # Active TF decision (for routing & context)
@@ -477,10 +564,10 @@ class BotEngine:
         atr_ratio = self._atr_pct_m1_ratio_to_med50()
         if atr_ratio is not None:
             if self.profile_active == "LIGHT" and scalp and atr_ratio > self._PROFILES["LIGHT"]["VOL_PAUSE_RATIO"]:
-                self.status_text = "Volatility pause (m1 ATR spike)"
+                self.status_text = "Volatility pause"
                 return
             if self.profile_active == "HEAVY" and atr_ratio > self._PROFILES["HEAVY"]["VOL_PAUSE_RATIO"]:
-                self.status_text = "Volatility pause (HEAVY)"
+                self.status_text = "Volatility pause"
                 return
 
         # Pre-signal cooldown hint for scalper strategy; H1 will be enforced post-pick.
@@ -537,24 +624,22 @@ class BotEngine:
         strategy_router = self.router.pick(scalp)
         sig = strategy_router.evaluate(src, context)
 
-        # status line with regime + strategy + reason (safe formatting for warmup)
+        # Telemetry for CONDITIONS block in UI (unchanged)
         adx_val = strategy_router.last_adx
         atr_pct = strategy_router.last_atr_pct
         reg = strategy_router.last_regime or "—"
         bias = strategy_router.last_bias or "—"
         active = strategy_router.last_strategy or "—"
 
-        adx_str = f"{adx_val:.0f}" if isinstance(adx_val, (int, float)) else "—"
-        atr_str = f"{((atr_pct or 0.0) * 100):.2f}%"
-
-        self.status_text = (
-            f"{self.profile_active} | Regime: {reg} (ADX={adx_str} | ATR%={atr_str}) | "
-            f"Bias: {bias} | Strat: {active} | {sig.reason}"
+        # Human‑friendly STATUS like V1
+        self.status_text = self._friendly_status(
+            sig_reason=getattr(sig, "reason", None),
+            tf=("m1" if scalp else "h1"),
+            now=now,
         )
 
         # --- Handle trade (apply strategy-chosen TF + cooldown) ---
         if sig.type in ("BUY", "SELL") and self.settings.get("auto_trade") and self.price is not None:
-            # Prefer explicit TF from signal if available; else fall back to robust name check
             tf_from_sig = getattr(sig, "tf", None)
             if tf_from_sig in ("m1", "h1"):
                 trade_tf = tf_from_sig
@@ -565,13 +650,11 @@ class BotEngine:
                 is_h1 = active_name_norm in {"Mean Reversion (H1)", "Breakout", "Trend-Following"}
                 trade_tf = "h1" if is_h1 else "m1"
 
-            # Enforce cooldown by TF of intended trade
             last_open = self.broker.history[-1].open_time if self.broker.history else 0
             cooldown_ok = (now - last_open) > (3600 if trade_tf == "h1" else 60)
             if not cooldown_ok:
                 return
 
-            # Select proper series/index for entry
             series = self.h1 if is_h1 else self.m1
             i_entry = (len(series) - 2)
             if i_entry is None or i_entry < 0 or i_entry >= len(series):
@@ -581,7 +664,6 @@ class BotEngine:
             stopd = sig.stop_dist or (entry * 0.005)
             taked = sig.take_dist or (entry * 0.005)
 
-            # --- Volatility overlay: reduce risk as ATR% rises within allowed band ---
             scalp_trade = (trade_tf == "m1")
             base_risk = self.profile.get("RISK_PCT_SCALP") if scalp_trade else self.profile.get("RISK_PCT_H1")
 
@@ -595,7 +677,6 @@ class BotEngine:
             risk_mult = 1.0 - 0.5 * norm  # high vol => ~0.5x; low vol => 1.0x
             risk_pct = base_risk * risk_mult
 
-            # HEAVY additional clamp: ≤ 75% of base
             if self.profile_active == "HEAVY":
                 risk_pct = min(risk_pct, 0.75 * base_risk)
 
@@ -608,7 +689,6 @@ class BotEngine:
             stop = (entry - stopd) if sig.type == "BUY" else (entry + stopd)
             take = (entry + taked) if sig.type == "BUY" else (entry - taked)
 
-            # reverse if opposite side open
             if self.broker.pos:
                 ps = self.broker.pos.side
                 if (sig.type == "BUY" and ps == "short") or (sig.type == "SELL" and ps == "long"):
