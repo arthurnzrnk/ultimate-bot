@@ -7,12 +7,25 @@ body {
 
 /* Background */
 .bg { position: fixed; inset: 0; background: #0a0f1a; }
+
+/* Static glow from V2 (kept but dimmed by the dynamic glow we add on the page) */
 .glow {
   position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
   width: 60vw; height: 60vw; border-radius: 9999px;
-  filter: blur(60px); opacity: 0.35;
+  filter: blur(60px); opacity: 0.15;   /* lower so dynamic glow dominates */
   background: linear-gradient(135deg, #fbbf24, #f59e0b, #ef4444);
 }
+
+/* Dynamic V1-style glow (tone changes with bot state) */
+.glow-dynamic {
+  position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  width: 60vw; height: 60vw; border-radius: 9999px;
+  filter: blur(60px); opacity: 0.35; pointer-events: none; z-index: 0;
+}
+.tone-gray   { background: linear-gradient(135deg, #94a3b8, #64748b, #475569); }
+.tone-orange { background: linear-gradient(135deg, #fbbf24, #f59e0b, #ef4444); }
+.tone-green  { background: linear-gradient(135deg, #86efac, #22c55e, #d9f99d); }
+.tone-red    { background: linear-gradient(135deg, #fb7185, #ef4444, #f59e0b); }
 
 /* Header */
 .app-header {
