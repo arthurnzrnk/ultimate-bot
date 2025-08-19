@@ -9,6 +9,9 @@ adjust defaults when deploying your own environment.
 
 import os
 from pydantic import BaseModel
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 def _get_list(env_key: str) -> list[str]:
