@@ -29,14 +29,14 @@ export default function Dashboard() {
   const [dir, setDir] = useState<'up' | 'down' | null>(null)
   const lastShown = useRef<number | undefined>(undefined)
 
-  // Logs (feed at bottom)
+  // Logs (feed now lives under Paper Account on the right)
   const [logs, setLogs] = useState<LogLine[]>([])
   const [loadingLogs, setLoadingLogs] = useState(true)
   const logBoxRef = useRef<HTMLDivElement | null>(null)
 
   // Chart
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
-  const [barCount, setBarCount] = useState<number>(150)
+  const [barCount] = useState<number>(150)
 
   // Poll /status
   useEffect(() => {
@@ -231,8 +231,7 @@ export default function Dashboard() {
     const canvas = canvasRef.current
     if (!canvas) return
     const overlays: Overlay[] = []
-    // VWAP on 1m (matches old look)
-    overlays.push({ data: vwap, color: '#60a5fa', dashed: true })
+    overlays.push({ data: vwap, color: '#60a5fa', dashed: true }) // VWAP on 1m like V1
     const pos = data?.pos
     const hl = pos ? (pos.side === 'long' ? 'BUY' : 'SELL') : null
     drawChart(canvas, (data.candles || []) as Candle[], overlays, hl, barCount)
@@ -249,9 +248,9 @@ export default function Dashboard() {
     await postSettings({ autoTrade: next })
     setData((d: any) => ({ ...d, autoTrade: next }))
   }
-  async function setStrategyLabel(label: string) {
-    await postSettings({ strategy: label })
-    setData((d: any) => ({ ...d, strategy: label }))
+  async function setProfileMode(mode: ProfileMode) {
+    await postSettings({ profileMode: mode })
+    setData((d: any) => ({ ...d, profileMode: mode }))
   }
 
   const px = data?.price ?? null
@@ -260,7 +259,7 @@ export default function Dashboard() {
   const fills = data?.fillsToday ?? 0
   const pnlToday = data?.pnlToday ?? 0
 
-  // Friendly CONDITIONS line close to the old UI
+  // Friendly CONDITIONS line (unchanged)
   const conditionsText = [
     data.activeStrategy ?? data.strategy ?? '—',
     data.regime ? `Regime: ${data.regime}` : null,
@@ -269,8 +268,14 @@ export default function Dashboard() {
     data.atrPct != null ? `ATR%: ${fmt((data.atrPct || 0) * 100, 2)}%` : null,
   ].filter(Boolean).join(' • ')
 
+  // ----- Dynamic glow tone (match V1) -----
+  const glowTone = !data.autoTrade ? 'gray' : data.pos ? (data.pos.side === 'long' ? 'green' : 'red') : 'orange'
+
   return (
     <div>
+      {/* Dynamic background glow like V1 */}
+      <div className={`glow-dynamic tone-${glowTone}`} />
+
       {/* HEADER */}
       <div className="glass header-card">
         <div>
@@ -296,8 +301,6 @@ export default function Dashboard() {
           <span className="cond-meta"> (P&amp;L today: {fmt(pnlToday, 2)} / cap ±$500; fills {fills}/60)</span>
         </div>
       </div>
-
-      {/* SIGNAL banner intentionally omitted (engine doesn’t emit it). */}
 
       {/* MAIN GRID */}
       <div className="main-grid">
@@ -336,7 +339,7 @@ export default function Dashboard() {
           </section>
         </div>
 
-        {/* Right: Controls + Account */}
+        {/* Right: Controls + Account + Logs (moved here) */}
         <div className="right-col">
           <section className="glass pcard">
             <h2 className="card-title">Toggles</h2>
@@ -349,20 +352,18 @@ export default function Dashboard() {
           </section>
 
           <section className="glass pcard">
-            <h2 className="card-title">Strategy</h2>
+            <h2 className="card-title">Profile Mode</h2>
             <select
               className="select"
-              value={data.strategy ?? 'Adaptive Router'}
-              onChange={e => setStrategyLabel(e.target.value)}
+              value={data.profileMode ?? 'AUTO'}
+              onChange={e => setProfileMode(e.target.value as ProfileMode)}
             >
-              <option>Adaptive Router</option>
-              <option>Level King — Profiled</option>
-              <option>Mean Reversion (H1)</option>
-              <option>Breakout</option>
-              <option>Trend‑Following</option>
+              <option value="AUTO">AUTO (recommended)</option>
+              <option value="LIGHT">LIGHT</option>
+              <option value="HEAVY">HEAVY</option>
             </select>
             <div className="muted">
-              Router decides dynamically • UI label only
+              Active today: <b>{data.profileModeActive}</b>
             </div>
           </section>
 
@@ -391,40 +392,40 @@ export default function Dashboard() {
               </div>
             ) : <div className="muted-xs" style={{ marginTop: 8 }}>No open position.</div>}
           </section>
-        </div>
-      </div>
 
-      {/* Logs */}
-      <div className="glass" style={{ padding: 12, marginTop: 12 }}>
-        <div style={{ fontWeight: 600, marginBottom: 8 }}>Bot Status Feed</div>
-        {loadingLogs && logs.length === 0 ? (
-          <p className="muted">Loading logs…</p>
-        ) : logs.length === 0 ? (
-          <p className="muted">No logs yet. Engine events will show here.</p>
-        ) : (
-          <div
-            ref={logBoxRef}
-            style={{
-              maxHeight: 420,
-              overflow: 'auto',
-              padding: 8,
-              borderRadius: 12,
-              background: 'rgba(0,0,0,0.25)',
-              border: '1px solid rgba(255,255,255,0.12)',
-            }}
-          >
-            <ul style={{ listStyleType: 'none', paddingLeft: 0, margin: 0 }}>
-              {logs.map((l, idx) => (
-                <li key={idx} style={{ marginBottom: 6, fontSize: 14 }}>
-                  <span style={{ opacity: 0.7, marginRight: 8 }}>
-                    {new Date(l.ts * 1000).toLocaleTimeString()}
-                  </span>
-                  <span>{l.text}</span>
-                </li>
-              ))}
-            </ul>
-          </div>
-        )}
+          {/* Bot Status Feed — moved under Paper Account */}
+          <section className="glass pcard">
+            <h2 className="card-title">Bot Status Feed</h2>
+            {loadingLogs && logs.length === 0 ? (
+              <p className="muted">Loading logs…</p>
+            ) : logs.length === 0 ? (
+              <p className="muted">No logs yet. Engine events will show here.</p>
+            ) : (
+              <div
+                ref={logBoxRef}
+                style={{
+                  maxHeight: 420,
+                  overflow: 'auto',
+                  padding: 8,
+                  borderRadius: 12,
+                  background: 'rgba(0,0,0,0.25)',
+                  border: '1px solid rgba(255,255,255,0.12)',
+                }}
+              >
+                <ul style={{ listStyleType: 'none', paddingLeft: 0, margin: 0 }}>
+                  {logs.map((l, idx) => (
+                    <li key={idx} style={{ marginBottom: 6, fontSize: 14 }}>
+                      <span style={{ opacity: 0.7, marginRight: 8 }}>
+                        {new Date(l.ts * 1000).toLocaleTimeString()}
+                      </span>
+                      <span>{l.text}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </section>
+        </div>
       </div>
     </div>
   )
