@@ -11,6 +11,8 @@ Profile gates implemented:
 - Volume confirmation on reclaim candle:
   * If feed volume is "tick-ish" (1 Hz polling → ~60 per bar), bypass this gate.
   * Otherwise: m1 vol ≥ mult × median(last 20)
+  * Warm-start exception: when seeding with real exchange volumes, allow the
+    gate to pass until the tick-volume window fills in.
 - Candlestick quality filters (engulfing/hammer/shooting star)
 - Entry = overshoot (prev bar) + reclaim (current bar green/red)
 - band_pct = max(0.20%, 0.7 * ATR%)
@@ -126,16 +128,19 @@ class LevelKingRegime(Strategy):
         if fee_r > prof.get("FEE_R_MAX", 0.25):
             return Signal(type="WAIT", reason="Fees>limitR")
 
-        # Volume confirmation on reclaim candle — bypass if we detect 1 Hz tick volume.
+        # Volume confirmation on reclaim candle
         win = m1[max(0, iC - 20): iC]  # last 20 closed bars
         vols = [c.get("volume", 0.0) for c in win if isinstance(c.get("volume", 0.0), (int, float))]
         med = median(vols) if vols else 0.0
+        cur_vol = m1[iC].get("volume", 0.0)
+
+        # Bypass when we detect tick-volume *or* we're in the cold-start where seed volumes dwarf tick counts.
         tickish = _looks_like_tick_volume(vols)
-        if tickish:
+        if tickish or (med >= 500 and cur_vol <= 120 and len(win) >= 10):
             vol_ok = True
         else:
             vol_mult = float(prof.get("SCALP_VOL_MULT", 1.5))
-            vol_ok = (m1[iC].get("volume", 0.0) >= (vol_mult * med)) if med > 0 else True
+            vol_ok = (cur_vol >= (vol_mult * med)) if med > 0 else True
 
         # Candlestick quality
         prev = m1[iC - 1] if iC > 0 else None
