@@ -3,12 +3,14 @@
 Profile gates implemented:
 - ATR% band (profile-specific)
 - VWAP EMA10 slope ≤ cap (over ~3 bars)
-- Spread ≤ 10 bps
+- Spread ≤ 10 bps (only enforced when feed spread looks realistic)
 - Fee/TP constraint
 - Top‑down bias:
   * LIGHT: if H1 ADX ≤ 18 → both sides; else align with H1 EMA200 bias
   * HEAVY: always align with H1 EMA200 bias
-- Volume confirmation on reclaim candle: m1 vol ≥ mult × median(last 20)
+- Volume confirmation on reclaim candle:
+  * If feed volume is "tick-ish" (1 Hz polling → ~60 per bar), bypass this gate.
+  * Otherwise: m1 vol ≥ mult × median(last 20)
 - Candlestick quality filters (engulfing/hammer/shooting star)
 - Entry = overshoot (prev bar) + reclaim (current bar green/red)
 - band_pct = max(0.20%, 0.7 * ATR%)
@@ -35,9 +37,7 @@ def _hammer(cur, heavy=False):
     rng = _range(cur)
     body = _body(cur)
     lower = cur["low"]
-    upper = cur["high"]
     lo_wick = (cur["open"] if cur["open"] < cur["close"] else cur["close"]) - lower
-    hi_wick = upper - (cur["open"] if cur["open"] > cur["close"] else cur["close"])
     cond = lo_wick >= body  # lower wick at least body
     if heavy:
         # close in top 25% of range
@@ -50,7 +50,6 @@ def _shooting_star(cur, heavy=False):
     body = _body(cur)
     lower = cur["low"]
     upper = cur["high"]
-    lo_wick = (cur["open"] if cur["open"] < cur["close"] else cur["close"]) - lower
     hi_wick = upper - (cur["open"] if cur["open"] > cur["close"] else cur["close"])
     cond = hi_wick >= body  # upper wick at least body
     if heavy:
@@ -58,6 +57,19 @@ def _shooting_star(cur, heavy=False):
         close_pos = (cur["close"] - lower) / max(1e-8, rng)
         cond = cond and (close_pos <= 0.25)
     return cond
+
+def _looks_like_tick_volume(vols: list[float]) -> bool:
+    """Heuristic: 1 Hz polling → ~60 'volume' per minute with tiny variation."""
+    if not vols or len(vols) < 10:
+        return False
+    vmin = min(vols)
+    vmax = max(vols)
+    med = median(vols)
+    if med <= 0:
+        return False
+    variation = (vmax - vmin) / max(1.0, med)
+    # Flat, small swing near 60 ticks/min → treat as tick‑volume, not real volume.
+    return (40 <= med <= 80) and (variation <= 0.25)
 
 
 class LevelKingRegime(Strategy):
@@ -77,7 +89,8 @@ class LevelKingRegime(Strategy):
 
         px = m1[iC]["close"]
         a14 = atr(m1, 14)
-        vwap = ctx["vwap"][iC] if ctx.get("vwap") else None
+        vwap_series = ctx.get("vwap") or []
+        vwap = vwap_series[iC] if len(vwap_series) > iC else None
         if vwap is None:
             return Signal(type="WAIT", reason="VWAP warmup")
 
@@ -89,19 +102,22 @@ class LevelKingRegime(Strategy):
             return Signal(type="WAIT", reason="ATR range")
 
         # Slope gate to avoid steep trends
-        v10 = ema([x if x is not None else vwap for x in ctx["vwap"]], 10)
+        v10 = ema([x if x is not None else vwap for x in vwap_series], 10)
         prev_ix = iC - 3 if iC >= 3 else (iC - 1 if iC > 0 else iC)
         slope = abs((v10[iC] or vwap) - (v10[prev_ix] or vwap)) / max(1.0, px)
         slope_mx = prof.get("VWAP_SLOPE_MAX", 0.00060)
         if slope > slope_mx:
             return Signal(type="WAIT", reason="Trend regime")
 
-        # Spread cap
+        # Spread cap — only enforce if the feed spread looks realistic.
         bid, ask = ctx.get("bid"), ctx.get("ask")
         if bid and ask:
-            spread_bps = ((ask - bid) / ((bid + ask) / 2.0)) * 10000.0
-            if spread_bps > prof.get("SPREAD_BPS_MAX", 10):
-                return Signal(type="WAIT", reason="Spread too wide")
+            mid = (bid + ask) / 2.0
+            spread_bps = ((ask - bid) / max(1e-12, mid)) * 10000.0
+            # Ignore absurd retail endpoints (e.g., padded >200 bps) instead of blocking.
+            if spread_bps <= 200:
+                if spread_bps > prof.get("SPREAD_BPS_MAX", 10):
+                    return Signal(type="WAIT", reason="Spread too wide")
 
         tp_floor = prof.get("TP_FLOOR", 0.0020)
         band_pct = max(tp_floor, 0.7 * atr_pct)
@@ -110,11 +126,16 @@ class LevelKingRegime(Strategy):
         if fee_r > prof.get("FEE_R_MAX", 0.25):
             return Signal(type="WAIT", reason="Fees>limitR")
 
-        # Volume confirmation on reclaim candle
+        # Volume confirmation on reclaim candle — bypass if we detect 1 Hz tick volume.
         win = m1[max(0, iC - 20): iC]  # last 20 closed bars
         vols = [c.get("volume", 0.0) for c in win if isinstance(c.get("volume", 0.0), (int, float))]
         med = median(vols) if vols else 0.0
-        vol_ok = (m1[iC].get("volume", 0.0) >= (prof.get("SCALP_VOL_MULT", 1.5) * med)) if med > 0 else True
+        tickish = _looks_like_tick_volume(vols)
+        if tickish:
+            vol_ok = True
+        else:
+            vol_mult = float(prof.get("SCALP_VOL_MULT", 1.5))
+            vol_ok = (m1[iC].get("volume", 0.0) >= (vol_mult * med)) if med > 0 else True
 
         # Candlestick quality
         prev = m1[iC - 1] if iC > 0 else None
@@ -150,7 +171,7 @@ class LevelKingRegime(Strategy):
                     bias_ok_short = bool(ema_bias_dn)
 
         # Overshoot + reclaim logic
-        vprev = ctx["vwap"][iC - 1] if iC > 0 else None
+        vprev = vwap_series[iC - 1] if iC > 0 else None
         overshoot_long = bool(prev and vprev and prev["low"] <= vprev * (1 - band_pct * 1.05))
         reclaim_long = bool(px >= (vwap or px) * (1 - band_pct * 0.70) and _is_green(cur))
         overshoot_short = bool(prev and vprev and prev["high"] >= vprev * (1 + band_pct * 1.05))
