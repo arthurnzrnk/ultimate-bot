@@ -1,10 +1,11 @@
 """Market data fetching utilities for the Ultimate Bot.
 
 This module provides asynchronous functions to seed historical candles from
-Binance (1m and 1h candles) and to poll Coinbase's spot, buy and sell
-endpoints. Coinbase retail endpoints can report padded buy/sell prices with
-a wide spread; we normalize obviously bogus spreads so strategy spread gates
-remain meaningful.
+Binance (1m and 1h candles) and to poll live ticks. We try Coinbase retail
+first, then fall back to Binance bookTicker (bid/ask) and, finally, to
+Binance spot price. Retail endpoints can report padded buy/sell prices with
+a wide spread; we normalize obviously bogus spreads so strategy spread
+gates remain meaningful.
 """
 
 import httpx
@@ -16,16 +17,20 @@ from .models import Candle
 BINANCE_1M = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit="
 BINANCE_1H = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1h&limit="
 
-# Coinbase retail endpoints used for fallback polling
+# Coinbase retail endpoints used for polling (preferred, when they respond)
 COINBASE_SPOT = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
 COINBASE_BUY = "https://api.coinbase.com/v2/prices/BTC-USD/buy"
 COINBASE_SELL = "https://api.coinbase.com/v2/prices/BTC-USD/sell"
+
+# Binance live tick fallbacks
+BINANCE_BOOK = "https://api.binance.com/api/v3/ticker/bookTicker?symbol=BTCUSDT"
+BINANCE_SPOT_TICK = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
 
 
 async def fetch_json(client: httpx.AsyncClient, url: str):
     """Fetch JSON from an endpoint with error handling."""
     try:
-        r = await client.get(url, timeout=8.0)
+        r = await client.get(url, timeout=8.0, headers={"User-Agent": "UltimateBot/1.0"})
         r.raise_for_status()
         return r.json()
     except Exception:
@@ -88,7 +93,7 @@ def _normalize_bid_ask_from_spot(px: float | None, bid: float | None, ask: float
     return bid, ask
 
 
-async def poll_coinbase_tick(client: httpx.AsyncClient) -> tuple[float | None, float | None, float | None]:
+async def _poll_coinbase_tick(client: httpx.AsyncClient) -> tuple[float | None, float | None, float | None]:
     """Poll Coinbase spot, buy and sell endpoints for a tick.
 
     Returns:
@@ -108,3 +113,33 @@ async def poll_coinbase_tick(client: httpx.AsyncClient) -> tuple[float | None, f
     # Normalize obviously padded spreads using spot as anchor
     bid, ask = _normalize_bid_ask_from_spot(px, bid, ask)
     return px, bid, ask
+
+
+async def poll_tick(client: httpx.AsyncClient) -> tuple[float | None, float | None, float | None]:
+    """Robust tick polling with fallbacks (Coinbase → Binance bookTicker → Binance spot)."""
+    # 1) Try Coinbase retail
+    try:
+        px, bid, ask = await _poll_coinbase_tick(client)
+        if px is not None and bid is not None and ask is not None:
+            return px, bid, ask
+    except Exception:
+        # swallow and try fallbacks
+        pass
+
+    # 2) Binance bookTicker (has bid/ask)
+    try:
+        bj = await fetch_json(client, BINANCE_BOOK + f"&ts={int(time.time() * 1000)}")
+        if isinstance(bj, dict) and "bidPrice" in bj and "askPrice" in bj:
+            b = float(bj["bidPrice"])
+            a = float(bj["askPrice"])
+            px2 = (b + a) / 2.0
+            b, a = _normalize_bid_ask_from_spot(px2, b, a)
+            return px2, b, a
+    except Exception:
+        pass
+
+    # 3) Binance spot price (synthesize a tight bid/ask if missing)
+    sj = await fetch_json(client, BINANCE_SPOT_TICK)
+    p = float(sj["price"]) if isinstance(sj, dict) and "price" in sj else None
+    b, a = _normalize_bid_ask_from_spot(p, None, None)
+    return p, b, a
