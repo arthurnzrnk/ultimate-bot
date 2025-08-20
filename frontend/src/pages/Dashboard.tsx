@@ -261,12 +261,25 @@ export default function Dashboard() {
   const fills = data?.fillsToday ?? 0
   const pnlToday = data?.pnlToday ?? 0
 
+  const atrLine = (() => {
+    const a = data.atrPct
+    if (a == null) return null
+    const bandMin = data.atrBandMin
+    const bandMax = data.atrBandMax
+    const pct = typeof a === 'number' ? (a * 100) : null
+    const bmin = typeof bandMin === 'number' ? (bandMin * 100) : null
+    const bmax = typeof bandMax === 'number' ? (bandMax * 100) : null
+    return (pct != null && bmin != null && bmax != null)
+      ? `ATR%: ${fmt(pct, 2)}% (band ${fmt(bmin, 2)}–${fmt(bmax, 2)}%)`
+      : `ATR%: ${fmt((a || 0) * 100, 2)}%`
+  })()
+
   const conditionsText = [
     data.activeStrategy ?? data.strategy ?? '—',
     data.regime ? `Regime: ${data.regime}` : null,
     data.bias ? `Bias: ${data.bias}` : null,
     data.adx != null ? `ADX: ${fmt(data.adx, 0)}` : null,
-    data.atrPct != null ? `ATR%: ${fmt((data.atrPct || 0) * 100, 2)}%` : null,
+    atrLine,
   ].filter(Boolean).join(' • ')
 
   // Dynamic glow tone
