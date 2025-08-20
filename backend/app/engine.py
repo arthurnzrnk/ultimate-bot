@@ -54,6 +54,11 @@ class BotEngine:
         self.status_text: str = "Loading..."
         self.logs: list[dict[str, Any]] = []
 
+        # Watchdog for net staleness
+        self._stale_count: int = 0
+        self._stale_threshold: int = 3
+        self._net_stale: bool = False
+
         self._PROFILES = {
             "LIGHT": {
                 "ATR_PCT_MIN": 0.0004,
@@ -92,7 +97,7 @@ class BotEngine:
         # NOTE: default auto_trade is OFF (you toggle it in the UI)
         self.settings: dict[str, Any] = {
             "scalp_mode": True,
-            "auto_trade": False,          # <-- OFF by default (changed)
+            "auto_trade": False,          # <-- OFF by default
             "strategy": "Adaptive Router",
             "macro_pause": False,
             "profile_mode": "AUTO",
@@ -377,6 +382,26 @@ class BotEngine:
         while True:
             try:
                 px, bid, ask = await poll_tick(self.client)
+
+                # Watchdog: mark feed stale if no provider returns for a few loops
+                if px is None and bid is None and ask is None:
+                    self._stale_count += 1
+                    if self._stale_count >= self._stale_threshold:
+                        if not self._net_stale:
+                            self._log("DATA: Feed stale (no tick ≥3s). Waiting for providers…", set_status=False)
+                            self._net_stale = True
+                        # Signal UI to show NET: STALE
+                        self.price = None
+                    # Skip the rest of the loop on a fully missing tick
+                    await asyncio.sleep(1.0)
+                    self._maybe_auto_switch()
+                    continue
+                else:
+                    if self._net_stale:
+                        self._log("DATA: Feed recovered.", set_status=False)
+                    self._stale_count = 0
+                    self._net_stale = False
+
                 if bid and ask:
                     self.bid, self.ask = bid, ask
                 shown = ((bid + ask) / 2.0) if (bid and ask) else (px or None)
@@ -608,8 +633,6 @@ class BotEngine:
             taked = sig.take_dist or (entry * 0.005)
 
             # --- SIZING: FULL PAPER EQUITY NOTIONAL (no risk model) ---
-            # Use the entire paper equity as the notional for every trade so the UI's
-            # account balance (e.g., $10,000) is exactly the trade size.
             notional = max(0.0, self.broker.equity)
             qty = max(0.0001, notional / max(1.0, entry))
 
