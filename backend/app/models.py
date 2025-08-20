@@ -49,7 +49,7 @@ class Trade(BaseModel):
 class Settings(BaseModel):
     # kept for compatibility; hidden in UI now
     scalp_mode: bool = True
-    auto_trade: bool = True
+    auto_trade: bool = False
     strategy: str = "Adaptive Router"
     macro_pause: bool = False
 
@@ -69,7 +69,7 @@ class Status(BaseModel):
 
     # UI flags (legacy, still emitted; UI ignores toggles)
     scalpMode: bool = True
-    autoTrade: bool = True
+    autoTrade: bool = False
 
     # Strategy labels
     strategy: str = "Adaptive Router"          # overall (from settings)
