@@ -87,3 +87,7 @@ class Status(BaseModel):
     # V2 profile telemetry
     profileMode: ProfileMode = "AUTO"          # user setting (AUTO/LIGHT/HEAVY)
     profileModeActive: Literal["LIGHT", "HEAVY"] = "LIGHT"
+
+    # NEW: expose active ATR band so UI can show why ATR gate is blocking
+    atrBandMin: Optional[float] = None         # e.g., 0.0004
+    atrBandMax: Optional[float] = None         # e.g., 0.0200
