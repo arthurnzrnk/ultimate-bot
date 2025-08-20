@@ -1,7 +1,7 @@
 """Market data fetching utilities for the Ultimate Bot.
 
 This version fixes the "frozen price / no orders" issue by:
-- Racing providers concurrently (Coinbase spot + Binance book + Binance spot).
+- Racing providers concurrently (Coinbase Exchange ticker + Coinbase retail spot + Binance book + Binance spot).
 - Using tight per‑request timeouts and cancelling stragglers.
 - Preferring Binance order book (real bid/ask); synthesizing bid/ask from spot when needed.
 - Keeping the robust multi‑source seeding with a local cache fallback.
@@ -35,9 +35,13 @@ CBX_1H = "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity
 # ----------------------
 # Endpoints for live tick polling (concurrent race)
 # ----------------------
+# Coinbase Exchange ticker: {"price","bid","ask","time"}
+CBX_TICKER = "https://api.exchange.coinbase.com/products/BTC-USD/ticker"
+# Coinbase retail spot
 COINBASE_SPOT = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
-# (we no longer wait on Coinbase buy/sell — we synthesize when needed)
+# Binance order book (best bid/ask)
 BINANCE_BOOK = "https://api.binance.com/api/v3/ticker/bookTicker?symbol=BTCUSDT"
+# Binance spot price
 BINANCE_SPOT_TICK = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
 
 # ----------------------
@@ -199,84 +203,99 @@ def _normalize_bid_ask_from_spot(px: float | None, bid: float | None, ask: float
 
 async def poll_tick(client: httpx.AsyncClient) -> tuple[float | None, float | None, float | None]:
     """
-    Race Coinbase spot + Binance order book + Binance spot.
+    Race Coinbase Exchange ticker + Coinbase spot + Binance order book + Binance spot.
     Returns (px, bid, ask) quickly; cancels stragglers to keep 1 Hz rhythm.
     """
     ts = int(time.time() * 1000)
 
-    # Fire all three; whichever finishes first gives us a viable tick.
-    t_cb_spot = asyncio.create_task(fetch_json(client, COINBASE_SPOT + f"?ts={ts}", timeout=1.5))
-    t_bn_book = asyncio.create_task(fetch_json(client, BINANCE_BOOK, timeout=1.5))
-    t_bn_spot = asyncio.create_task(fetch_json(client, BINANCE_SPOT_TICK, timeout=1.5))
+    tasks = [
+        asyncio.create_task(fetch_json(client, CBX_TICKER + f"?ts={ts}", timeout=1.5)),
+        asyncio.create_task(fetch_json(client, COINBASE_SPOT + f"?ts={ts}", timeout=1.5)),
+        asyncio.create_task(fetch_json(client, BINANCE_BOOK, timeout=1.5)),
+        asyncio.create_task(fetch_json(client, BINANCE_SPOT_TICK, timeout=1.5)),
+    ]
 
     px: float | None = None
     bid: float | None = None
     ask: float | None = None
 
     try:
-        # First shot: wait briefly for any to come back.
-        done, pending = await asyncio.wait(
-            {t_cb_spot, t_bn_book, t_bn_spot},
-            timeout=1.2,
-            return_when=asyncio.FIRST_COMPLETED,
-        )
+        # Phase 1: wait briefly for the first winner
+        done, pending = await asyncio.wait(set(tasks), timeout=1.2, return_when=asyncio.FIRST_COMPLETED)
 
-        # Collect whatever finished.
-        for task in (t_cb_spot, t_bn_book, t_bn_spot):
-            if not task.done():
-                continue
-            res = task.result()
-            if task is t_bn_book and isinstance(res, dict) and "bidPrice" in res and "askPrice" in res:
+        def absorb(task_res, is_done: bool):
+            nonlocal px, bid, ask
+            if not is_done:
+                return
+            res = task_res
+            # Binance book (authoritative bid/ask)
+            if isinstance(res, dict) and "bidPrice" in res and "askPrice" in res:
                 try:
                     b = float(res["bidPrice"])
                     a = float(res["askPrice"])
                     bid, ask = _normalize_bid_ask_from_spot(((b + a) / 2.0), b, a)
                     px = (bid + ask) / 2.0 if (bid and ask) else px
+                    return
                 except Exception:
                     pass
-            elif task is t_cb_spot and isinstance(res, dict) and "data" in res:
+            # Coinbase Exchange ticker
+            if isinstance(res, dict) and "price" in res and ("bid" in res or "ask" in res):
                 try:
-                    px = float(res["data"]["amount"])
+                    # Some responses have strings; convert defensively
+                    if "bid" in res and res["bid"] is not None:
+                        b = float(res["bid"])
+                    else:
+                        b = None
+                    if "ask" in res and res["ask"] is not None:
+                        a = float(res["ask"])
+                    else:
+                        a = None
+                    p = float(res["price"])
+                    # If bid/ask present, prefer them; otherwise synthesize from price
+                    if b is not None or a is not None:
+                        bb, aa = _normalize_bid_ask_from_spot(p, b, a)
+                        bid, ask = bb, aa
+                        px = (bid + ask) / 2.0 if (bid and ask) else p
+                    else:
+                        px = p
+                    return
                 except Exception:
                     pass
-            elif task is t_bn_spot and isinstance(res, dict) and "price" in res:
+            # Coinbase retail spot
+            if isinstance(res, dict) and "data" in res and isinstance(res["data"], dict) and "amount" in res["data"]:
                 try:
-                    px = float(res["price"])
+                    p = float(res["data"]["amount"])
+                    px = p
+                    return
+                except Exception:
+                    pass
+            # Binance spot price
+            if isinstance(res, dict) and "price" in res and "bidPrice" not in res:
+                try:
+                    p = float(res["price"])
+                    px = p
+                    return
                 except Exception:
                     pass
 
-        # If Binance book gave us bid/ask, we are done.
+        # Absorb anything that already finished
+        for t in tasks:
+            if t in done:
+                absorb(t.result(), True)
+
+        # If we already have bid/ask, return immediately
         if bid is not None and ask is not None:
             return ((bid + ask) / 2.0), bid, ask
-
-        # Otherwise synthesize bid/ask from any spot we have.
+        # Otherwise synthesize from spot if present
         if px is not None:
             b, a = _normalize_bid_ask_from_spot(px, None, None)
             return px, b, a
 
-        # If nothing finished yet, wait the remainder once more very briefly.
+        # Phase 2: give pending tasks a tiny extra window
         if pending:
-            more_done, _ = await asyncio.wait(pending, timeout=0.4, return_when=asyncio.FIRST_COMPLETED)
-            for task in more_done:
-                res = task.result()
-                if task is t_bn_book and isinstance(res, dict) and "bidPrice" in res and "askPrice" in res:
-                    try:
-                        b = float(res["bidPrice"])
-                        a = float(res["askPrice"])
-                        bid, ask = _normalize_bid_ask_from_spot(((b + a) / 2.0), b, a)
-                        px = (bid + ask) / 2.0 if (bid and ask) else px
-                    except Exception:
-                        pass
-                elif task is t_cb_spot and isinstance(res, dict) and "data" in res:
-                    try:
-                        px = float(res["data"]["amount"])
-                    except Exception:
-                        pass
-                elif task is t_bn_spot and isinstance(res, dict) and "price" in res:
-                    try:
-                        px = float(res["price"])
-                    except Exception:
-                        pass
+            more_done, _ = await asyncio.wait(pending, timeout=0.5, return_when=asyncio.FIRST_COMPLETED)
+            for t in more_done:
+                absorb(t.result(), True)
 
             if bid is not None and ask is not None:
                 return ((bid + ask) / 2.0), bid, ask
@@ -289,7 +308,7 @@ async def poll_tick(client: httpx.AsyncClient) -> tuple[float | None, float | No
 
     finally:
         # Ensure pending HTTP requests don't pile up.
-        for t in (t_cb_spot, t_bn_book, t_bn_spot):
+        for t in tasks:
             if not t.done():
                 t.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
