@@ -57,6 +57,27 @@ def get_status() -> Status:
     atr_band_min = engine.profile.get("ATR_PCT_MIN")
     atr_band_max = engine.profile.get("ATR_PCT_MAX")
 
+    # Always return a fixed window so the UI never starts at 1 bar
+    def _candles_fixed(n=150):
+        cs = [c for c in engine.m1[-n:]]
+        if len(cs) >= n:
+            return cs
+        if cs:
+            first = cs[0]
+            missing = n - len(cs)
+            pad = []
+            for k in range(missing, 0, -1):
+                pad.append({
+                    "time": first["time"] - k * 60,
+                    "open": first["open"],
+                    "high": first["high"],
+                    "low": first["low"],
+                    "close": first["close"],
+                    "volume": first.get("volume", 0.0),
+                })
+            return pad + cs
+        return cs
+
     return Status(
         price=_fmt(engine.price, 2),
         bid=_fmt(engine.bid, 2),
@@ -65,9 +86,9 @@ def get_status() -> Status:
         equity=_fmt(engine.broker.equity, 2) or 0.0,
         pos=pos,
         history=engine.broker.history[-100:],
-        candles=[c for c in engine.m1[-150:]],
+        candles=_candles_fixed(150),
         scalpMode=engine.settings.get("scalp_mode", True),
-        autoTrade=engine.settings.get("auto_trade", True),
+        autoTrade=engine.settings.get("auto_trade", False),
         strategy=engine.settings.get("strategy", "Adaptive Router"),
         activeStrategy=active,
         regime=reg,
@@ -102,6 +123,24 @@ def update_settings(payload: dict = Body(...)) -> dict:
         engine.settings["auto_trade"] = bool(payload["autoTrade"])
     if "strategy" in payload:
         engine.settings["strategy"] = str(payload["strategy"])
+
+    # --- sizing controls ---
+    if "sizingMode" in payload:
+        v = str(payload["sizingMode"]).upper()
+        if v not in ("RISK", "ALL_IN", "NOTIONAL_PCT"):
+            v = "RISK"
+        engine.settings["sizing_mode"] = v
+    if "allInLeverage" in payload:
+        try:
+            engine.settings["all_in_leverage"] = float(payload["allInLeverage"])
+        except Exception:
+            pass
+    if "notionalPct" in payload:
+        try:
+            engine.settings["notional_pct"] = float(payload["notionalPct"])
+        except Exception:
+            pass
+
     return {"ok": True, "settings": engine.settings}
 
 @app.post("/start")
