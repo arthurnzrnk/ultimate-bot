@@ -8,6 +8,10 @@ Implements:
 
 This version updates ONLY the user-facing status text to be human‑friendly
 in the style of V1. Strategy logic is unchanged.
+
+Edits in this build:
+- Feed: switch to robust poll_tick (Coinbase with Binance fallbacks).
+- Diagnostics: log WAIT reason changes (lightweight, not chatty).
 """
 
 from __future__ import annotations
@@ -19,7 +23,7 @@ from typing import Any
 from statistics import median
 
 from .config import settings
-from .datafeed import seed_klines, poll_coinbase_tick
+from .datafeed import seed_klines, poll_tick
 from .broker import PaperBroker, FEE_MAKER, FEE_TAKER
 from .strategies.router import StrategyRouter
 from .ta import atr, donchian  # (ema removed as unused)
@@ -135,6 +139,9 @@ class BotEngine:
         self._last_trade_was_loss: bool = False
         self._last_close_ts: int | None = None
         self._entered_heavy_at: int | None = None
+
+        # Diagnostics: remember last WAIT reasons per TF to avoid log spam
+        self._last_wait_reason: dict[str, str | None] = {"m1": None, "h1": None}
 
     # ---------------- internal helpers ----------------
 
@@ -419,7 +426,7 @@ class BotEngine:
         last_h1_closed = 0
         while True:
             try:
-                px, bid, ask = await poll_coinbase_tick(self.client)
+                px, bid, ask = await poll_tick(self.client)
                 if bid and ask:
                     self.bid, self.ask = bid, ask
                 shown = ((bid + ask) / 2.0) if (bid and ask) else (px or None)
@@ -624,19 +631,20 @@ class BotEngine:
         strategy_router = self.router.pick(scalp)
         sig = strategy_router.evaluate(src, context)
 
-        # Telemetry for CONDITIONS block in UI (unchanged)
-        adx_val = strategy_router.last_adx
-        atr_pct = strategy_router.last_atr_pct
-        reg = strategy_router.last_regime or "—"
-        bias = strategy_router.last_bias or "—"
-        active = strategy_router.last_strategy or "—"
-
         # Human‑friendly STATUS like V1
         self.status_text = self._friendly_status(
             sig_reason=getattr(sig, "reason", None),
             tf=("m1" if scalp else "h1"),
             now=now,
         )
+
+        # Light diagnostic: log reason changes so UI shows why it's idle
+        if sig.type == "WAIT":
+            key = "m1" if scalp else "h1"
+            prev = self._last_wait_reason.get(key)
+            if sig.reason != prev:
+                self._last_wait_reason[key] = sig.reason
+                self._log(f"WAIT[{key}]: {sig.reason}", set_status=False)
 
         # --- Handle trade (apply strategy-chosen TF + cooldown) ---
         if sig.type in ("BUY", "SELL") and self.settings.get("auto_trade") and self.price is not None:
