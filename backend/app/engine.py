@@ -89,9 +89,10 @@ class BotEngine:
             "LEV_CAP_H1": 1,
         }
 
+        # NOTE: default auto_trade is OFF (you toggle it in the UI)
         self.settings: dict[str, Any] = {
             "scalp_mode": True,
-            "auto_trade": True,
+            "auto_trade": False,          # <-- OFF by default (changed)
             "strategy": "Adaptive Router",
             "macro_pause": False,
             "profile_mode": "AUTO",
@@ -606,27 +607,11 @@ class BotEngine:
             stopd = sig.stop_dist or (entry * 0.005)
             taked = sig.take_dist or (entry * 0.005)
 
-            scalp_trade = (trade_tf == "m1")
-            base_risk = self.profile.get("RISK_PCT_SCALP") if scalp_trade else self.profile.get("RISK_PCT_H1")
-
-            A = atr(series, 14)
-            ap = (A[i_entry] or 0.0) / max(1.0, series[i_entry]["close"])
-
-            atr_min = self.profile.get("ATR_PCT_MIN", 0.0004)
-            atr_max = self.profile.get("ATR_PCT_MAX", 0.0200)
-            ap = max(atr_min, min(atr_max, ap))
-            norm = (ap - atr_min) / max(1e-8, (atr_max - atr_min))
-            risk_mult = 1.0 - 0.5 * norm
-            risk_pct = base_risk * risk_mult
-
-            if self.profile_active == "HEAVY":
-                risk_pct = min(risk_pct, 0.75 * base_risk)
-
-            risk_usd = self.broker.equity * risk_pct
-            qty = max(0.0001, risk_usd / max(1.0, stopd))
-
-            notional_cap = self.broker.equity * (self.profile.get("LEV_CAP_SCALP") if scalp_trade else self.profile.get("LEV_CAP_H1"))
-            qty = min(qty, max(0.0001, notional_cap / max(1.0, entry)))
+            # --- SIZING: FULL PAPER EQUITY NOTIONAL (no risk model) ---
+            # Use the entire paper equity as the notional for every trade so the UI's
+            # account balance (e.g., $10,000) is exactly the trade size.
+            notional = max(0.0, self.broker.equity)
+            qty = max(0.0001, notional / max(1.0, entry))
 
             stop = (entry - stopd) if sig.type == "BUY" else (entry + stopd)
             take = (entry + taked) if sig.type == "BUY" else (entry - taked)
@@ -645,6 +630,6 @@ class BotEngine:
                     scratch_after_sec=300,
                 )
                 self._log(
-                    f"Open {sig.type} @ {entry:.2f} | qty={qty:.6f} stop={stop:.2f} take={take:.2f} score={sig.score}",
+                    f"Open {sig.type} @ {entry:.2f} | qty={qty:.6f} notional≈${notional:.2f} stop={stop:.2f} take={take:.2f} score={sig.score}",
                     set_status=False,
                 )
