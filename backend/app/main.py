@@ -55,6 +55,10 @@ def get_status() -> Status:
     atr = engine.router.last_atr_pct
     active = engine.router.last_strategy
 
+    # Active ATR band from current profile
+    atr_band_min = engine.profile.get("ATR_PCT_MIN")
+    atr_band_max = engine.profile.get("ATR_PCT_MAX")
+
     return Status(
         price=_fmt(engine.price, 2),
         bid=_fmt(engine.bid, 2),
@@ -77,6 +81,8 @@ def get_status() -> Status:
         unrealNet=_fmt(unreal, 2) or 0.0,
         profileMode=engine.settings.get("profile_mode", "AUTO"),
         profileModeActive=engine.profile_active,
+        atrBandMin=_fmt(atr_band_min, 4),
+        atrBandMax=_fmt(atr_band_max, 4),
     )
 
 @app.get("/logs")
@@ -119,3 +125,35 @@ def save_api_keys(payload: dict = Body(...)) -> dict:
 @app.get("/health")
 def health() -> dict:
     return {"ok": True, "status": engine.status_text}
+
+# --- DEBUG ONLY: open a tiny paper position to prove the path works end-to-end ---
+@app.post("/debug/open_test")
+def open_test(
+    side: str = Body("BUY"),
+    tf: str = Body("m1"),        # "m1" or "h1" (for label only)
+    risk_usd: float = Body(5.0), # tiny
+) -> dict:
+    if engine.price is None:
+        return {"ok": False, "error": "No price yet."}
+    entry = engine.price
+    stopd = entry * 0.002
+    taked = entry * 0.002
+    qty = max(0.0001, risk_usd / max(1.0, stopd))
+    stop = entry - stopd if side.upper() == "BUY" else entry + stopd
+    take = entry + taked if side.upper() == "BUY" else entry - taked
+
+    # Close if flipping sides
+    if engine.broker.pos:
+        ps = engine.broker.pos.side
+        if (side.upper() == "BUY" and ps == "short") or (side.upper() == "SELL" and ps == "long"):
+            engine.broker.close(entry)
+
+    if not engine.broker.pos:
+        engine.broker.open(
+            side, entry, qty, stop, take, stopd, maker=True,
+            tf=("h1" if tf == "h1" else "m1"),
+            profile=engine.profile_active,
+            scratch_after_sec=300,
+        )
+        engine.logs.append({"ts": int(time.time()), "text": f"DEBUG: Opened test {side.upper()} @ {entry:.2f} qty={qty:.6f}"})
+    return {"ok": True, "pos": engine.broker.pos}
