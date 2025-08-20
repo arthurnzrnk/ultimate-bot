@@ -13,6 +13,8 @@ Edits in this build:
 - Feed: switch to robust poll_tick (Coinbase with Binance fallbacks).
 - Diagnostics: log WAIT reason changes (lightweight, not chatty).
 - Diagnostics+ : include numeric detail for ATR band + overshoot needs.
+- Defaults: auto_trade starts OFF.
+- Sizing: optional ALL_IN / NOTIONAL_PCT modes for paper sizing.
 """
 
 from __future__ import annotations
@@ -115,13 +117,18 @@ class BotEngine:
             "LEV_CAP_H1": 1,
         }
 
-        # Engine settings (UI shows only profile picker; other toggles hidden)
+        # Engine settings
         self.settings: dict[str, Any] = {
-            "scalp_mode": True,          # default true (router decides h1 entries)
-            "auto_trade": True,
+            "scalp_mode": True,
+            "auto_trade": False,        # default OFF
             "strategy": "Adaptive Router",
             "macro_pause": False,
-            "profile_mode": "AUTO",      # LIGHT | HEAVY | AUTO
+            "profile_mode": "AUTO",     # LIGHT | HEAVY | AUTO
+
+            # --- sizing controls ---
+            "sizing_mode": "RISK",      # RISK | ALL_IN | NOTIONAL_PCT
+            "all_in_leverage": 1.0,     # only if sizing_mode == ALL_IN
+            "notional_pct": 1.0,        # only if sizing_mode == NOTIONAL_PCT (0..1)
         }
 
         # Active profile (what gates actually apply right now)
@@ -712,13 +719,27 @@ class BotEngine:
             norm = (ap - atr_min) / max(1e-8, (atr_max - atr_min))  # 0..1
             risk_mult = 1.0 - 0.5 * norm  # high vol => ~0.5x; low vol => 1.0x
             risk_pct = base_risk * risk_mult
-
             if self.profile_active == "HEAVY":
                 risk_pct = min(risk_pct, 0.75 * base_risk)
 
-            risk_usd = self.broker.equity * risk_pct
-            qty = max(0.0001, risk_usd / max(1.0, stopd))
+            # --- Position sizing ---
+            sizing = str(self.settings.get("sizing_mode", "RISK")).upper()
+            if sizing == "ALL_IN":
+                lev_cap = self.profile.get("LEV_CAP_SCALP") if scalp_trade else self.profile.get("LEV_CAP_H1")
+                lev = float(self.settings.get("all_in_leverage", 1.0))
+                lev = max(0.1, min(float(lev_cap), lev))
+                notional = self.broker.equity * lev      # e.g., 1.0 × equity = “use full $10k”
+                qty = max(0.0001, notional / max(1.0, entry))
+            elif sizing == "NOTIONAL_PCT":
+                pct = max(0.0, min(1.0, float(self.settings.get("notional_pct", 1.0))))
+                notional = self.broker.equity * pct
+                qty = max(0.0001, notional / max(1.0, entry))
+            else:
+                # default: risk-based
+                risk_usd = self.broker.equity * risk_pct
+                qty = max(0.0001, risk_usd / max(1.0, stopd))
 
+            # Always respect leverage caps
             notional_cap = self.broker.equity * (self.profile.get("LEV_CAP_SCALP") if scalp_trade else self.profile.get("LEV_CAP_H1"))
             qty = min(qty, max(0.0001, notional_cap / max(1.0, entry)))
 
