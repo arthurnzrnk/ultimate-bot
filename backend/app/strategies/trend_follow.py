@@ -7,7 +7,8 @@ class TrendFollow(Strategy):
 
     def evaluate(self, h1: list[dict], ctx: dict) -> Signal:
         iC = ctx.get("iC_h1")
-        if iC is None or iC < ctx.get("min_h1_bars", 220):
+        min_h1 = int(ctx.get("min_h1_bars", 220))
+        if iC is None or len(h1) < min_h1:
             return Signal(type="WAIT", reason="Need H1 history")
 
         closes = [c["close"] for c in h1]
