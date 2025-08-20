@@ -2,9 +2,9 @@
 
 This module provides asynchronous functions to seed historical candles from
 Binance (1m and 1h candles) and to poll Coinbase's spot, buy and sell
-endpoints. Coinbase's endpoints are used instead of websockets here because
-they are CORS friendly and easy to consume in a simple HTTP loop. For
-production use, consider replacing with Coinbase Advanced Trade websockets.
+endpoints. Coinbase retail endpoints can report padded buy/sell prices with
+a wide spread; we normalize obviously bogus spreads so strategy spread gates
+remain meaningful.
 """
 
 import httpx
@@ -69,6 +69,25 @@ async def seed_klines(client: httpx.AsyncClient) -> tuple[list[Candle], list[Can
     return m1, h1
 
 
+def _normalize_bid_ask_from_spot(px: float | None, bid: float | None, ask: float | None) -> tuple[float | None, float | None]:
+    """Retail 'buy'/'sell' may include padded spreads. Clamp to a tight band around spot if needed."""
+    if px is None and (bid is None or ask is None):
+        return bid, ask
+    if px is not None:
+        # If either missing, synthesize around spot ~8 bps total spread.
+        if bid is None:
+            bid = px * (1.0 - 0.0004)
+        if ask is None:
+            ask = px * (1.0 + 0.0004)
+        # If spread is absurd (>30 bps), clamp to ~8 bps around spot.
+        if ask and bid:
+            wid = (ask - bid) / max(1e-12, px)
+            if wid > 0.003:
+                bid = px * (1.0 - 0.0004)
+                ask = px * (1.0 + 0.0004)
+    return bid, ask
+
+
 async def poll_coinbase_tick(client: httpx.AsyncClient) -> tuple[float | None, float | None, float | None]:
     """Poll Coinbase spot, buy and sell endpoints for a tick.
 
@@ -85,4 +104,7 @@ async def poll_coinbase_tick(client: httpx.AsyncClient) -> tuple[float | None, f
     px = float(sp["data"]["amount"]) if sp and "data" in sp else None
     bid = float(se["data"]["amount"]) if se and "data" in se else None
     ask = float(bu["data"]["amount"]) if bu and "data" in bu else None
+
+    # Normalize obviously padded spreads using spot as anchor
+    bid, ask = _normalize_bid_ask_from_spot(px, bid, ask)
     return px, bid, ask
