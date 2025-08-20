@@ -23,7 +23,7 @@ export default function Dashboard() {
     profileMode: 'AUTO',
     profileModeActive: 'LIGHT',
     strategy: 'Adaptive Router',
-    autoTrade: true,
+    autoTrade: false,
     scalpMode: true,
   })
   const [dir, setDir] = useState<'up' | 'down' | null>(null)
