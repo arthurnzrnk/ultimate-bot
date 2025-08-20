@@ -57,27 +57,6 @@ def get_status() -> Status:
     atr_band_min = engine.profile.get("ATR_PCT_MIN")
     atr_band_max = engine.profile.get("ATR_PCT_MAX")
 
-    # Always return a fixed window so the UI never starts at 1 bar
-    def _candles_fixed(n=150):
-        cs = [c for c in engine.m1[-n:]]
-        if len(cs) >= n:
-            return cs
-        if cs:
-            first = cs[0]
-            missing = n - len(cs)
-            pad = []
-            for k in range(missing, 0, -1):
-                pad.append({
-                    "time": first["time"] - k * 60,
-                    "open": first["open"],
-                    "high": first["high"],
-                    "low": first["low"],
-                    "close": first["close"],
-                    "volume": first.get("volume", 0.0),
-                })
-            return pad + cs
-        return cs
-
     return Status(
         price=_fmt(engine.price, 2),
         bid=_fmt(engine.bid, 2),
@@ -86,9 +65,9 @@ def get_status() -> Status:
         equity=_fmt(engine.broker.equity, 2) or 0.0,
         pos=pos,
         history=engine.broker.history[-100:],
-        candles=_candles_fixed(150),
+        candles=[c for c in engine.m1[-150:]],
         scalpMode=engine.settings.get("scalp_mode", True),
-        autoTrade=engine.settings.get("auto_trade", False),
+        autoTrade=engine.settings.get("auto_trade", True),
         strategy=engine.settings.get("strategy", "Adaptive Router"),
         activeStrategy=active,
         regime=reg,
@@ -120,37 +99,24 @@ def update_settings(payload: dict = Body(...)) -> dict:
     if "scalpMode" in payload:
         engine.settings["scalp_mode"] = bool(payload["scalpMode"])
     if "autoTrade" in payload:
-        engine.settings["auto_trade"] = bool(payload["autoTrade"])
+        on = bool(payload["autoTrade"])
+        engine.settings["auto_trade"] = on
+        # Update status immediately so UI doesn't show stale "Off"
+        engine.status_text = "Waiting for the next trade" if on else "Off"
     if "strategy" in payload:
         engine.settings["strategy"] = str(payload["strategy"])
-
-    # --- sizing controls ---
-    if "sizingMode" in payload:
-        v = str(payload["sizingMode"]).upper()
-        if v not in ("RISK", "ALL_IN", "NOTIONAL_PCT"):
-            v = "RISK"
-        engine.settings["sizing_mode"] = v
-    if "allInLeverage" in payload:
-        try:
-            engine.settings["all_in_leverage"] = float(payload["allInLeverage"])
-        except Exception:
-            pass
-    if "notionalPct" in payload:
-        try:
-            engine.settings["notional_pct"] = float(payload["notionalPct"])
-        except Exception:
-            pass
-
     return {"ok": True, "settings": engine.settings}
 
 @app.post("/start")
 def start_bot() -> dict:
     engine.settings["auto_trade"] = True
+    engine.status_text = "Waiting for the next trade"
     return {"ok": True}
 
 @app.post("/stop")
 def stop_bot() -> dict:
     engine.settings["auto_trade"] = False
+    engine.status_text = "Off"
     return {"ok": True}
 
 @app.post("/apikeys")
@@ -163,7 +129,6 @@ def health() -> dict:
 
 # ---------------- DEBUG HELPERS ----------------
 
-# Open a tiny paper position (used to prove broker/UI path)
 @app.post("/debug/open_test")
 def open_test(payload: dict = Body({"side": "BUY", "tf": "m1", "risk_usd": 5.0})):
     side = str(payload.get("side", "BUY")).upper()
@@ -172,7 +137,7 @@ def open_test(payload: dict = Body({"side": "BUY", "tf": "m1", "risk_usd": 5.0})
     if engine.price is None:
         return {"ok": False, "error": "No price yet."}
     entry = engine.price
-    stopd = entry * 0.002  # 0.20%
+    stopd = entry * 0.002
     taked = entry * 0.002
     qty = max(0.0001, risk_usd / max(1.0, stopd))
     stop = entry - stopd if side == "BUY" else entry + stopd
@@ -191,7 +156,6 @@ def open_test(payload: dict = Body({"side": "BUY", "tf": "m1", "risk_usd": 5.0})
         engine.logs.append({"ts": int(time.time()), "text": f"DEBUG: Opened test {side} @ {entry:.2f} qty={qty:.6f}"})
     return {"ok": True, "pos": engine.broker.pos}
 
-# Close whatever is open at the current price (market-flat)
 @app.post("/debug/flat")
 def debug_flat() -> dict:
     p = engine.broker.pos
@@ -202,7 +166,6 @@ def debug_flat() -> dict:
     engine.logs.append({"ts": int(time.time()), "text": f"DEBUG: Flat @ {px:.2f} PnL {net:+.2f}"})
     return {"ok": True, "pnl": _fmt(net, 2)}
 
-# Partial close by fraction at current price (e.g., 0.5 = close 50%)
 @app.post("/debug/partial")
 def debug_partial(payload: dict = Body({"fraction": 0.5})):
     p = engine.broker.pos
