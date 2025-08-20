@@ -23,13 +23,13 @@ export default function Dashboard() {
     profileMode: 'AUTO',
     profileModeActive: 'LIGHT',
     strategy: 'Adaptive Router',
-    autoTrade: false,
+    autoTrade: true,
     scalpMode: true,
   })
   const [dir, setDir] = useState<'up' | 'down' | null>(null)
   const lastShown = useRef<number | undefined>(undefined)
 
-  // Logs (feed lives under Paper Account on the right)
+  // Logs
   const [logs, setLogs] = useState<LogLine[]>([])
   const [loadingLogs, setLoadingLogs] = useState(true)
   const logBoxRef = useRef<HTMLDivElement | null>(null)
@@ -155,6 +155,13 @@ export default function Dashboard() {
         }
       })
     })
+
+    // Guard bad ranges
+    if (!isFinite(lo) || !isFinite(hi) || hi <= lo) {
+      // Not enough valid data to render
+      return
+    }
+
     const xPer = chartW / Math.max(1, Math.min(limit, n - start))
     const y = (p: number) => padT + (hi - p) * (chartH / Math.max(1e-8, (hi - lo)))
 
@@ -231,15 +238,31 @@ export default function Dashboard() {
   useEffect(() => {
     const canvas = canvasRef.current
     if (!canvas) return
+
+    const candles = (data.candles || []) as Candle[]
+
+    // Guard: only draw when we truly have real history
+    if (!Array.isArray(candles) || candles.length < 5) {
+      const ctx = canvas.getContext('2d')
+      if (!ctx) return
+      const W = canvas.clientWidth, H = canvas.clientHeight
+      ctx.clearRect(0, 0, W, H)
+      ctx.fillStyle = 'rgba(255,255,255,0.6)'
+      ctx.font = '12px ui-sans-serif, system-ui'
+      ctx.textAlign = 'center'
+      ctx.fillText('Loading candles…', W / 2, H / 2)
+      return
+    }
+
     const overlays: Overlay[] = []
-    const vwap = buildSessionVWAPArray((data.candles || []) as Candle[])
-    overlays.push({ data: vwap, color: '#60a5fa', dashed: true }) // VWAP on 1m
+    const vwap = buildSessionVWAPArray(candles)
+    overlays.push({ data: vwap, color: '#60a5fa', dashed: true })
     const pos = data?.pos
     const hl = pos ? (pos.side === 'long' ? 'BUY' : 'SELL') : null
-    drawChart(canvas, (data.candles || []) as Candle[], overlays, hl, barCount)
+    drawChart(canvas, candles, overlays, hl, barCount)
   }, [data.candles, data.pos, barCount])
 
-  // ---------- UI actions ----------
+  // UI actions
   async function toggleScalp() {
     const next = !data.scalpMode
     await postSettings({ scalpMode: next })
@@ -282,15 +305,12 @@ export default function Dashboard() {
     atrLine,
   ].filter(Boolean).join(' • ')
 
-  // Dynamic glow tone
   const glowTone = !data.autoTrade ? 'gray' : data.pos ? (data.pos.side === 'long' ? 'green' : 'red') : 'orange'
 
   return (
     <div>
-      {/* Dynamic background glow */}
       <div className={`glow-dynamic tone-${glowTone}`} />
 
-      {/* HEADER */}
       <div className="glass header-card">
         <div>
           <div className="pair-sub">BTC/USD</div>
@@ -305,7 +325,6 @@ export default function Dashboard() {
         </div>
       </div>
 
-      {/* STATUS + CONDITIONS */}
       <div className="status-row">
         <div className={`glass status-pill ${data.pos ? (data.pos.side === 'long' ? 'status-green' : 'status-red') : ''}`}>
           <b>STATUS:</b>&nbsp;&nbsp;{data.status ?? '—'}
@@ -316,9 +335,7 @@ export default function Dashboard() {
         </div>
       </div>
 
-      {/* MAIN GRID */}
       <div className="main-grid">
-        {/* Left: Chart + History */}
         <div className="left-col">
           <div className="glass chart-wrap">
             <canvas ref={canvasRef} className="chart" />
@@ -353,7 +370,6 @@ export default function Dashboard() {
           </section>
         </div>
 
-        {/* Right: Controls + Account + Logs */}
         <div className="right-col">
           <section className="glass pcard">
             <h2 className="card-title">Toggles</h2>
