@@ -3,8 +3,8 @@
 
 Regimes:
 - Range (low ADX): Level King — Profiled (m1) or Mean-Reversion (H1) by gates
-- Breakout (ADX ≤ 25 + Donchian break + ATR% in band): Breakout (H1)
-- Trend (ADX ≥ 27, exit ≤ 23): TrendFollow (H1)
+- Breakout (H1): ADX ≤ 25 on H1 + Donchian break on H1 + ATR% in band
+- Trend (H1): ADX ≥ 27 on H1, exit ≤ 23
 
 Telemetry: last_regime / last_bias / last_adx / last_atr_pct / last_strategy
 """
@@ -69,10 +69,10 @@ class StrategyRouter(Strategy):
         self.breakout = Breakout()
         self.trend = TrendFollow()
 
-        # ADX thresholds with hysteresis
-        self.adx_thr = 25      # breakout threshold
-        self.adx_on = 27       # enter trend
-        self.adx_off = 23      # exit trend
+        # ADX thresholds with hysteresis (on H1)
+        self.adx_thr = 25      # breakout threshold (H1)
+        self.adx_on = 27       # enter trend (H1)
+        self.adx_off = 23      # exit trend (H1)
 
         # Internal state
         self._scalp_mode = True
@@ -108,58 +108,56 @@ class StrategyRouter(Strategy):
             return Signal(type="WAIT", reason="Loading...")
 
         # --- Regime features ---
+        # We *always* use H1 ADX for regime determination (trend/breakout),
+        # even when in scalper mode, so router and H1 strategies are aligned.
+        a_h1 = adx(h1, 14)
+        adx_h1 = a_h1[-2] if len(a_h1) >= 2 else None
+
         if self._scalp_mode:
             m5 = _aggregate(m1, 300)
-            a = adx(m5, 14)
-            adx_val = a[-2] if len(a) >= 2 else None
-
+            a_m5 = adx(m5, 14)
+            # Expose an m1-based ATR% for telemetry/guards (uses m1)
             A_m1 = atr(m1, 14)
-            idx = ctx.get("iC_m1")
-            atr_pct = ((A_m1[idx] or 0.0) / max(1.0, m1[idx]["close"])) if isinstance(idx, int) and idx >= 0 else 0.0
-
-            dc = donchian(m1, 20)
+            idx_m1 = ctx.get("iC_m1")
+            atr_pct = ((A_m1[idx_m1] or 0.0) / max(1.0, m1[idx_m1]["close"])) if isinstance(idx_m1, int) and idx_m1 >= 0 else 0.0
         else:
-            a = adx(h1, 14)
-            adx_val = a[-2] if len(a) >= 2 else None
-
             A_h1 = atr(h1, 14)
-            idx = ctx.get("iC_h1")
-            atr_pct = ((A_h1[idx] or 0.0) / max(1.0, h1[idx]["close"])) if isinstance(idx, int) and idx >= 0 else 0.0
-
-            dc = donchian(h1, 20)
+            idx_h1 = ctx.get("iC_h1")
+            atr_pct = ((A_h1[idx_h1] or 0.0) / max(1.0, h1[idx_h1]["close"])) if isinstance(idx_h1, int) and idx_h1 >= 0 else 0.0
 
         # Telemetry
-        self.last_adx = adx_val
+        self.last_adx = adx_h1
         self.last_atr_pct = atr_pct
         self.last_bias = self._calc_bias(h1, ctx.get("iC_h1"))
 
-        # ATR% band guard (uses profile band via strategies too; this is coarse)
+        # ATR% band guard (coarse; exact gates live in strategies)
         profile = ctx.get("profile") or {}
         atr_min = profile.get("ATR_PCT_MIN", 0.0004)
         atr_max = profile.get("ATR_PCT_MAX", 0.0200)
         atr_ok = (atr_pct >= atr_min) and (atr_pct <= atr_max)
 
-        # Donchian break flags — SAFE indexing with warmup guard
-        series = m1 if self._scalp_mode else h1
-        if isinstance(idx, int) and idx > 0 and idx < len(series):
-            hi_prev = dc["hi"][idx - 1]
-            lo_prev = dc["lo"][idx - 1]
-            px_now = series[idx]["close"]
+        # Donchian break flags on H1 (aligns with Breakout/Trend strategies)
+        idx_h1 = ctx.get("iC_h1")
+        dc_h1 = donchian(h1, 20)
+        if isinstance(idx_h1, int) and idx_h1 > 0 and idx_h1 < len(h1):
+            hi_prev = dc_h1["hi"][idx_h1 - 1]
+            lo_prev = dc_h1["lo"][idx_h1 - 1]
+            px_now = h1[idx_h1]["close"]
             bk_up = (hi_prev is not None) and (px_now > hi_prev)
             bk_dn = (lo_prev is not None) and (px_now < lo_prev)
         else:
             bk_up = bk_dn = False
 
-        # Hysteresis regime logic
+        # Hysteresis regime logic (on H1 ADX)
         mode = self._mode
-        if adx_val is not None:
-            if mode in ("trend", "breakout") and adx_val <= self.adx_off:
+        if adx_h1 is not None:
+            if mode in ("trend", "breakout") and adx_h1 <= self.adx_off:
                 mode = "range"
-            elif mode == "range" and adx_val >= self.adx_on:
+            elif mode == "range" and adx_h1 >= self.adx_on:
                 mode = "trend"
 
-        # Breakout priority when ADX low and Donchian break occurs and ATR% within band
-        if adx_val is not None and adx_val <= self.adx_thr and (bk_up or bk_dn) and atr_ok:
+        # Breakout priority when H1 ADX low and H1 Donchian breaks within ATR band
+        if adx_h1 is not None and adx_h1 <= self.adx_thr and (bk_up or bk_dn) and atr_ok:
             mode = "breakout"
 
         self._mode = mode
