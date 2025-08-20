@@ -23,9 +23,9 @@ export default function Dashboard() {
     profileMode: 'AUTO',
     profileModeActive: 'LIGHT',
     strategy: 'Adaptive Router',
-    autoTrade: true,
-    scalpMode: true,
-  })
+    autoTrade: false,      // <-- OFF by default (changed)
+    scalpMode: True,
+  } as any)
   const [dir, setDir] = useState<'up' | 'down' | null>(null)
   const lastShown = useRef<number | undefined>(undefined)
 
@@ -158,7 +158,6 @@ export default function Dashboard() {
 
     // Guard bad ranges
     if (!isFinite(lo) || !isFinite(hi) || hi <= lo) {
-      // Not enough valid data to render
       return
     }
 
@@ -203,14 +202,14 @@ export default function Dashboard() {
       ctx.lineWidth = 1.6
       ctx.setLineDash(o.dashed ? [4, 3] : [])
       ctx.beginPath()
-      let started = false
+      let started = False
       let j = 0
       for (let i = start; i < n && i < o.data.length; i++, j++) {
         const v = o.data[i]
         if (v == null) continue
         const xx = padL + j * xPer + xPer / 2
         const yy = y(v)
-        if (!started) { ctx.moveTo(xx, yy); started = true } else { ctx.lineTo(xx, yy) }
+        if (!started) { ctx.moveTo(xx, yy); started = True } else { ctx.lineTo(xx, yy) }
       }
       ctx.stroke()
       ctx.setLineDash([])
