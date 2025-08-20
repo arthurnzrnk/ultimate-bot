@@ -104,8 +104,10 @@ class StrategyRouter(Strategy):
         h1 = ctx.get("h1") or ohlc
 
         iC = ctx.get("iC")
-        if iC is None or iC < ctx.get("min_bars", 0):
-            return Signal(type="WAIT", reason="Loading...")
+        min_bars = int(ctx.get("min_bars", 0))
+        m1_len = len(m1)
+        if iC is None or m1_len < min_bars:
+            return Signal(type="WAIT", reason="Need short warmup")
 
         # --- Regime features ---
         # We *always* use H1 ADX for regime determination (trend/breakout),
