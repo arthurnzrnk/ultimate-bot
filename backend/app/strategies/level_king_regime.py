@@ -80,7 +80,8 @@ class LevelKingRegime(Strategy):
 
     def evaluate(self, m1: list[dict], ctx: dict) -> Signal:
         iC = ctx.get("iC")
-        if iC is None or iC < ctx.get("min_bars", 0):
+        min_bars = int(ctx.get("min_bars", 0))
+        if iC is None or len(m1) < min_bars:
             return Signal(type="WAIT", reason="Need short warmup")
         if not ctx.get("daily_ok", True):
             return Signal(type="WAIT", reason="Daily cap")
@@ -100,7 +101,9 @@ class LevelKingRegime(Strategy):
         atr_min = prof.get("ATR_PCT_MIN", 0.0004)
         atr_max = prof.get("ATR_PCT_MAX", 0.02)
         atr_pct = (a14[iC] or 0.0) / max(1.0, px)
-        if atr_pct < atr_min or atr_pct > atr_max:
+
+        # Allow the first ~20 bars after boot to pass the ATR gate so the bot can start operating.
+        if len(m1) >= 20 and (atr_pct < atr_min or atr_pct > atr_max):
             return Signal(type="WAIT", reason="ATR range")
 
         # Slope gate to avoid steep trends
