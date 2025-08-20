@@ -12,6 +12,7 @@ in the style of V1. Strategy logic is unchanged.
 Edits in this build:
 - Feed: switch to robust poll_tick (Coinbase with Binance fallbacks).
 - Diagnostics: log WAIT reason changes (lightweight, not chatty).
+- Diagnostics+ : include numeric detail for ATR band + overshoot needs.
 """
 
 from __future__ import annotations
@@ -381,12 +382,21 @@ class BotEngine:
         # Map strategy reasons into UX phrases (best‑effort; keeps V2 logic intact)
         r = (sig_reason or "").lower()
 
-        # ATR band mapping
+        # ATR band mapping with numbers
+        def _pct(x: float | None) -> str:
+            return f"{(x or 0.0) * 100:.2f}%"
+
         if "atr range" in r:
-            ap = self._atr_pct_m1() or 0.0
+            ap = self._atr_pct_m1()
             mn = self.profile.get("ATR_PCT_MIN", 0.0004)
             mx = self.profile.get("ATR_PCT_MAX", 0.02)
-            return "Movement too small" if ap < mn else "Movement too wild"
+            if ap is None:
+                return "Loading recent prices"
+            return (
+                f"Movement too small ({_pct(ap)} < {_pct(mn)} min)"
+                if ap < mn else
+                f"Movement too wild ({_pct(ap)} > {_pct(mx)} max)"
+            )
 
         if "spread" in r:
             return "Spread too wide"
@@ -643,8 +653,26 @@ class BotEngine:
             key = "m1" if scalp else "h1"
             prev = self._last_wait_reason.get(key)
             if sig.reason != prev:
+                text = f"WAIT[{key}]: {sig.reason}"
+                # Add numeric detail for ATR & overshoot context
+                if "ATR range" in (sig.reason or ""):
+                    ap = self._atr_pct_m1() or 0.0
+                    mn = self.profile.get("ATR_PCT_MIN", 0.0004)
+                    mx = self.profile.get("ATR_PCT_MAX", 0.0200)
+                    text += f" (ATR% {ap*100:.2f}% in band {mn*100:.2f}–{mx*100:.2f}%)"
+                elif "Inside bands" in (sig.reason or "") and key == "m1" and len(self.m1) >= 3 and self.vwap:
+                    i = len(self.m1) - 2
+                    prev_bar = self.m1[i - 1] if i - 1 >= 0 else None
+                    vprev = self.vwap[i - 1] if i - 1 >= 0 else None
+                    atr_pct = self._atr_pct_m1() or 0.0
+                    tp_floor = self.profile.get("TP_FLOOR", 0.0020)
+                    band_pct = max(tp_floor, 0.7 * atr_pct)
+                    if prev_bar and vprev:
+                        dlow = max(0.0, (vprev - prev_bar["low"]) / max(1e-12, vprev))
+                        dhigh = max(0.0, (prev_bar["high"] - vprev) / max(1e-12, vprev))
+                        text += f" (need ≥{band_pct*100:.2f}% overshoot; prev LΔ={dlow*100:.2f}%, HΔ={dhigh*100:.2f}%)"
                 self._last_wait_reason[key] = sig.reason
-                self._log(f"WAIT[{key}]: {sig.reason}", set_status=False)
+                self._log(text, set_status=False)
 
         # --- Handle trade (apply strategy-chosen TF + cooldown) ---
         if sig.type in ("BUY", "SELL") and self.settings.get("auto_trade") and self.price is not None:
