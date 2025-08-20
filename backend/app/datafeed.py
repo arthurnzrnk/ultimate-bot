@@ -38,15 +38,27 @@ async def fetch_json(client: httpx.AsyncClient, url: str):
 
 
 async def seed_klines(client: httpx.AsyncClient) -> tuple[list[Candle], list[Candle]]:
-    """Seed the m1 and h1 candles from Binance.
+    """Seed the m1 and h1 candles from Binance, with retries and a flat fallback.
 
     Returns:
         A tuple (m1, h1) where each is a list of ``Candle`` instances.
     """
-    m1_raw = await fetch_json(client, BINANCE_1M + "300")
-    h1_raw = await fetch_json(client, BINANCE_1H + "400")
+    m1_raw = None
+    h1_raw = None
+
+    # Retry a few times to be resilient to transient network issues
+    for _ in range(3):
+        if m1_raw is None:
+            m1_raw = await fetch_json(client, BINANCE_1M + "300")
+        if h1_raw is None:
+            h1_raw = await fetch_json(client, BINANCE_1H + "400")
+        if isinstance(m1_raw, list) and isinstance(h1_raw, list):
+            break
+        await asyncio.sleep(0.5)
+
     m1: list[Candle] = []
     h1: list[Candle] = []
+
     if isinstance(m1_raw, list):
         for k in m1_raw:
             m1.append(
@@ -71,6 +83,20 @@ async def seed_klines(client: httpx.AsyncClient) -> tuple[list[Candle], list[Can
                     volume=float(k[5]),
                 )
             )
+
+    # Fallback: if both failed, synthesize flat seed from current spot so UI and indicators aren’t empty
+    if not m1 and not h1:
+        sj = await fetch_json(client, BINANCE_SPOT_TICK)
+        p = float(sj["price"]) if isinstance(sj, dict) and "price" in sj else None
+        if p is not None:
+            now = int(time.time())
+            for i in range(300, 0, -1):
+                t = now - i * 60
+                m1.append(Candle(time=t, open=p, high=p, low=p, close=p, volume=0.0))
+            for i in range(400, 0, -1):
+                t = now - i * 3600
+                h1.append(Candle(time=t, open=p, high=p, low=p, close=p, volume=0.0))
+
     return m1, h1
 
 
