@@ -14,7 +14,12 @@ engine = BotEngine()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    client = httpx.AsyncClient()
+    # Tighter client config so slow providers can’t stall the loop.
+    client = httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=2.5, read=1.8, write=1.8, pool=1.0),
+        limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
+        headers={"User-Agent": "UltimateBot/1.1"},
+    )
     await engine.start(client)
     try:
         yield
@@ -101,7 +106,6 @@ def update_settings(payload: dict = Body(...)) -> dict:
     if "autoTrade" in payload:
         on = bool(payload["autoTrade"])
         engine.settings["auto_trade"] = on
-        # Update status immediately so UI doesn't show stale "Off"
         engine.status_text = "Waiting for the next trade" if on else "Off"
     if "strategy" in payload:
         engine.settings["strategy"] = str(payload["strategy"])
