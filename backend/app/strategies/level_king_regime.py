@@ -61,7 +61,12 @@ def _shooting_star(cur, heavy=False):
     return cond
 
 def _looks_like_tick_volume(vols: list[float]) -> bool:
-    """Heuristic: 1 Hz polling → ~60 'volume' per minute with tiny variation."""
+    """Heuristic: 1 Hz polling → ~60 'volume' per minute with modest variation.
+
+    Previous threshold was too strict and often failed to detect tick-volume,
+    causing the volume gate to block indefinitely. We widen both the median
+    window and the allowed variation so scalper can operate on synthetic volume.
+    """
     if not vols or len(vols) < 10:
         return False
     vmin = min(vols)
@@ -70,8 +75,8 @@ def _looks_like_tick_volume(vols: list[float]) -> bool:
     if med <= 0:
         return False
     variation = (vmax - vmin) / max(1.0, med)
-    # Flat, small swing near 60 ticks/min → treat as tick‑volume, not real volume.
-    return (40 <= med <= 80) and (variation <= 0.25)
+    # Treat ~30–120 ticks/min with up to ~60% swing as "tick-ish".
+    return (30 <= med <= 120) and (variation <= 0.60)
 
 
 class LevelKingRegime(Strategy):
