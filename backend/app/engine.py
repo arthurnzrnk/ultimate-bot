@@ -56,8 +56,15 @@ class BotEngine:
 
         # Watchdog for net staleness
         self._stale_count: int = 0
-        self._stale_threshold: int = 3
+        self._stale_threshold: int = 5   # was 3; loosen to avoid noisy flips
         self._net_stale: bool = False
+
+        # Last-good tick cache (used for micro-hiccups)
+        self._last_tick_ts: float = 0.0
+        self._last_px: float | None = None
+        self._last_bid: float | None = None
+        self._last_ask: float | None = None
+        self._reuse_ttl_sec: float = 6.0  # reuse last tick within 6s
 
         self._PROFILES = {
             "LIGHT": {
@@ -383,28 +390,46 @@ class BotEngine:
             try:
                 px, bid, ask = await poll_tick(self.client)
 
-                # Watchdog: mark feed stale if no provider returns for a few loops
+                # If nothing arrived this loop, consider reusing the last good tick
                 if px is None and bid is None and ask is None:
-                    self._stale_count += 1
-                    if self._stale_count >= self._stale_threshold:
-                        if not self._net_stale:
-                            self._log("DATA: Feed stale (no tick ≥3s). Waiting for providers…", set_status=False)
-                            self._net_stale = True
-                        # Signal UI to show NET: STALE
-                        self.price = None
-                    # Skip the rest of the loop on a fully missing tick
-                    await asyncio.sleep(1.0)
-                    self._maybe_auto_switch()
-                    continue
+                    now = time.time()
+                    if self._last_tick_ts and (now - self._last_tick_ts) <= self._reuse_ttl_sec:
+                        # Reuse last good values — do NOT mark stale.
+                        px, bid, ask = self._last_px, self._last_bid, self._last_ask
+                        # keep stale counters reset
+                        self._stale_count = 0
+                        self._net_stale = False
+                    else:
+                        self._stale_count += 1
+                        if self._stale_count >= self._stale_threshold:
+                            if not self._net_stale:
+                                self._log("DATA: Feed stale (no tick ≥3s). Waiting for providers…", set_status=False)
+                                self._net_stale = True
+                            self.price = None  # Signal UI: NET: STALE
+                        await asyncio.sleep(1.0)
+                        self._maybe_auto_switch()
+                        continue
                 else:
+                    # We got *something* new — reset stale flags and cache it.
                     if self._net_stale:
                         self._log("DATA: Feed recovered.", set_status=False)
                     self._stale_count = 0
                     self._net_stale = False
+                    now = time.time()
+                    # Cache last seen (favor bid/ask if present)
+                    if (bid is not None) and (ask is not None):
+                        self._last_px = (bid + ask) / 2.0
+                        self._last_bid = bid
+                        self._last_ask = ask
+                    elif px is not None:
+                        self._last_px = px
+                        # leave last_bid/ask as-is if we only had spot
+                    self._last_tick_ts = now
 
-                if bid and ask:
+                # Update live price snapshot
+                if (bid is not None) and (ask is not None):
                     self.bid, self.ask = bid, ask
-                shown = ((bid + ask) / 2.0) if (bid and ask) else (px or None)
+                shown = ((bid + ask) / 2.0) if ((bid is not None) and (ask is not None)) else (px if px is not None else None)
                 if shown is not None:
                     self.price = shown
                     iso = datetime.utcnow().isoformat() + "Z"
@@ -412,6 +437,7 @@ class BotEngine:
                     self._rebuild_vwap()
                     self._aggregate_h1()
 
+                # Position management & exits
                 if self.broker.pos and self.price is not None:
                     _ = self.broker.mark(self.price)
                     p = self.broker.pos
@@ -490,6 +516,7 @@ class BotEngine:
                                 self._log("Cooling off after 3 losses (30 min).")
                                 self._loss_streak = 0
 
+                # Signal on closed bars only
                 if len(self.m1) >= 2 and self.m1[-2]["time"] != last_m1_closed:
                     last_m1_closed = self.m1[-2]["time"]
                     await self._maybe_signal(tf="m1")
