@@ -105,14 +105,20 @@ class StrategyRouter(Strategy):
         m1 = ctx.get("m1") or ohlc
         h1 = ctx.get("h1") or ohlc
 
-        iC = ctx.get("iC")
-        min_bars = int(ctx.get("min_bars", 0))
-        m1_len = len(m1)
-        if iC is None or m1_len < min_bars:
-            return Signal(type="WAIT", reason="Need short warmup")
+        # ---- Warmup gating (FIX): gate by the TF we are about to consider ----
+        if self._scalp_mode:
+            iC_m1 = ctx.get("iC_m1")
+            min_bars = int(ctx.get("min_bars", 0))
+            if iC_m1 is None or len(m1) < min_bars:
+                return Signal(type="WAIT", reason="Need short warmup")
+        else:
+            iC_h1 = ctx.get("iC_h1")
+            min_h1 = int(ctx.get("min_h1_bars", 240))
+            if iC_h1 is None or len(h1) < min_h1:
+                return Signal(type="WAIT", reason="Need H1 history")
 
         # --- Regime features ---
-        # ADX for the router: m5 when scalper is under consideration; H1 for H1 strategies.
+        # ADX for the router: m5 when scalper is under consideration; H1 otherwise.
         if self._scalp_mode:
             m5 = _aggregate(m1, 300)
             a_m5 = adx(m5, 14)
@@ -161,7 +167,6 @@ class StrategyRouter(Strategy):
 
         # Breakout priority when H1 ADX low and H1 Donchian breaks within ATR band
         # (This can preempt to Breakout strategy even when scalper is the active mode)
-        # Note: Breakout threshold uses H1 ADX as canonical.
         a_h1_for_break = adx(h1, 14)
         adx_h1_last = a_h1_for_break[-2] if len(a_h1_for_break) >= 2 else None
         if adx_h1_last is not None and adx_h1_last <= self.adx_thr and (bk_up or bk_dn) and atr_ok:
