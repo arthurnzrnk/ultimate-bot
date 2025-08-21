@@ -1,12 +1,18 @@
 const API_BASE = 'http://localhost:8000'
 
 export async function getStatus() {
-  const r = await fetch(`${API_BASE}/status`)
+  const r = await fetch(`${API_BASE}/status`, {
+    cache: 'no-store',
+    headers: { 'Cache-Control': 'no-store' },
+  })
   return r.json()
 }
 
 export async function getLogs(limit: number = 200) {
-  const r = await fetch(`${API_BASE}/logs?limit=${limit}`)
+  const r = await fetch(`${API_BASE}/logs?limit=${limit}`, {
+    cache: 'no-store',
+    headers: { 'Cache-Control': 'no-store' },
+  })
   return r.json()
 }
 
