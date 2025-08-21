@@ -61,12 +61,7 @@ def _shooting_star(cur, heavy=False):
     return cond
 
 def _looks_like_tick_volume(vols: list[float]) -> bool:
-    """Heuristic: 1 Hz polling → ~60 'volume' per minute with modest variation.
-
-    Previous threshold was too strict and often failed to detect tick-volume,
-    causing the volume gate to block indefinitely. We widen both the median
-    window and the allowed variation so scalper can operate on synthetic volume.
-    """
+    """Heuristic: 1 Hz polling → ~60 'volume' per minute with modest variation."""
     if not vols or len(vols) < 10:
         return False
     vmin = min(vols)
@@ -107,8 +102,8 @@ class LevelKingRegime(Strategy):
         atr_max = prof.get("ATR_PCT_MAX", 0.02)
         atr_pct = (a14[iC] or 0.0) / max(1.0, px)
 
-        # Allow the first ~20 bars after boot to pass the ATR gate so the bot can start operating.
-        if len(m1) >= 20 and (atr_pct < atr_min or atr_pct > atr_max):
+        # Startup ATR bypass — shrink to 5 bars max
+        if len(m1) >= 6 and (atr_pct < atr_min or atr_pct > atr_max):
             return Signal(type="WAIT", reason="ATR range")
 
         # Slope gate to avoid steep trends
