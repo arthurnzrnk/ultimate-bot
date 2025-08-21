@@ -108,6 +108,11 @@ class BotEngine:
             "strategy": "Adaptive Router",
             "macro_pause": False,
             "profile_mode": "AUTO",
+
+            # NEW: sizing controls
+            "sizing_mode": "NOTIONAL_FIXED",   # RISK_PCT | NOTIONAL_FIXED | HYBRID
+            "alloc_notional_usd": settings.start_equity,  # UI: “Trade with this amount”
+            "strict_notional": True,           # if True, never downscale — reject instead
         }
 
         self.profile_active: str = "LIGHT"
@@ -123,6 +128,12 @@ class BotEngine:
         self._last_trade_was_loss: bool = False
         self._last_close_ts: int | None = None
         self._entered_heavy_at: int | None = None
+
+        # NEW: persist ATR-spike candidate to avoid 1-bar wiggles forcing HEAVY
+        self._heavy_candidate_since: int | None = None
+
+        # Sizing telemetry for /status
+        self._last_sizing: dict[str, Any] = {}
 
         self._last_wait_reason: dict[str, str | None] = {"m1": None, "h1": None}
 
@@ -229,6 +240,8 @@ class BotEngine:
             f"Engine initialized. Seeded m1={len(self.m1)} bars, h1={len(self.h1)} bars. "
             f"(source: {source})"
         )
+        # Debug checklist (for "no trades"):
+        self._log("DEBUG CHECKLIST: m5 ADX for m1; macro_pause OFF; ATR% units; VWAP slope caps; sane spread; vol window=20 median; one signal per closed bar; AUTO HEAVY 60s-persist; daily cap reset at UTC.", set_status=False)
         asyncio.create_task(self._run())
 
     def _push_trade_to_m1(self, price: float, iso: str) -> None:
@@ -270,21 +283,30 @@ class BotEngine:
         atr_ratio = self._atr_pct_m1_ratio_to_med50()
         macro_pause = bool(self.settings.get("macro_pause"))
 
-        escalate = False
-        if self._loss_streak >= 2:
-            escalate = True
-        if day_pnl <= -200:
-            escalate = True
-        if atr_ratio is not None and atr_ratio > 1.5:
-            escalate = True
-        if macro_pause:
-            escalate = True
+        # Determine causes for escalation
+        escalate_by_streak = self._loss_streak >= 2
+        escalate_by_pnl = day_pnl <= -200
+        escalate_by_atr = (atr_ratio is not None and atr_ratio > 1.5)
+        escalate_by_macro = macro_pause
 
-        if escalate and self.profile_active != "HEAVY":
-            self._apply_profile("HEAVY")
-            self._entered_heavy_at = now
-            self._heavy_locked_until = sod + 86400
-            self._log("AUTO: Escalated to HEAVY for safety (rest of UTC day).", set_status=False)
+        # Persistence guard only for ATR spike condition
+        if (escalate_by_atr and not (escalate_by_streak or escalate_by_pnl or escalate_by_macro)) and self.profile_active != "HEAVY":
+            if self._heavy_candidate_since is None:
+                self._heavy_candidate_since = now
+            if now - self._heavy_candidate_since >= 60:
+                self._apply_profile("HEAVY")
+                self._entered_heavy_at = now
+                self._heavy_locked_until = sod + 86400
+                self._heavy_candidate_since = None
+                self._log("AUTO: Escalated to HEAVY (ATR spike persisted 60s).", set_status=False)
+        else:
+            self._heavy_candidate_since = None
+            escalate = (escalate_by_streak or escalate_by_pnl or escalate_by_macro)
+            if escalate and self.profile_active != "HEAVY":
+                self._apply_profile("HEAVY")
+                self._entered_heavy_at = now
+                self._heavy_locked_until = sod + 86400
+                self._log("AUTO: Escalated to HEAVY for safety (rest of UTC day).", set_status=False)
 
         if self.profile_active == "HEAVY" and self._entered_heavy_at:
             elapsed = now - self._entered_heavy_at
@@ -479,20 +501,34 @@ class BotEngine:
                                     p.stop = new_stop
 
                     else:
-                        if p.side == "long":
-                            if (self.price >= p.entry + R) and not p.be:
-                                p.stop = p.entry
-                                p.be = True
-                            new_stop = self.price - R
-                            if new_stop > p.stop:
-                                p.stop = new_stop
-                        else:
-                            if (self.price <= p.entry - R) and not p.be:
-                                p.stop = p.entry
-                                p.be = True
-                            new_stop = self.price + R
-                            if new_stop < p.stop:
-                                p.stop = new_stop
+                        # --- H1 parity: partial at +0.5R, move to BE, then 1R trail ---
+                        if not p.partial_taken:
+                            hit_half = (self.price >= p.entry + 0.5 * R) if p.side == "long" else (self.price <= p.entry - 0.5 * R)
+                            if hit_half:
+                                name = (p.opened_by or "").lower()
+                                if "mean reversion" in name:
+                                    frac = 0.33
+                                else:
+                                    # Trend‑Following or Breakout
+                                    frac = 0.25
+                                frac = max(0.05, min(0.90, frac))
+                                self.broker.partial_close(frac, self.price)
+                                if self.broker.pos:
+                                    self.broker.pos.stop = self.broker.pos.entry
+                                    self.broker.pos.be = True
+                                    self.broker.pos.partial_taken = True
+
+                        # Trail remainder by 1R (same logic as m1)
+                        if self.broker.pos:
+                            p = self.broker.pos
+                            if p.side == "long":
+                                new_stop = self.price - R
+                                if new_stop > p.stop:
+                                    p.stop = new_stop
+                            else:
+                                new_stop = self.price + R
+                                if new_stop < p.stop:
+                                    p.stop = new_stop
 
                     p = self.broker.pos
                     if p:
@@ -529,6 +565,23 @@ class BotEngine:
 
             self._maybe_auto_switch()
             await asyncio.sleep(1.0)
+
+    def _emit_sizing_log(self, payload: dict[str, Any]) -> None:
+        self._last_sizing = payload.copy()
+        # Compact log line for UI
+        sm = payload.get("sizing_mode")
+        al = payload.get("alloc_notional_usd")
+        qr = payload.get("qty_requested")
+        qf = payload.get("qty_final")
+        il = payload.get("implied_loss_usd")
+        ir = payload.get("implied_risk_pct")
+        rl = payload.get("remaining_daily_loss_cap")
+        lv = payload.get("lev_used")
+        rr = payload.get("reason_if_reject")
+        txt = (f"SIZING[{sm}] alloc=${al:.2f} qty_req={qr:.6f} qty_final={qf:.6f} "
+               f"implied_loss=${il:.2f} implied_risk={ir*100:.2f}% rem_daily_cap=${rl:.2f} lev={lv:.2f} "
+               + (f"REJECT: {rr}" if rr else "OK"))
+        self._log(txt, set_status=False)
 
     async def _maybe_signal(self, tf: str) -> None:
         now = int(time.time())
@@ -656,30 +709,127 @@ class BotEngine:
                 return
             entry = series[i_entry]["close"]
 
+            # Distances from signal (absolute $ distances)
             stopd = sig.stop_dist or (entry * 0.005)
             taked = sig.take_dist or (entry * 0.005)
 
-            # --- SIZING: FULL PAPER EQUITY NOTIONAL (no risk model) ---
-            notional = max(0.0, self.broker.equity)
-            qty = max(0.0001, notional / max(1.0, entry))
+            # --- Fee→TP gate (enforced on all strategies; was scalper-only before) ---
+            tp_pct = max(1e-9, taked / max(1.0, entry))
+            fee_r = (2 * FEE_MAKER) / tp_pct
+            if fee_r > self.profile.get("FEE_R_MAX", 0.25):
+                # log and ignore the signal (do not open)
+                self._emit_sizing_log({
+                    "sizing_mode": self.settings.get("sizing_mode"),
+                    "alloc_notional_usd": float(self.settings.get("alloc_notional_usd", 0.0)),
+                    "qty_requested": 0.0,
+                    "qty_final": 0.0,
+                    "implied_loss_usd": 0.0,
+                    "implied_risk_pct": 0.0,
+                    "remaining_daily_loss_cap": max(0.0, 500 - max(0.0, -self._day_pnl())),
+                    "lev_used": 0.0,
+                    "reason_if_reject": "Fees>limitR",
+                })
+                key = "h1" if is_h1 else "m1"
+                self._last_wait_reason[key] = "Fees>limitR"
+                return
 
+            # --- SIZING v3: Notional‑first with caps (RISK_PCT | NOTIONAL_FIXED | HYBRID) ---
+            equity = max(1e-9, float(self.broker.equity))
+            sizing_mode = str(self.settings.get("sizing_mode", "NOTIONAL_FIXED")).upper()
+            alloc_notional = float(self.settings.get("alloc_notional_usd", equity))
+            strict_notional = bool(self.settings.get("strict_notional", True))
+            lev_cap = float(self._BASE["LEV_CAP_H1" if is_h1 else "LEV_CAP_SCALP"])
+
+            # Step C1 — compute requested size
+            if sizing_mode == "RISK_PCT":
+                risk_pct = float(self._BASE["RISK_PCT_H1" if is_h1 else "RISK_PCT_SCALP"])
+                risk_usd = max(0.0, equity * risk_pct)
+                qty_requested = max(0.0, risk_usd / max(1e-9, stopd))
+            else:
+                # NOTIONAL_FIXED or HYBRID
+                qty_requested = max(0.0, alloc_notional / max(1.0, entry))
+            qty_cap = min(qty_requested, (equity * lev_cap) / max(1.0, entry))
+            qty_final = max(0.0, min(qty_requested, qty_cap))
+
+            # Step C2 — pre‑trade risk sanity vs daily cap
+            implied_loss_usd = qty_final * stopd
+            remaining_daily_loss_cap = max(0.0, 500 - max(0.0, -self._day_pnl()))
+            reject_reason: str | None = None
+            if implied_loss_usd > remaining_daily_loss_cap:
+                if strict_notional:
+                    reject_reason = "pre-trade risk > daily cap"
+                else:
+                    # downscale to fit daily cap (HYBRID behavior)
+                    qty_final = max(0.0, remaining_daily_loss_cap / max(1e-9, stopd))
+                    qty_final = min(qty_final, qty_cap)
+                    # tiny threshold: notional < $5 ⇒ reject (no meaningful size)
+                    if entry * qty_final < 5.0:
+                        reject_reason = "downsized < $5 notional"
+
+            # Step C3 — profile-aware implied risk cap (only when not strict)
+            implied_risk_pct = (qty_final * stopd) / equity if equity > 0 else 0.0
+            if reject_reason is None and not strict_notional:
+                if is_h1:
+                    cap_for_profile = 0.005 if self.profile_active == "HEAVY" else 0.008
+                else:
+                    cap_for_profile = 0.010 if self.profile_active == "HEAVY" else 0.020
+                if implied_risk_pct > cap_for_profile:
+                    # HYBRID: scale down to the cap
+                    qty_final = (cap_for_profile * equity) / max(1e-9, stopd)
+                    qty_final = min(qty_final, qty_cap)
+                    if entry * qty_final < 5.0:
+                        reject_reason = "downsized < $5 notional"
+                    implied_risk_pct = (qty_final * stopd) / equity if equity > 0 else 0.0
+
+            # Extra: when in HEAVY + strict_notional, auto‑REJECT if implied risk exceeds HEAVY caps
+            if reject_reason is None and self.profile_active == "HEAVY" and strict_notional:
+                heavy_cap = (0.005 if is_h1 else 0.010)
+                if implied_risk_pct > heavy_cap:
+                    reject_reason = "HEAVY cap exceeded (strict)"
+
+            lev_used = (qty_final * entry) / equity if equity > 0 else 0.0
+
+            # Emit sizing telemetry
+            self._emit_sizing_log({
+                "sizing_mode": sizing_mode,
+                "alloc_notional_usd": float(alloc_notional),
+                "qty_requested": float(qty_requested),
+                "qty_final": float(qty_final),
+                "implied_loss_usd": float(qty_final * stopd),
+                "implied_risk_pct": float(implied_risk_pct),
+                "remaining_daily_loss_cap": float(remaining_daily_loss_cap),
+                "lev_used": float(lev_used),
+                "reason_if_reject": reject_reason,
+            })
+
+            if reject_reason:
+                key = "h1" if is_h1 else "m1"
+                self._last_wait_reason[key] = reject_reason
+                return
+
+            # Compute concrete stop/take
             stop = (entry - stopd) if sig.type == "BUY" else (entry + stopd)
             take = (entry + taked) if sig.type == "BUY" else (entry - taked)
 
+            # Flip if opposite position present
             if self.broker.pos:
                 ps = self.broker.pos.side
                 if (sig.type == "BUY" and ps == "short") or (sig.type == "SELL" and ps == "long"):
                     self.broker.close(entry)
                     self._log(f"Reversed position at {entry:.2f}")
 
+            # Place order
             if not self.broker.pos:
                 self.broker.open(
-                    sig.type, entry, qty, stop, take, stopd, maker=True,
+                    sig.type, entry, qty_final, stop, take, stopd, maker=True,
                     tf=trade_tf,
                     profile=self.profile_active,
                     scratch_after_sec=300,
+                    opened_by=(strategy_router.last_strategy or None),
                 )
+                notional = qty_final * entry
                 self._log(
-                    f"Open {sig.type} @ {entry:.2f} | qty={qty:.6f} notional≈${notional:.2f} stop={stop:.2f} take={take:.2f} score={sig.score}",
+                    f"Open {sig.type} @ {entry:.2f} | qty={qty_final:.6f} notional≈${notional:.2f} "
+                    f"stop={stop:.2f} take={take:.2f} score={sig.score}",
                     set_status=False,
                 )
