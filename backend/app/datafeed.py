@@ -1,10 +1,10 @@
 """Market data fetching utilities for the Ultimate Bot.
 
-This version fixes the "frozen price / no orders" issue by:
-- Racing providers concurrently (Coinbase Exchange ticker + Coinbase retail spot + Binance book + Binance spot).
-- Using tight per‑request timeouts and cancelling stragglers.
-- Preferring Binance order book (real bid/ask); synthesizing bid/ask from spot when needed.
-- Keeping the robust multi‑source seeding with a local cache fallback.
+This version hardens the live ticker cadence:
+- Races 6 providers concurrently (CBX Exchange ticker + Coinbase retail spot + Binance book + Binance spot + Kraken + Bitstamp).
+- Tight per‑request timeouts; cancels stragglers so the loop stays near 1 Hz.
+- Prefers real bid/ask from Binance book or CBX ticker; synthesizes from spot if needed.
+- Keeps robust multi‑source seeding with a local cache fallback.
 """
 
 from __future__ import annotations
@@ -24,25 +24,22 @@ from .models import Candle
 # Endpoints for seeding
 # ----------------------
 
-# Binance API endpoints for seeding historical candles
 BINANCE_1M = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit="
 BINANCE_1H = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1h&limit="
 
-# Coinbase *Exchange* (the former "Pro") candles: [ time, low, high, open, close, volume ]
+# Coinbase Exchange (candles: [time, low, high, open, close, volume])
 CBX_1M = "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=60&limit=300"
 CBX_1H = "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=3600&limit=400"
 
 # ----------------------
 # Endpoints for live tick polling (concurrent race)
 # ----------------------
-# Coinbase Exchange ticker: {"price","bid","ask","time"}
-CBX_TICKER = "https://api.exchange.coinbase.com/products/BTC-USD/ticker"
-# Coinbase retail spot
-COINBASE_SPOT = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
-# Binance order book (best bid/ask)
-BINANCE_BOOK = "https://api.binance.com/api/v3/ticker/bookTicker?symbol=BTCUSDT"
-# Binance spot price
-BINANCE_SPOT_TICK = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
+CBX_TICKER = "https://api.exchange.coinbase.com/products/BTC-USD/ticker"  # {"price","bid","ask","time"}
+COINBASE_SPOT = "https://api.coinbase.com/v2/prices/BTC-USD/spot"         # {"data":{"amount": "..."}}
+BINANCE_BOOK = "https://api.binance.com/api/v3/ticker/bookTicker?symbol=BTCUSDT"  # {"bidPrice","askPrice"}
+BINANCE_SPOT_TICK = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"  # {"price": "..."}
+KRAKEN_TICKER = "https://api.kraken.com/0/public/Ticker?pair=XBTUSD"      # result.<pair>.b[0], a[0], c[0]
+BITSTAMP_TICKER = "https://www.bitstamp.net/api/v2/ticker/btcusd/"        # {"last","bid","ask"}
 
 # ----------------------
 # Local cache
@@ -55,14 +52,14 @@ CACHE_H1 = CACHE_DIR / "h1.json"
 
 # ------------- helpers -------------
 
-async def fetch_json(client: httpx.AsyncClient, url: str, *, timeout: float = 1.6):
+async def fetch_json(client: httpx.AsyncClient, url: str, *, timeout: float = 1.0):
     """Fetch JSON with a tight per-request timeout and a cache‑busting ts."""
     try:
         sep = "&" if "?" in url else "?"
         r = await client.get(
             f"{url}{sep}ts={int(time.time() * 1000)}",
             timeout=timeout,
-            headers={"User-Agent": "UltimateBot/1.1"},
+            headers={"User-Agent": "UltimateBot/1.2"},
         )
         r.raise_for_status()
         return r.json()
@@ -71,7 +68,6 @@ async def fetch_json(client: httpx.AsyncClient, url: str, *, timeout: float = 1.
 
 
 def _to_candles_from_binance(raw: list) -> List[Candle]:
-    """Parse Binance klines list -> List[Candle]."""
     out: List[Candle] = []
     if isinstance(raw, list):
         for k in raw:
@@ -92,11 +88,6 @@ def _to_candles_from_binance(raw: list) -> List[Candle]:
 
 
 def _to_candles_from_cbx(raw: list) -> List[Candle]:
-    """
-    Parse Coinbase Exchange candles (array of arrays):
-    Each entry: [ time, low, high, open, close, volume ] (time is seconds)
-    Returned newest→oldest; we sort ascending by time.
-    """
     out: List[Candle] = []
     if isinstance(raw, list):
         for k in raw:
@@ -156,8 +147,8 @@ async def seed_klines(client: httpx.AsyncClient) -> tuple[list[Candle], list[Can
         (m1, h1, source) where source is 'binance' | 'coinbase' | 'cache' | 'none'
     """
     # 1) Try Binance
-    m1_raw = await fetch_json(client, BINANCE_1M + "300", timeout=3.5)
-    h1_raw = await fetch_json(client, BINANCE_1H + "400", timeout=3.5)
+    m1_raw = await fetch_json(client, BINANCE_1M + "300", timeout=3.0)
+    h1_raw = await fetch_json(client, BINANCE_1H + "400", timeout=3.0)
     m1 = _to_candles_from_binance(m1_raw) if m1_raw else []
     h1 = _to_candles_from_binance(h1_raw) if h1_raw else []
     if m1 and h1:
@@ -165,15 +156,15 @@ async def seed_klines(client: httpx.AsyncClient) -> tuple[list[Candle], list[Can
         return m1, h1, "binance"
 
     # 2) Try Coinbase Exchange candles
-    cbx_m1 = await fetch_json(client, CBX_1M, timeout=3.5)
-    cbx_h1 = await fetch_json(client, CBX_1H, timeout=3.5)
+    cbx_m1 = await fetch_json(client, CBX_1M, timeout=3.0)
+    cbx_h1 = await fetch_json(client, CBX_1H, timeout=3.0)
     m1 = _to_candles_from_cbx(cbx_m1) if cbx_m1 else []
     h1 = _to_candles_from_cbx(cbx_h1) if cbx_h1 else []
     if m1 and h1:
         _save_cache(m1, h1)
         return m1, h1, "coinbase"
 
-    # 3) Fall back to cache (from last successful session)
+    # 3) Cache fallback
     m1_c, h1_c = _load_cache()
     if m1_c or h1_c:
         return (m1_c or []), (h1_c or []), "cache"
@@ -195,24 +186,52 @@ def _normalize_bid_ask_from_spot(px: float | None, bid: float | None, ask: float
             ask = px * (1.0 + 0.0004)
         if ask and bid:
             wid = (ask - bid) / max(1e-12, px)
-            if wid > 0.003:  # 30 bps cap on synthetic spread
+            if wid > 0.003:  # cap synthetic spread at 30 bps
                 bid = px * (1.0 - 0.0004)
                 ask = px * (1.0 + 0.0004)
     return bid, ask
 
 
+def _parse_kraken(j: dict) -> tuple[float | None, float | None, float | None]:
+    try:
+        res = j.get("result") or {}
+        if not res:
+            return None, None, None
+        # take the first pair key regardless of the exact name
+        k = next(iter(res.keys()))
+        d = res[k]
+        bid = float(d["b"][0]) if d.get("b") else None
+        ask = float(d["a"][0]) if d.get("a") else None
+        px = float(d["c"][0]) if d.get("c") else None
+        return px, bid, ask
+    except Exception:
+        return None, None, None
+
+
+def _parse_bitstamp(j: dict) -> tuple[float | None, float | None, float | None]:
+    try:
+        px = float(j["last"]) if "last" in j else None
+        bid = float(j["bid"]) if "bid" in j else None
+        ask = float(j["ask"]) if "ask" in j else None
+        return px, bid, ask
+    except Exception:
+        return None, None, None
+
+
 async def poll_tick(client: httpx.AsyncClient) -> tuple[float | None, float | None, float | None]:
     """
-    Race Coinbase Exchange ticker + Coinbase spot + Binance order book + Binance spot.
-    Returns (px, bid, ask) quickly; cancels stragglers to keep 1 Hz rhythm.
+    Race CBX Exchange ticker + Coinbase spot + Binance book + Binance spot + Kraken + Bitstamp.
+    Returns (px, bid, ask) fast; cancels stragglers to keep cadence ≈ 1 Hz.
     """
     ts = int(time.time() * 1000)
 
     tasks = [
-        asyncio.create_task(fetch_json(client, CBX_TICKER + f"?ts={ts}", timeout=1.5)),
-        asyncio.create_task(fetch_json(client, COINBASE_SPOT + f"?ts={ts}", timeout=1.5)),
-        asyncio.create_task(fetch_json(client, BINANCE_BOOK, timeout=1.5)),
-        asyncio.create_task(fetch_json(client, BINANCE_SPOT_TICK, timeout=1.5)),
+        asyncio.create_task(fetch_json(client, CBX_TICKER + f"?ts={ts}", timeout=0.9)),
+        asyncio.create_task(fetch_json(client, COINBASE_SPOT + f"?ts={ts}", timeout=0.9)),
+        asyncio.create_task(fetch_json(client, BINANCE_BOOK, timeout=0.9)),
+        asyncio.create_task(fetch_json(client, BINANCE_SPOT_TICK, timeout=0.9)),
+        asyncio.create_task(fetch_json(client, KRAKEN_TICKER + f"?ts={ts}", timeout=0.9)),
+        asyncio.create_task(fetch_json(client, BITSTAMP_TICKER + f"?ts={ts}", timeout=0.9)),
     ]
 
     px: float | None = None
@@ -220,16 +239,15 @@ async def poll_tick(client: httpx.AsyncClient) -> tuple[float | None, float | No
     ask: float | None = None
 
     try:
-        # Phase 1: wait briefly for the first winner
-        done, pending = await asyncio.wait(set(tasks), timeout=1.2, return_when=asyncio.FIRST_COMPLETED)
+        # Phase 1: very quick wait for the first responders
+        done, pending = await asyncio.wait(set(tasks), timeout=0.8, return_when=asyncio.FIRST_COMPLETED)
 
-        def absorb(task_res, is_done: bool):
+        def absorb(res: dict | None):
             nonlocal px, bid, ask
-            if not is_done:
+            if not isinstance(res, dict):
                 return
-            res = task_res
             # Binance book (authoritative bid/ask)
-            if isinstance(res, dict) and "bidPrice" in res and "askPrice" in res:
+            if "bidPrice" in res and "askPrice" in res:
                 try:
                     b = float(res["bidPrice"])
                     a = float(res["askPrice"])
@@ -239,19 +257,11 @@ async def poll_tick(client: httpx.AsyncClient) -> tuple[float | None, float | No
                 except Exception:
                     pass
             # Coinbase Exchange ticker
-            if isinstance(res, dict) and "price" in res and ("bid" in res or "ask" in res):
+            if "price" in res and ("bid" in res or "ask" in res):
                 try:
-                    # Some responses have strings; convert defensively
-                    if "bid" in res and res["bid"] is not None:
-                        b = float(res["bid"])
-                    else:
-                        b = None
-                    if "ask" in res and res["ask"] is not None:
-                        a = float(res["ask"])
-                    else:
-                        a = None
                     p = float(res["price"])
-                    # If bid/ask present, prefer them; otherwise synthesize from price
+                    b = float(res["bid"]) if res.get("bid") is not None else None
+                    a = float(res["ask"]) if res.get("ask") is not None else None
                     if b is not None or a is not None:
                         bb, aa = _normalize_bid_ask_from_spot(p, b, a)
                         bid, ask = bb, aa
@@ -262,26 +272,46 @@ async def poll_tick(client: httpx.AsyncClient) -> tuple[float | None, float | No
                 except Exception:
                     pass
             # Coinbase retail spot
-            if isinstance(res, dict) and "data" in res and isinstance(res["data"], dict) and "amount" in res["data"]:
+            if "data" in res and isinstance(res["data"], dict) and "amount" in res["data"]:
                 try:
-                    p = float(res["data"]["amount"])
-                    px = p
+                    px = float(res["data"]["amount"])
                     return
                 except Exception:
                     pass
-            # Binance spot price
-            if isinstance(res, dict) and "price" in res and "bidPrice" not in res:
+            # Binance spot
+            if "price" in res and "bidPrice" not in res:
                 try:
-                    p = float(res["price"])
-                    px = p
+                    px = float(res["price"])
                     return
                 except Exception:
                     pass
+            # Kraken
+            if "result" in res:
+                p2, b2, a2 = _parse_kraken(res)
+                if b2 is not None or a2 is not None:
+                    bb, aa = _normalize_bid_ask_from_spot(p2, b2, a2)
+                    bid, ask = bb, aa
+                    px = (bid + ask) / 2.0 if (bid and ask) else (p2 or px)
+                    return
+                if p2 is not None:
+                    px = p2
+                    return
+            # Bitstamp
+            if "last" in res:
+                p3, b3, a3 = _parse_bitstamp(res)
+                if b3 is not None or a3 is not None:
+                    bb, aa = _normalize_bid_ask_from_spot(p3, b3, a3)
+                    bid, ask = bb, aa
+                    px = (bid + ask) / 2.0 if (bid and ask) else (p3 or px)
+                    return
+                if p3 is not None:
+                    px = p3
+                    return
 
-        # Absorb anything that already finished
+        # Absorb anything that finished already
         for t in tasks:
             if t in done:
-                absorb(t.result(), True)
+                absorb(t.result())
 
         # If we already have bid/ask, return immediately
         if bid is not None and ask is not None:
@@ -291,11 +321,11 @@ async def poll_tick(client: httpx.AsyncClient) -> tuple[float | None, float | No
             b, a = _normalize_bid_ask_from_spot(px, None, None)
             return px, b, a
 
-        # Phase 2: give pending tasks a tiny extra window
+        # Phase 2: tiny extra window to grab one more response
         if pending:
-            more_done, _ = await asyncio.wait(pending, timeout=0.5, return_when=asyncio.FIRST_COMPLETED)
+            more_done, _ = await asyncio.wait(pending, timeout=0.35, return_when=asyncio.FIRST_COMPLETED)
             for t in more_done:
-                absorb(t.result(), True)
+                absorb(t.result())
 
             if bid is not None and ask is not None:
                 return ((bid + ask) / 2.0), bid, ask
