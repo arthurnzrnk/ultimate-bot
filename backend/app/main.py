@@ -14,11 +14,13 @@ engine = BotEngine()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Tighter client config so slow providers can’t stall the loop.
+    # Slightly looser + HTTP/2 for faster races (if h2 is installed).
     client = httpx.AsyncClient(
-        timeout=httpx.Timeout(connect=2.5, read=1.8, write=1.8, pool=1.0),
-        limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
-        headers={"User-Agent": "UltimateBot/1.1"},
+        http2=True,
+        follow_redirects=True,
+        timeout=httpx.Timeout(connect=3.0, read=2.5, write=2.5, pool=3.0),
+        limits=httpx.Limits(max_keepalive_connections=100, max_connections=100),
+        headers={"User-Agent": "UltimateBot/1.3"},
     )
     await engine.start(client)
     try:
@@ -48,7 +50,7 @@ def _fmt(n: float | None, d: int = 2):
 @app.get("/status", response_model=Status)
 def get_status() -> Status:
     pos = engine.broker.pos
-    unreal = engine.broker.mark(engine.price) if engine.price else 0.0
+    unreal = engine.broker.mark(engine.price) if engine.price is not None else 0.0
     sod = int((int(time.time()) // 86400) * 86400)
     pnl_today = sum([t.pnl for t in engine.broker.history if (t.close_time or t.open_time) >= sod])
     fills_today = sum(1 for t in engine.broker.history if (t.close_time or t.open_time) >= sod) + (1 if pos else 0)
