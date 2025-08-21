@@ -32,9 +32,11 @@ class Position(BaseModel):
     # V2 additions
     tf: Literal["m1", "h1"] = "m1"            # which timeframe strategy opened this
     profile: Literal["LIGHT", "HEAVY"] = "LIGHT"
-    partial_taken: bool = False               # scalper partial at +0.5R taken?
-    # Optional scratch (HEAVY scalper): if +0.25R not hit within 5 min → move stop to BE
-    scratch_after_sec: int = 300
+    partial_taken: bool = False               # partial at +0.5R taken?
+    scratch_after_sec: int = 300              # HEAVY scalper scratch rule
+
+    # NEW: record which strategy opened the trade (for H1 partial fractions)
+    opened_by: Optional[str] = None
 
 
 class Trade(BaseModel):
@@ -88,6 +90,17 @@ class Status(BaseModel):
     profileMode: ProfileMode = "AUTO"          # user setting (AUTO/LIGHT/HEAVY)
     profileModeActive: Literal["LIGHT", "HEAVY"] = "LIGHT"
 
-    # NEW: expose active ATR band so UI can show why ATR gate is blocking
+    # Active ATR band so UI can show why ATR gate is blocking
     atrBandMin: Optional[float] = None         # e.g., 0.0004
     atrBandMax: Optional[float] = None         # e.g., 0.0200
+
+    # NEW: Sizing telemetry (exposed each decision)
+    sizingMode: Optional[str] = None
+    allocNotionalUsd: Optional[float] = None
+    qtyRequested: Optional[float] = None
+    qtyFinal: Optional[float] = None
+    impliedLossUsd: Optional[float] = None
+    impliedRiskPct: Optional[float] = None
+    remainingDailyLossCap: Optional[float] = None
+    levUsed: Optional[float] = None
+    lastRejectReason: Optional[str] = None
