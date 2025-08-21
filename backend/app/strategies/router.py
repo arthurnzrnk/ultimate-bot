@@ -4,7 +4,9 @@
 Regimes:
 - Range (low ADX): Level King — Profiled (m1) or Mean-Reversion (H1) by gates
 - Breakout (H1): ADX ≤ 25 on H1 + Donchian break on H1 + ATR% in band
-- Trend (H1): ADX ≥ 27 on H1, exit ≤ 23
+- Trend with hysteresis:
+    • For scalper (m1 under consideration): ADX(14) on m5 with hysteresis (on ≥27, off ≤23)
+    • For H1 strategies: ADX(14) on H1 with the same hysteresis
 
 Telemetry: last_regime / last_bias / last_adx / last_atr_pct / last_strategy
 """
@@ -69,10 +71,10 @@ class StrategyRouter(Strategy):
         self.breakout = Breakout()
         self.trend = TrendFollow()
 
-        # ADX thresholds with hysteresis (on H1)
-        self.adx_thr = 25      # breakout threshold (H1)
-        self.adx_on = 27       # enter trend (H1)
-        self.adx_off = 23      # exit trend (H1)
+        # ADX thresholds with hysteresis (canonical)
+        self.adx_thr = 25      # breakout threshold (H1 Donchian)
+        self.adx_on = 27       # enter trend
+        self.adx_off = 23      # exit trend
 
         # Internal state
         self._scalp_mode = True
@@ -110,25 +112,24 @@ class StrategyRouter(Strategy):
             return Signal(type="WAIT", reason="Need short warmup")
 
         # --- Regime features ---
-        # We *always* use H1 ADX for regime determination (trend/breakout),
-        # even when in scalper mode, so router and H1 strategies are aligned.
-        a_h1 = adx(h1, 14)
-        adx_h1 = a_h1[-2] if len(a_h1) >= 2 else None
-
+        # ADX for the router: m5 when scalper is under consideration; H1 for H1 strategies.
         if self._scalp_mode:
             m5 = _aggregate(m1, 300)
             a_m5 = adx(m5, 14)
-            # Expose an m1-based ATR% for telemetry/guards (uses m1)
+            adx_src = a_m5[-2] if len(a_m5) >= 2 else None
+            # For telemetry, compute ATR% on m1
             A_m1 = atr(m1, 14)
             idx_m1 = ctx.get("iC_m1")
             atr_pct = ((A_m1[idx_m1] or 0.0) / max(1.0, m1[idx_m1]["close"])) if isinstance(idx_m1, int) and idx_m1 >= 0 else 0.0
         else:
+            a_h1 = adx(h1, 14)
+            adx_src = a_h1[-2] if len(a_h1) >= 2 else None
             A_h1 = atr(h1, 14)
             idx_h1 = ctx.get("iC_h1")
             atr_pct = ((A_h1[idx_h1] or 0.0) / max(1.0, h1[idx_h1]["close"])) if isinstance(idx_h1, int) and idx_h1 >= 0 else 0.0
 
         # Telemetry
-        self.last_adx = adx_h1
+        self.last_adx = adx_src
         self.last_atr_pct = atr_pct
         self.last_bias = self._calc_bias(h1, ctx.get("iC_h1"))
 
@@ -150,16 +151,20 @@ class StrategyRouter(Strategy):
         else:
             bk_up = bk_dn = False
 
-        # Hysteresis regime logic (on H1 ADX)
+        # Hysteresis regime logic (using m5 ADX in scalper mode, H1 ADX otherwise)
         mode = self._mode
-        if adx_h1 is not None:
-            if mode in ("trend", "breakout") and adx_h1 <= self.adx_off:
+        if adx_src is not None:
+            if mode in ("trend", "breakout") and adx_src <= self.adx_off:
                 mode = "range"
-            elif mode == "range" and adx_h1 >= self.adx_on:
+            elif mode == "range" and adx_src >= self.adx_on:
                 mode = "trend"
 
         # Breakout priority when H1 ADX low and H1 Donchian breaks within ATR band
-        if adx_h1 is not None and adx_h1 <= self.adx_thr and (bk_up or bk_dn) and atr_ok:
+        # (This can preempt to Breakout strategy even when scalper is the active mode)
+        # Note: Breakout threshold uses H1 ADX as canonical.
+        a_h1_for_break = adx(h1, 14)
+        adx_h1_last = a_h1_for_break[-2] if len(a_h1_for_break) >= 2 else None
+        if adx_h1_last is not None and adx_h1_last <= self.adx_thr and (bk_up or bk_dn) and atr_ok:
             mode = "breakout"
 
         self._mode = mode
