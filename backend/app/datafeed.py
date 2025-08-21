@@ -1,14 +1,17 @@
 """Market data fetching utilities for the Ultimate Bot.
 
-This version hardens the live ticker cadence:
-- Races 6 providers concurrently (CBX Exchange ticker + Coinbase retail spot + Binance book + Binance spot + Kraken + Bitstamp).
-- Uses asyncio.as_completed with a short deadline: returns as soon as we have bid/ask or at least a spot price.
-- Prefers real bid/ask (Binance book or CBX ticker); synthesizes from spot if needed.
+This version hardens the live ticker cadence and fixes the as_completed iterator bug:
+- Uses asyncio.as_completed correctly (sync iterator, not async-for).
+- Optional MINIMAL_FEED toggle to race only 1–2 stable providers.
+- Races providers with a short deadline and returns as soon as we have bid/ask
+  or at least a spot price.
+- Prefers real bid/ask (Binance order book or CBX ticker); synthesizes from spot if needed.
 - Robust multi-source seeding with local cache fallback.
 """
 
 from __future__ import annotations
 
+import os
 import asyncio
 import contextlib
 import json
@@ -19,6 +22,12 @@ from typing import Tuple, List
 import httpx
 
 from .models import Candle
+
+# ----------------------
+# Feature flags
+# ----------------------
+# Set MINIMAL_FEED=1 in your environment to simplify to 1–2 stable sources.
+USE_MINIMAL_FEED = str(os.getenv("MINIMAL_FEED", "0")).lower() in ("1", "true", "yes", "on")
 
 # ----------------------
 # Endpoints for seeding
@@ -219,17 +228,24 @@ def _parse_bitstamp(j: dict) -> tuple[float | None, float | None, float | None]:
 
 async def poll_tick(client: httpx.AsyncClient) -> tuple[float | None, float | None, float | None]:
     """
-    Race CBX Exchange ticker + Coinbase spot + Binance book + Binance spot + Kraken + Bitstamp.
-    Returns (px, bid, ask) fast; cancels stragglers to keep cadence ≈ 1 Hz.
+    Race providers concurrently and return (px, bid, ask) quickly; cancel stragglers.
     """
-    tasks = [
-        asyncio.create_task(fetch_json(client, CBX_TICKER, timeout=1.2)),
-        asyncio.create_task(fetch_json(client, COINBASE_SPOT, timeout=1.2)),
-        asyncio.create_task(fetch_json(client, BINANCE_BOOK, timeout=1.2)),
-        asyncio.create_task(fetch_json(client, BINANCE_SPOT_TICK, timeout=1.2)),
-        asyncio.create_task(fetch_json(client, KRAKEN_TICKER, timeout=1.2)),
-        asyncio.create_task(fetch_json(client, BITSTAMP_TICKER, timeout=1.2)),
-    ]
+    if USE_MINIMAL_FEED:
+        # Minimal, stable set: authoritative BBO + robust fallback
+        tasks = [
+            asyncio.create_task(fetch_json(client, BINANCE_BOOK, timeout=1.2)),  # bid/ask
+            asyncio.create_task(fetch_json(client, CBX_TICKER,  timeout=1.2)),   # price + (bid/ask)
+        ]
+    else:
+        # Full race
+        tasks = [
+            asyncio.create_task(fetch_json(client, CBX_TICKER,       timeout=1.2)),
+            asyncio.create_task(fetch_json(client, COINBASE_SPOT,    timeout=1.2)),
+            asyncio.create_task(fetch_json(client, BINANCE_BOOK,     timeout=1.2)),
+            asyncio.create_task(fetch_json(client, BINANCE_SPOT_TICK,timeout=1.2)),
+            asyncio.create_task(fetch_json(client, KRAKEN_TICKER,    timeout=1.2)),
+            asyncio.create_task(fetch_json(client, BITSTAMP_TICKER,  timeout=1.2)),
+        ]
 
     px: float | None = None
     bid: float | None = None
@@ -306,7 +322,7 @@ async def poll_tick(client: httpx.AsyncClient) -> tuple[float | None, float | No
 
     try:
         # Consume responses as they arrive until the deadline.
-        async for t in _as_completed_until(tasks, deadline):
+        for t in _as_completed_until(tasks, deadline):
             res = await t
             absorb(res)
             # If we already have both sides, we're done.
@@ -315,6 +331,7 @@ async def poll_tick(client: httpx.AsyncClient) -> tuple[float | None, float | No
     except asyncio.TimeoutError:
         pass
     finally:
+        # Cancel any stragglers cleanly
         for t in tasks:
             if not t.done():
                 t.cancel()
@@ -329,11 +346,9 @@ async def poll_tick(client: httpx.AsyncClient) -> tuple[float | None, float | No
     return None, None, None
 
 
-async def _as_completed_until(tasks: list[asyncio.Task], deadline: float):
-    """Like asyncio.as_completed but stops iterating at the given monotonic deadline."""
-    coros = asyncio.as_completed(tasks, timeout=max(0.0, deadline - time.monotonic()))
-    try:
-        async for t in coros:
-            yield t
-    except asyncio.TimeoutError:
-        raise
+def _as_completed_until(tasks: list[asyncio.Task], deadline: float):
+    """Return a sync iterator over tasks that complete before 'deadline'."""
+    timeout = max(0.0, deadline - time.monotonic())
+    # NOTE: asyncio.as_completed returns a *sync* iterator of awaitables
+    # and raises asyncio.TimeoutError when the timeout elapses.
+    return asyncio.as_completed(tasks, timeout=timeout)
