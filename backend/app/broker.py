@@ -45,6 +45,7 @@ class PaperBroker:
         tf: str = "m1",
         profile: str = "LIGHT",
         scratch_after_sec: int = 300,
+        opened_by: str | None = None,
     ) -> None:
         """Open a new position.
 
@@ -59,6 +60,7 @@ class PaperBroker:
             tf: 'm1' (scalper) or 'h1' (swing).
             profile: 'LIGHT' or 'HEAVY' at entry.
             scratch_after_sec: optional time-based scratch window (HEAVY scalper).
+            opened_by: strategy name that opened the trade (for H1 partials policy).
         """
         fee_rate = FEE_MAKER if maker else FEE_TAKER
         self.pos = Position(
@@ -77,6 +79,7 @@ class PaperBroker:
             profile="HEAVY" if profile == "HEAVY" else "LIGHT",
             partial_taken=False,
             scratch_after_sec=scratch_after_sec,
+            opened_by=opened_by,
         )
 
     def _close_amount(self, qty_to_close: float, px: float) -> float:
