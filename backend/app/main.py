@@ -6,17 +6,29 @@ from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import math
 import time
+
 from .config import settings
 from .engine import BotEngine
 from .models import Status
 
 engine = BotEngine()
 
+def _http2_available() -> bool:
+    """
+    Return True only if the 'h2' package is present so httpx can enable HTTP/2.
+    Avoids ImportError on startup when h2 isn't installed.
+    """
+    try:
+        import h2  # noqa: F401
+        return True
+    except Exception:
+        return False
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Slightly looser + HTTP/2 for faster races (if h2 is installed).
+    # If 'h2' isn't installed, we fall back to HTTP/1.1 automatically.
     client = httpx.AsyncClient(
-        http2=True,
+        http2=_http2_available(),
         follow_redirects=True,
         timeout=httpx.Timeout(connect=3.0, read=2.5, write=2.5, pool=3.0),
         limits=httpx.Limits(max_keepalive_connections=100, max_connections=100),
