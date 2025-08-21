@@ -76,6 +76,8 @@ def get_status() -> Status:
     atr_band_min = engine.profile.get("ATR_PCT_MIN")
     atr_band_max = engine.profile.get("ATR_PCT_MAX")
 
+    # sizing telemetry snapshot
+    st = engine._last_sizing or {}
     return Status(
         price=_fmt(engine.price, 2),
         bid=_fmt(engine.bid, 2),
@@ -100,6 +102,17 @@ def get_status() -> Status:
         profileModeActive=engine.profile_active,
         atrBandMin=_fmt(atr_band_min, 4),
         atrBandMax=_fmt(atr_band_max, 4),
+
+        # NEW: sizing telemetry
+        sizingMode=str(st.get("sizing_mode")) if st else None,
+        allocNotionalUsd=_fmt(st.get("alloc_notional_usd"), 2) if st else None,
+        qtyRequested=_fmt(st.get("qty_requested"), 6) if st else None,
+        qtyFinal=_fmt(st.get("qty_final"), 6) if st else None,
+        impliedLossUsd=_fmt(st.get("implied_loss_usd"), 2) if st else None,
+        impliedRiskPct=_fmt(st.get("implied_risk_pct"), 4) if st else None,
+        remainingDailyLossCap=_fmt(st.get("remaining_daily_loss_cap"), 2) if st else None,
+        levUsed=_fmt(st.get("lev_used"), 2) if st else None,
+        lastRejectReason=str(st.get("reason_if_reject")) if st else None,
     )
 
 @app.get("/logs")
@@ -123,6 +136,21 @@ def update_settings(payload: dict = Body(...)) -> dict:
         engine.status_text = "Waiting for the next trade" if on else "Off"
     if "strategy" in payload:
         engine.settings["strategy"] = str(payload["strategy"])
+
+    # NEW: sizing
+    if "sizingMode" in payload:
+        sm = str(payload["sizingMode"]).upper()
+        if sm not in ("RISK_PCT", "NOTIONAL_FIXED", "HYBRID"):
+            sm = "NOTIONAL_FIXED"
+        engine.settings["sizing_mode"] = sm
+    if "allocNotionalUsd" in payload:
+        try:
+            engine.settings["alloc_notional_usd"] = float(payload["allocNotionalUsd"])
+        except Exception:
+            pass
+    if "strictNotional" in payload:
+        engine.settings["strict_notional"] = bool(payload["strictNotional"])
+
     return {"ok": True, "settings": engine.settings}
 
 @app.post("/start")
@@ -169,7 +197,7 @@ def open_test(payload: dict = Body({"side": "BUY", "tf": "m1", "risk_usd": 5.0})
     if not engine.broker.pos:
         engine.broker.open(
             side, entry, qty, stop, take, stopd, maker=True,
-            tf=tf, profile=engine.profile_active, scratch_after_sec=300,
+            tf=tf, profile=engine.profile_active, scratch_after_sec=300, opened_by="DEBUG",
         )
         engine.logs.append({"ts": int(time.time()), "text": f"DEBUG: Opened test {side} @ {entry:.2f} qty={qty:.6f}"})
     return {"ok": True, "pos": engine.broker.pos}
