@@ -91,6 +91,8 @@ class PaperBroker:
         fees = (p.entry + px) * qty_to_close * p.fee_rate
         net = gross - fees
         self.equity += net
+        base_R_usd = p.stop_dist * qty_to_close
+        r_mult = (net / base_R_usd) if base_R_usd > 0 else None
         self.history.append(
             Trade(
                 side=p.side,
@@ -99,6 +101,7 @@ class PaperBroker:
                 pnl=net,
                 open_time=p.open_time,
                 close_time=self._now(),
+                r_multiple=r_mult,
             )
         )
         p.qty = max(0.0, p.qty - qty_to_close)
