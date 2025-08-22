@@ -1,10 +1,19 @@
-"""Initialize the app package for the Ultimate Bot backend.
+"""
+Initialize the strategies package for Strategy V3 Dynamic.
 
-This package holds the FastAPI application and supporting modules like
-configuration, data feed handlers, the trading engine, brokers, TA utilities,
-and strategy implementations. The goal of the backend is to run the
-adaptive multi‑strategy trading bot continuously and expose a simple API
-for the frontend to query status and update settings.
+Exports only the V3 components to avoid import errors and confusion with
+older V2 files.
 """
 
-__all__ = []
+from .base import Strategy, Signal
+from .router import RouterV3, M1Scalp, H1MeanReversion, H1Breakout, H1Trend
+
+__all__ = [
+    "Strategy",
+    "Signal",
+    "RouterV3",
+    "M1Scalp",
+    "H1MeanReversion",
+    "H1Breakout",
+    "H1Trend",
+]
