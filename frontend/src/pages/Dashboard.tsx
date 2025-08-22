@@ -331,7 +331,7 @@ export default function Dashboard() {
         </div>
         <div className="glass status-pill">
           <b>CONDITIONS:</b>&nbsp;&nbsp;{conditionsText || '—'}
-          <span className="cond-meta"> (P&amp;L today: {fmt(pnlToday, 2)} / cap ±$500; fills {fills}/60)</span>
+          <span className="cond-meta"> (P&amp;L today: {fmt(pnlToday, 2)}; fills {fills}/60)</span>
         </div>
       </div>
 
