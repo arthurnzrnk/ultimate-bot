@@ -6,7 +6,7 @@ Stops/takes are ATR‑based.
 """
 
 from .base import Strategy, Signal
-from ..ta import atr, adx, donchian
+from ..ta import atr, adx, donchian, rsi
 
 
 class MeanReversion(Strategy):
@@ -45,8 +45,22 @@ class MeanReversion(Strategy):
 
         dist = px - mid
 
-        # Price sufficiently below mid → fade up
+        # Determine side
+        side = None
         if dist <= -k * atr_abs:
+            side = "long"
+        elif dist >= k * atr_abs:
+            side = "short"
+
+        # RSI supportive (spec)
+        rsi_h1 = rsi([c["close"] for c in h1], 14); rsi_now = rsi_h1[iC] or 50.0
+        if side == "long" and not (rsi_now < 30.0):
+            return Signal(type="WAIT", reason="RSI not supportive")
+        if side == "short" and not (rsi_now > 70.0):
+            return Signal(type="WAIT", reason="RSI not supportive")
+
+        # Entry/stop/take
+        if side == "long":
             return Signal(
                 type="BUY",
                 reason="Below mid by >k*ATR",
@@ -55,8 +69,7 @@ class MeanReversion(Strategy):
                 score=3,
             )
 
-        # Price sufficiently above mid → fade down
-        if dist >= k * atr_abs:
+        if side == "short":
             return Signal(
                 type="SELL",
                 reason="Above mid by >k*ATR",
