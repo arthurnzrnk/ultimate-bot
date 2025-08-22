@@ -93,3 +93,6 @@ class Status(BaseModel):
     feeToTp: Optional[float] = None
     slipEst: Optional[float] = None
     top3DepthNotional: Optional[float] = None
+
+    # UI convenience
+    autoTrade: bool = False
