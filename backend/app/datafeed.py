@@ -7,6 +7,10 @@ This version hardens the live ticker cadence and fixes the as_completed iterator
   or at least a spot price.
 - Prefers real bid/ask (Binance order book or CBX ticker); synthesizes from spot if needed.
 - Robust multi-source seeding with local cache fallback.
+
+Edits in this release:
+- Early-break when spot price arrives (don’t wait the full deadline for bid/ask).
+- Tightened race deadline to 0.9s and per-request timeouts to 0.8s for snappier cadence.
 """
 
 from __future__ import annotations
@@ -61,7 +65,7 @@ CACHE_H1 = CACHE_DIR / "h1.json"
 
 # ------------- helpers -------------
 
-async def fetch_json(client: httpx.AsyncClient, url: str, *, timeout: float = 1.2):
+async def fetch_json(client: httpx.AsyncClient, url: str, *, timeout: float = 0.8):
     """Fetch JSON with a tight per-request timeout and a cache‑busting ts."""
     try:
         r = await client.get(
@@ -233,25 +237,26 @@ async def poll_tick(client: httpx.AsyncClient) -> tuple[float | None, float | No
     if USE_MINIMAL_FEED:
         # Minimal, stable set: authoritative BBO + robust fallback
         tasks = [
-            asyncio.create_task(fetch_json(client, BINANCE_BOOK, timeout=1.2)),  # bid/ask
-            asyncio.create_task(fetch_json(client, CBX_TICKER,  timeout=1.2)),   # price + (bid/ask)
+            asyncio.create_task(fetch_json(client, BINANCE_BOOK, timeout=0.8)),  # bid/ask
+            asyncio.create_task(fetch_json(client, CBX_TICKER,  timeout=0.8)),   # price + (bid/ask)
         ]
     else:
         # Full race
         tasks = [
-            asyncio.create_task(fetch_json(client, CBX_TICKER,       timeout=1.2)),
-            asyncio.create_task(fetch_json(client, COINBASE_SPOT,    timeout=1.2)),
-            asyncio.create_task(fetch_json(client, BINANCE_BOOK,     timeout=1.2)),
-            asyncio.create_task(fetch_json(client, BINANCE_SPOT_TICK,timeout=1.2)),
-            asyncio.create_task(fetch_json(client, KRAKEN_TICKER,    timeout=1.2)),
-            asyncio.create_task(fetch_json(client, BITSTAMP_TICKER,  timeout=1.2)),
+            asyncio.create_task(fetch_json(client, CBX_TICKER,        timeout=0.8)),
+            asyncio.create_task(fetch_json(client, COINBASE_SPOT,     timeout=0.8)),
+            asyncio.create_task(fetch_json(client, BINANCE_BOOK,      timeout=0.8)),
+            asyncio.create_task(fetch_json(client, BINANCE_SPOT_TICK, timeout=0.8)),
+            asyncio.create_task(fetch_json(client, KRAKEN_TICKER,     timeout=0.8)),
+            asyncio.create_task(fetch_json(client, BITSTAMP_TICKER,   timeout=0.8)),
         ]
 
     px: float | None = None
     bid: float | None = None
     ask: float | None = None
 
-    deadline = time.monotonic() + 1.4
+    # Shorter deadline so we don't sit around waiting for stragglers
+    deadline = time.monotonic() + 0.9
 
     def absorb(res: dict | None):
         nonlocal px, bid, ask
@@ -327,6 +332,9 @@ async def poll_tick(client: httpx.AsyncClient) -> tuple[float | None, float | No
             absorb(res)
             # If we already have both sides, we're done.
             if bid is not None and ask is not None:
+                break
+            # NEW: if we have spot px (but not bid/ask), don't wait out the deadline.
+            if px is not None:
                 break
     except asyncio.TimeoutError:
         pass
