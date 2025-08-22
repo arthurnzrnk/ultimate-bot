@@ -1,197 +1,394 @@
-# backend/app/strategies/router.py
-"""Adaptive router-as-a-strategy with hysteresis and status telemetry.
+"""Router + Strategies for Strategy V3 (Dynamic VS/PS).
 
-Regimes:
-- Range (low ADX): Level King — Profiled (m1) or Mean-Reversion (H1) by gates
-- Breakout (H1): ADX ≤ 25 on H1 + Donchian break on H1 + ATR% in band
-- Trend with hysteresis:
-    • For scalper (m1 under consideration): ADX(14) on m5 with hysteresis (on ≥27, off ≤23)
-    • For H1 strategies: ADX(14) on H1 with the same hysteresis
+Implements:
+- Regime: Trend / Breakout / Range with hysteresis.
+- Bias: h1 EMA200.
+- m1 VWAP Mean-Reversion (Enhanced Level King) with scoring.
+- h1 Mean-Reversion, Breakout, Trend-Following.
 
-Telemetry: last_regime / last_bias / last_adx / last_atr_pct / last_strategy
+All thresholds smoothly adapt via VS/PS supplied in ctx.
 """
 
-from typing import List, Dict, Any, Optional
+from statistics import median
+from typing import Optional
+
 from .base import Strategy, Signal
-from ..ta import adx, atr, donchian, ema
+from ..ta import ema, atr, adx, donchian, rsi, macd_line_signal
 
 
-def _aggregate(ohlc: List[Dict[str, Any]], step_sec: int) -> List[Dict[str, Any]]:
-    if not ohlc:
-        return []
-    out: List[Dict[str, Any]] = []
-    bucket = (ohlc[0]["time"] // step_sec) * step_sec
-    cur: Dict[str, Any] | None = None
-    for c in ohlc:
-        b = (c["time"] // step_sec) * step_sec
-        if b != bucket:
-            if cur:
-                out.append(cur)
-            bucket = b
-            cur = {
-                "time": b,
-                "open": c["open"],
-                "high": c["high"],
-                "low": c["low"],
-                "close": c["close"],
-                "volume": c.get("volume", 0.0),
-            }
-        else:
-            if cur is None:
-                cur = {
-                    "time": b,
-                    "open": c["open"],
-                    "high": c["high"],
-                    "low": c["low"],
-                    "close": c["close"],
-                    "volume": c.get("volume", 0.0),
-                }
-            else:
-                cur["high"] = max(cur["high"], c["high"])
-                cur["low"] = min(cur["low"], c["low"])
-                cur["close"] = c["close"]
-                cur["volume"] += c.get("volume", 0.0)
-    if cur:
-        out.append(cur)
-    return out
+def _macd_state(line, sig, i) -> str:
+    if i is None or i <= 0 or i >= len(line) or line[i] is None or sig[i] is None:
+        return "flat"
+    prev = (line[i - 1] or 0.0) - (sig[i - 1] or 0.0)
+    cur = (line[i] or 0.0) - (sig[i] or 0.0)
+    if prev <= 0 < cur or prev >= 0 > cur:
+        return "cross"
+    if cur > 0:
+        return "up"
+    if cur < 0:
+        return "down"
+    return "flat"
 
 
-class StrategyRouter(Strategy):
-    """ONE adaptive bot that chooses among sub-strategies automatically."""
-    name = "Adaptive Router"
+# ---------------- m1 scalper ----------------
+
+class M1Scalp(Strategy):
+    name = "m1 VWAP MR"
+
+    def evaluate(self, ctx: dict) -> Signal:
+        m1 = ctx["m1"]; i = ctx["iC_m1"]
+        if i is None or i < 2 or len(m1) < max(6, ctx.get("min_bars", 5)):
+            return Signal(type="WAIT", reason="Warmup")
+        px = m1[i]["close"]
+        # Indicators
+        a14 = atr(m1, 14)
+        atr_pct = (a14[i] or 0.0) / max(1.0, px)
+        tp_floor = 0.0015  # 0.15%
+        VS = float(ctx["VS"])
+        # ATR band scale
+        atr_min = 0.0005
+        atr_max = 0.0175
+        atr_min *= VS
+        atr_max *= VS
+        if atr_pct < atr_min or atr_pct > atr_max:
+            return Signal(type="WAIT", reason="ATR band")
+        # VWAP slope cap
+        vwap = ctx["vwap"]
+        if vwap[i] is None:
+            return Signal(type="WAIT", reason="VWAP warmup")
+        v10 = ema([x if x is not None else vwap[i] for x in vwap], 10)
+        base = i - 3 if i >= 3 else (i - 1 if i > 0 else i)
+        slope = abs((v10[i] or vwap[i]) - (v10[base] or vwap[base])) / max(1.0, px)
+        if slope > (0.0005 * VS):  # 0.050% × VS
+            return Signal(type="WAIT", reason="Slope cap")
+        # Spread gate (if bid/ask present)
+        bid, ask = ctx.get("bid"), ctx.get("ask")
+        if bid and ask:
+            mid = (bid + ask) / 2.0
+            spread_bps = ((ask - bid) / max(1e-9, mid)) * 10000.0
+            if spread_bps > 8.0:
+                return Signal(type="WAIT", reason="Spread")
+        # MTF alignment (EMA200 on h1), with CT exception
+        h1 = ctx["h1"]; j = ctx["iC_h1"]
+        closes_h1 = [c["close"] for c in h1]
+        e200 = ema(closes_h1, 200)
+        ema_bias_up = bool(e200[j] and h1[j]["close"] >= (e200[j] or 0.0)) if j is not None else True
+        ema_bias_dn = bool(e200[j] and h1[j]["close"] <= (e200[j] or 0.0)) if j is not None else True
+        ax_h1 = adx(h1, 14); adx_h1 = (ax_h1[j] or 0.0) if j is not None else 0.0
+        rsi_m1 = rsi([c["close"] for c in m1], 14); rsi_now = rsi_m1[i] or 50.0
+        allow_ct = (adx_h1 < 20.0 * VS) and ((rsi_now < 25.0) or (rsi_now > 75.0))
+
+        # Volume quality on reclaim candle
+        win = m1[max(0, i - 20):i]
+        vols = [c.get("volume", 0.0) for c in win]
+        vmed = median(vols) if vols else 0.0
+        cur_vol = m1[i].get("volume", 0.0)
+        vol_ok = (cur_vol >= (2.0 * vmed)) if vmed > 0 else True
+
+        # Candle quality (engulfing preferred; hammer / shooting star allowed)
+        prev = m1[i - 1]
+        cur = m1[i]
+
+        def _body(c): return abs(c["close"] - c["open"])
+        def _range(c): return max(1e-9, c["high"] - c["low"])
+        def _is_green(c): return c["close"] >= c["open"]
+        def _is_red(c): return c["close"] <= c["open"]
+        def bull_engulf(a, b):
+            return _is_green(b) and (a["close"] < a["open"]) and (b["close"] > a["open"]) and (b["open"] < a["close"])
+        def bear_engulf(a, b):
+            return _is_red(b) and (a["close"] > a["open"]) and (b["close"] < a["open"]) and (b["open"] > a["close"])
+        def hammer(b):
+            rng = _range(b); body = _body(b)
+            lower = min(b["open"], b["close"])
+            lo_w = lower - b["low"]
+            close_pos = (b["close"] - b["low"]) / max(1e-8, rng)
+            return lo_w >= body and close_pos >= 0.75
+        def shooting_star(b):
+            rng = _range(b); body = _body(b)
+            upper = max(b["open"], b["close"])
+            hi_w = b["high"] - upper
+            close_pos = (b["close"] - b["low"]) / max(1e-8, rng)
+            return hi_w >= body and close_pos <= 0.25
+
+        long_pat = bull_engulf(prev, cur) or hammer(cur)
+        short_pat = bear_engulf(prev, cur) or shooting_star(cur)
+
+        # Band math
+        band_pct = max(0.0015, 0.75 * atr_pct)
+        tp_pct = max(0.0015, 0.85 * band_pct)
+        # Fee->TP constraint (maker 0.01%/side)
+        fee_to_tp = (2 * 0.0001) / tp_pct
+        if fee_to_tp > 0.20:
+            return Signal(type="WAIT", reason="Fees")
+
+        # Overshoot + reclaim
+        vprev = ctx["vwap"][i - 1]
+        px_prev = prev["close"]
+        long_ok_bias = ema_bias_up or allow_ct
+        short_ok_bias = ema_bias_dn or allow_ct
+
+        over_long = bool(prev["low"] <= (vprev * (1 - 1.00 * band_pct))) if vprev else False
+        reclaim_long = bool(cur["close"] >= (ctx["vwap"][i] * (1 - 0.65 * band_pct)) and _is_green(cur))
+        over_short = bool(prev["high"] >= (vprev * (1 + 1.00 * band_pct))) if vprev else False
+        reclaim_short = bool(cur["close"] <= (ctx["vwap"][i] * (1 + 0.65 * band_pct)) and _is_red(cur))
+
+        # Soft scoring
+        closes_m1 = [c["close"] for c in m1]
+        macd_l, macd_s = macd_line_signal(closes_m1, 12, 26, 9)
+        macd_state = _macd_state(macd_l, macd_s, i)
+        macd_align_long = macd_state in ("up", "cross")
+        macd_align_short = macd_state in ("down", "cross")
+
+        score_base = 4.0
+        score_long = score_base
+        score_short = score_base
+        # rsi extreme
+        if rsi_now is not None:
+            if rsi_now < 30.0:
+                score_long += 0.5
+            if rsi_now > 70.0:
+                score_short += 0.5
+        # macd align
+        if macd_align_long:
+            score_long += 0.5
+        if macd_align_short:
+            score_short += 0.5
+        # (cum delta optional) + h1 rsi extreme
+        rsi_h1 = rsi([c["close"] for c in h1], 14); rsi_h1_now = rsi_h1[j] if j is not None else None
+        if rsi_h1_now is not None and rsi_h1_now < 30.0:
+            score_long += 0.5
+        if rsi_h1_now is not None and rsi_h1_now > 70.0:
+            score_short += 0.5
+
+        PS = float(ctx["PS"])
+        loss_streak = float(ctx["loss_streak"])
+        min_score = 5.0
+        if PS < 0.4 or loss_streak >= 2.0:
+            min_score = 5.5
+
+        # Final gates
+        if over_long and reclaim_long and vol_ok and long_pat and long_ok_bias and score_long >= min_score:
+            dist = px * tp_pct
+            return Signal(type="BUY", reason="m1 reclaim long", stop_dist=dist, take_dist=dist, score=score_long, tf="m1")
+        if over_short and reclaim_short and vol_ok and short_pat and short_ok_bias and score_short >= min_score:
+            dist = px * tp_pct
+            return Signal(type="SELL", reason="m1 reclaim short", stop_dist=dist, take_dist=dist, score=score_short, tf="m1")
+
+        return Signal(type="WAIT", reason="Inside bands")
+        
+
+# ---------------- h1 mean reversion ----------------
+
+class H1MeanReversion(Strategy):
+    name = "h1 Mean‑Reversion"
+
+    def evaluate(self, ctx: dict) -> Signal:
+        h1 = ctx["h1"]; i = ctx["iC_h1"]
+        if i is None or i < max(220, ctx.get("min_h1_bars", 220)):
+            return Signal(type="WAIT", reason="Warmup")
+        px = h1[i]["close"]
+        a14 = atr(h1, 14); ax = adx(h1, 14)
+        dc = donchian(h1, 20)
+        VS = float(ctx["VS"])
+        adx_cap = 17.0 * VS
+        if (ax[i] or 0.0) > adx_cap:
+            return Signal(type="WAIT", reason="Trend regime")
+        hi = dc["hi"][i]; lo = dc["lo"][i]
+        if hi is None or lo is None:
+            return Signal(type="WAIT", reason="DC warmup")
+        mid = 0.5 * (hi + lo); atr_abs = a14[i] or 0.0
+        if atr_abs <= 0:
+            return Signal(type="WAIT", reason="ATR warmup")
+
+        # Base distances (ATR units)
+        k_entry = 0.75; k_stop = 0.85; k_take = 0.95
+        if (ax[i] or 0.0) < 14.0:
+            k_entry = 0.85  # deeper entry in dead-range
+        # Capitulation extension (bigger take)
+        rsi_h1 = rsi([c["close"] for c in h1], 14); rsi_now = rsi_h1[i] or 50.0
+        vol_win = [c.get("volume", 0.0) for c in h1[max(0, i - 20):i]]
+        vmed = median(vol_win) if vol_win else 0.0
+        capit = (
+            (ax[i] or 0.0) < 14.0
+            and (rsi_now < 30.0 or rsi_now > 70.0)
+            and (h1[i].get("volume", 0.0) >= 2.0 * vmed if vmed > 0 else True)
+        )
+        if capit:
+            k_take = 1.2 if VS <= 1.2 else 1.1
+
+        dist = px - mid
+        if dist <= -(k_entry * atr_abs):
+            return Signal(type="BUY", reason="H1 mean‑revert up", stop_dist=k_stop * atr_abs, take_dist=k_take * atr_abs, score=3.5, tf="h1")
+        if dist >= +(k_entry * atr_abs):
+            return Signal(type="SELL", reason="H1 mean‑revert down", stop_dist=k_stop * atr_abs, take_dist=k_take * atr_abs, score=3.5, tf="h1")
+
+        return Signal(type="WAIT", reason="Near mean")
+
+
+# ---------------- h1 breakout ----------------
+
+class H1Breakout(Strategy):
+    name = "h1 Breakout"
+
+    def evaluate(self, ctx: dict) -> Signal:
+        h1 = ctx["h1"]; i = ctx["iC_h1"]
+        if i is None or i < max(220, ctx.get("min_h1_bars", 220)):
+            return Signal(type="WAIT", reason="Warmup")
+        a14 = atr(h1, 14); ax = adx(h1, 14)
+        dc = donchian(h1, 20)
+        px = h1[i]["close"]
+        # squeeze→expansion similar to V1; volume threshold scales with VS
+        wnd = a14[max(0, i - 30):i]
+        if len([x for x in wnd if x is not None]) < 10:
+            return Signal(type="WAIT", reason="ATR warmup")
+        med = median([x for x in wnd if x is not None])
+        squeeze = (a14[i - 1] or 0.0) <= 0.6 * med
+        tr_today = max(
+            h1[i]["high"] - h1[i]["low"],
+            abs(h1[i]["high"] - h1[i - 1]["close"]),
+            abs(h1[i]["low"] - h1[i - 1]["close"]),
+        )
+        expand = tr_today >= 1.4 * med
+        VS = float(ctx["VS"])
+        v_win = [c.get("volume", 0.0) for c in h1[max(0, i - 20):i]]
+        v_med = median(v_win) if v_win else 0.0
+        mult = min(2.0, max(1.1, 1.3 * VS))
+        vol_ok = (h1[i].get("volume", 0.0) >= mult * v_med) if v_med > 0 else True
+
+        hi_prev = dc["hi"][i - 1]; lo_prev = dc["lo"][i - 1]
+        up = (px > hi_prev) if hi_prev is not None else False
+        dn = (px < lo_prev) if lo_prev is not None else False
+
+        if not (squeeze and expand and vol_ok):
+            return Signal(type="WAIT", reason="No breakout")
+
+        if up:
+            return Signal(type="BUY", reason="H1 breakout up", stop_dist=1.2 * (a14[i] or 0.0), take_dist=1.1 * (a14[i] or 0.0), score=5.0, tf="h1")
+        if dn:
+            return Signal(type="SELL", reason="H1 breakout down", stop_dist=1.2 * (a14[i] or 0.0), take_dist=1.1 * (a14[i] or 0.0), score=5.0, tf="h1")
+
+        return Signal(type="WAIT", reason="Waiting break")
+
+
+# ---------------- h1 trend ----------------
+
+class H1Trend(Strategy):
+    name = "h1 Trend‑Following"
+
+    def evaluate(self, ctx: dict) -> Signal:
+        h1 = ctx["h1"]; i = ctx["iC_h1"]
+        if i is None or i < max(220, ctx.get("min_h1_bars", 220)):
+            return Signal(type="WAIT", reason="Warmup")
+
+        closes = [c["close"] for c in h1]
+        e200 = ema(closes, 200)
+        a14 = atr(h1, 14)
+        ax = adx(h1, 14)
+        dc = donchian(h1, 20)
+
+        VS = float(ctx["VS"]); PS = float(ctx["PS"])
+        thr = 25.0 * (1.0 - 0.20 * (1.0 - PS))   # higher PS → easier engage
+        if (ax[i] or 0.0) < thr:
+            return Signal(type="WAIT", reason="Trend weak")
+
+        px = h1[i]["close"]
+        ema_up = bool(e200[i] and e200[i] > e200[max(0, i - 5)])
+        ema_dn = bool(e200[i] and e200[i] < e200[max(0, i - 5)])
+        hi_prev = dc["hi"][i - 1]; lo_prev = dc["lo"][i - 1]
+        bk_up = (px > hi_prev) if hi_prev is not None else False
+        bk_dn = (px < lo_prev) if lo_prev is not None else False
+
+        if ema_up and bk_up:
+            return Signal(type="BUY", reason="Trend up + break", stop_dist=1.8 * (a14[i] or 0.0), take_dist=1.4 * (a14[i] or 0.0), score=5.0, tf="h1")
+        if ema_dn and bk_dn:
+            return Signal(type="SELL", reason="Trend down + break", stop_dist=1.8 * (a14[i] or 0.0), take_dist=1.4 * (a14[i] or 0.0), score=5.0, tf="h1")
+
+        return Signal(type="WAIT", reason="Need Donchian break")
+
+
+# ---------------- Router ----------------
+
+class RouterV3(Strategy):
+    """Implements regime & priority and picks a candidate signal."""
+    name = "Router V3"
 
     def __init__(self):
-        from .level_king_regime import LevelKingRegime
-        from .mean_reversion import MeanReversion
-        from .breakout import Breakout
-        from .trend_follow import TrendFollow
+        self.m1 = M1Scalp()
+        self.h1_mr = H1MeanReversion()
+        self.h1_bo = H1Breakout()
+        self.h1_tr = H1Trend()
 
-        self.scalper = LevelKingRegime()
-        self.revert = MeanReversion()
-        self.breakout = Breakout()
-        self.trend = TrendFollow()
-
-        # ADX thresholds with hysteresis (canonical)
-        self.adx_thr = 25      # breakout threshold (H1 Donchian)
-        self.adx_on = 27       # enter trend
-        self.adx_off = 23      # exit trend
-
-        # Internal state
-        self._scalp_mode = True
-        self._mode = "range"   # "range" | "trend" | "breakout"
-
-        # Telemetry for UI
+        # telemetry
         self.last_regime: Optional[str] = None
         self.last_bias: Optional[str] = None
         self.last_adx: Optional[float] = None
         self.last_atr_pct: Optional[float] = None
         self.last_strategy: Optional[str] = None
 
-    def pick(self, scalp_mode: bool) -> "StrategyRouter":
-        self._scalp_mode = bool(scalp_mode)
-        return self
+    def evaluate(self, ctx: dict) -> Signal:
+        m1 = ctx["m1"]; h1 = ctx["h1"]
+        iC_m1 = ctx.get("iC_m1"); iC_h1 = ctx.get("iC_h1")
 
-    def _calc_bias(self, h1: List[Dict[str, Any]], i: Optional[int]) -> Optional[str]:
-        if i is None or i < 0 or i >= len(h1):
-            return None
-        closes = [c["close"] for c in h1]
-        e200 = ema(closes, 200)
-        if e200[i] is None:
-            return None
-        return "Bullish" if h1[i]["close"] >= (e200[i] or 0.0) else "Bearish"
+        # regime by ADX (hysteresis: Trend ≥25, exit ≤21; Breakout ≤23 with DC break; else Range)
+        ax_h1 = adx(h1, 14)
+        adx_last = (ax_h1[iC_h1] or 0.0) if iC_h1 is not None else 0.0
+        self.last_adx = adx_last
 
-    def evaluate(self, ohlc: List[Dict[str, Any]], ctx: Dict[str, Any]) -> Signal:
-        # Ensure we have both series in context
-        m1 = ctx.get("m1") or ohlc
-        h1 = ctx.get("h1") or ohlc
-
-        # ---- Warmup gating (FIX): gate by the TF we are about to consider ----
-        if self._scalp_mode:
-            iC_m1 = ctx.get("iC_m1")
-            min_bars = int(ctx.get("min_bars", 0))
-            if iC_m1 is None or len(m1) < min_bars:
-                return Signal(type="WAIT", reason="Need short warmup")
-        else:
-            iC_h1 = ctx.get("iC_h1")
-            min_h1 = int(ctx.get("min_h1_bars", 240))
-            if iC_h1 is None or len(h1) < min_h1:
-                return Signal(type="WAIT", reason="Need H1 history")
-
-        # --- Regime features ---
-        # ADX for the router: m5 when scalper is under consideration; H1 otherwise.
-        if self._scalp_mode:
-            m5 = _aggregate(m1, 300)
-            a_m5 = adx(m5, 14)
-            adx_src = a_m5[-2] if len(a_m5) >= 2 else None
-            # For telemetry, compute ATR% on m1
-            A_m1 = atr(m1, 14)
-            idx_m1 = ctx.get("iC_m1")
-            atr_pct = ((A_m1[idx_m1] or 0.0) / max(1.0, m1[idx_m1]["close"])) if isinstance(idx_m1, int) and idx_m1 >= 0 else 0.0
-        else:
-            a_h1 = adx(h1, 14)
-            adx_src = a_h1[-2] if len(a_h1) >= 2 else None
-            A_h1 = atr(h1, 14)
-            idx_h1 = ctx.get("iC_h1")
-            atr_pct = ((A_h1[idx_h1] or 0.0) / max(1.0, h1[idx_h1]["close"])) if isinstance(idx_h1, int) and idx_h1 >= 0 else 0.0
-
-        # Telemetry
-        self.last_adx = adx_src
+        A = atr(h1, 14)
+        atr_pct = ((A[iC_h1] or 0.0) / max(1.0, h1[iC_h1]["close"])) if iC_h1 is not None else None
         self.last_atr_pct = atr_pct
-        self.last_bias = self._calc_bias(h1, ctx.get("iC_h1"))
 
-        # ATR% band guard (coarse; exact gates live in strategies)
-        profile = ctx.get("profile") or {}
-        atr_min = profile.get("ATR_PCT_MIN", 0.0004)
-        atr_max = profile.get("ATR_PCT_MAX", 0.0200)
-        atr_ok = (atr_pct >= atr_min) and (atr_pct <= atr_max)
-
-        # Donchian break flags on H1 (aligns with Breakout/Trend strategies)
-        idx_h1 = ctx.get("iC_h1")
-        dc_h1 = donchian(h1, 20)
-        if isinstance(idx_h1, int) and idx_h1 > 0 and idx_h1 < len(h1):
-            hi_prev = dc_h1["hi"][idx_h1 - 1]
-            lo_prev = dc_h1["lo"][idx_h1 - 1]
-            px_now = h1[idx_h1]["close"]
-            bk_up = (hi_prev is not None) and (px_now > hi_prev)
-            bk_dn = (lo_prev is not None) and (px_now < lo_prev)
+        # bias via EMA200(h1)
+        closes_h1 = [c["close"] for c in h1]
+        e200 = ema(closes_h1, 200)
+        if iC_h1 is not None and e200[iC_h1] is not None:
+            self.last_bias = "Bullish" if h1[iC_h1]["close"] >= (e200[iC_h1] or 0.0) else "Bearish"
         else:
-            bk_up = bk_dn = False
+            self.last_bias = None
 
-        # Hysteresis regime logic (using m5 ADX in scalper mode, H1 ADX otherwise)
-        mode = self._mode
-        if adx_src is not None:
-            if mode in ("trend", "breakout") and adx_src <= self.adx_off:
-                mode = "range"
-            elif mode == "range" and adx_src >= self.adx_on:
-                mode = "trend"
+        # breakout presence
+        dc = donchian(h1, 20)
+        bk_up = bk_dn = False
+        if iC_h1 and iC_h1 > 0:
+            px = h1[iC_h1]["close"]
+            hi_prev = dc["hi"][iC_h1 - 1]
+            lo_prev = dc["lo"][iC_h1 - 1]
+            bk_up = (hi_prev is not None) and (px > hi_prev)
+            bk_dn = (lo_prev is not None) and (px < lo_prev)
 
-        # Breakout priority when H1 ADX low and H1 Donchian breaks within ATR band
-        # (This can preempt to Breakout strategy even when scalper is the active mode)
-        a_h1_for_break = adx(h1, 14)
-        adx_h1_last = a_h1_for_break[-2] if len(a_h1_for_break) >= 2 else None
-        if adx_h1_last is not None and adx_h1_last <= self.adx_thr and (bk_up or bk_dn) and atr_ok:
-            mode = "breakout"
-
-        self._mode = mode
-        self.last_regime = {"range": "Range", "trend": "Trending", "breakout": "Breakout"}.get(mode, "Unknown")
-
-        # --- Route selection ---
-        if mode == "breakout":
-            self.last_strategy = self.breakout.name
-            return self.breakout.evaluate(h1, ctx)
-
-        if mode == "trend":
-            self.last_strategy = self.trend.name
-            return self.trend.evaluate(h1, ctx)
-
-        # Range:
-        if self._scalp_mode:
-            self.last_strategy = self.scalper.name
-            if atr_ok:
-                return self.scalper.evaluate(m1, ctx)
-            return Signal(type="WAIT", reason="ATR range")
+        if adx_last >= 25.0:
+            regime = "Trend"
+        elif (adx_last <= 23.0) and (bk_up or bk_dn) and (atr_pct is None or (0.0005 <= atr_pct <= 0.0175)):
+            regime = "Breakout"
         else:
-            self.last_strategy = self.revert.name
-            if atr_ok:
-                return self.revert.evaluate(h1, ctx)
-            return Signal(type="WAIT", reason="ATR range")
+            regime = "Range"
+        self.last_regime = regime
+
+        # Priority: Trend → Breakout → Range
+        sig: Signal = Signal(type="WAIT", reason="—")
+        if regime == "Trend":
+            sig = self.h1_tr.evaluate(ctx)
+            self.last_strategy = self.h1_tr.name if sig.type != "WAIT" else None
+            if sig.type != "WAIT":
+                return sig
+
+        if regime == "Breakout":
+            sig = self.h1_bo.evaluate(ctx)
+            self.last_strategy = self.h1_bo.name if sig.type != "WAIT" else None
+            if sig.type != "WAIT":
+                return sig
+
+        # Range: try m1 scalp; if not, h1 mean‑reversion when ADX <= 17×VS
+        sig = self.m1.evaluate(ctx)
+        self.last_strategy = self.m1.name if sig.type != "WAIT" else None
+        if sig.type != "WAIT":
+            return sig
+
+        # fall back to H1 MR if quiet enough
+        VS = float(ctx["VS"])
+        if adx_last <= 17.0 * VS:
+            sig2 = self.h1_mr.evaluate(ctx)
+            self.last_strategy = self.h1_mr.name if sig2.type != "WAIT" else None
+            return sig2
+
+        return Signal(type="WAIT", reason="No setup")
