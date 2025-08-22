@@ -35,7 +35,6 @@ def _opp_wick_ge_body(c: dict, side: str) -> bool:
     body = abs(c["close"] - c["open"])
     if body <= 0:
         return False
-    # opposing wick: for long fades we want a long LOWER wick; for short fades, a long UPPER wick
     lower = min(c["open"], c["close"]) - c["low"]
     upper = c["high"] - max(c["open"], c["close"])
     return (lower >= body) if side == "long" else (upper >= body)
@@ -104,7 +103,11 @@ class M1Scalp(Strategy):
         ema_bias_dn = bool(e200[j] and h1[j]["close"] <= (e200[j] or 0.0)) if j is not None else True
         ax_h1 = adx(h1, 14); adx_h1 = (ax_h1[j] or 0.0) if j is not None else 0.0
         rsi_m1 = rsi([c["close"] for c in m1], 14); rsi_now = rsi_m1[i] or 50.0
-        allow_ct = (adx_h1 < 20.0 * VS) and ((rsi_now < 25.0) or (rsi_now > 75.0))
+        rsi_prev = rsi_m1[i - 1] if i - 1 >= 0 else None
+        allow_ct = (adx_h1 < 20.0 * VS) and (
+            (rsi_now < 25.0 and (rsi_prev is not None and rsi_now > rsi_prev)) or
+            (rsi_now > 75.0 and (rsi_prev is not None and rsi_now < rsi_prev))
+        )
 
         # Volume quality on reclaim candle
         win = m1[max(0, i - 20):i]
@@ -117,8 +120,6 @@ class M1Scalp(Strategy):
         prev = m1[i - 1]
         cur = m1[i]
 
-        def _body(c): return abs(c["close"] - c["open"])
-        def _range(c): return max(1e-9, c["high"] - c["low"])
         def _is_green(c): return c["close"] >= c["open"]
         def _is_red(c): return c["close"] <= c["open"]
         def bull_engulf(a, b):
@@ -126,14 +127,14 @@ class M1Scalp(Strategy):
         def bear_engulf(a, b):
             return _is_red(b) and (a["close"] > a["open"]) and (b["close"] < a["open"]) and (b["open"] > a["close"])
         def hammer(b):
-            rng = _range(b); body = _body(b)
+            rng = max(1e-9, b["high"] - b["low"]); body = abs(b["close"] - b["open"])
             lower = min(b["open"], b["close"]) - b["low"]
-            close_pos = (b["close"] - b["low"]) / max(1e-8, rng)
+            close_pos = (b["close"] - b["low"]) / rng
             return lower >= body and close_pos >= 0.75
         def shooting_star(b):
-            rng = _range(b); body = _body(b)
+            rng = max(1e-9, b["high"] - b["low"]); body = abs(b["close"] - b["open"])
             upper = b["high"] - max(b["open"], b["close"])
-            close_pos = (b["close"] - b["low"]) / max(1e-8, rng)
+            close_pos = (b["close"] - b["low"]) / rng
             return upper >= body and close_pos <= 0.25
 
         long_pat = bull_engulf(prev, cur) or hammer(cur)
@@ -163,15 +164,21 @@ class M1Scalp(Strategy):
         macd_long_recent = _macd_cross_recent(macd_l, macd_s, i, "long", 3)
         macd_short_recent = _macd_cross_recent(macd_l, macd_s, i, "short", 3)
 
-        # Soft scoring
+        # Soft scoring (exact spec: RSI extreme + trend of RSI; MACD cross recency; + h1 RSI extreme)
         score_base = 4.0
         score_long = score_base
         score_short = score_base
-        if rsi_now is not None:
-            if rsi_now < 30.0: score_long += 0.5
-            if rsi_now > 70.0: score_short += 0.5
+
+        # RSI extreme + direction
+        if rsi_prev is not None and rsi_now is not None:
+            if rsi_now < 30.0 and rsi_now > rsi_prev:  # rising
+                score_long += 0.5
+            if rsi_now > 70.0 and rsi_now < rsi_prev:  # falling
+                score_short += 0.5
+
         if macd_long_recent: score_long += 0.5
         if macd_short_recent: score_short += 0.5
+
         # (cum delta optional) + h1 rsi extreme
         rsi_h1 = rsi([c["close"] for c in h1], 14); rsi_h1_now = rsi_h1[j] if j is not None else None
         if rsi_h1_now is not None and rsi_h1_now < 30.0: score_long += 0.5
@@ -222,12 +229,7 @@ class H1MeanReversion(Strategy):
         if (ax[i] or 0.0) < 14.0:
             k_entry = 0.85  # deeper entry in dead-range
 
-        # Capitulation extension (bigger take only on true capitulation)
-        rsi_h1 = rsi([c["close"] for c in h1], 14); rsi_now = rsi_h1[i] or 50.0
-        vol_win = [c.get("volume", 0.0) for c in h1[max(0, i - 20):i]]
-        vmed = median(vol_win) if vol_win else 0.0
-        capit_base = ((ax[i] or 0.0) < 14.0) and (h1[i].get("volume", 0.0) >= 2.0 * vmed if vmed > 0 else True)
-
+        # How far from the mid are we?
         dist = px - mid
         side: Optional[str] = None
         if dist <= -(k_entry * atr_abs):
@@ -235,15 +237,26 @@ class H1MeanReversion(Strategy):
         elif dist >= +(k_entry * atr_abs):
             side = "short"
 
+        # RSI supportive (spec requirement)
+        rsi_h1 = rsi([c["close"] for c in h1], 14); rsi_now = rsi_h1[i] or 50.0
+        if side == "long" and not (rsi_now < 30.0):
+            return Signal(type="WAIT", reason="RSI not supportive")
+        if side == "short" and not (rsi_now > 70.0):
+            return Signal(type="WAIT", reason="RSI not supportive")
+
+        # Capitulation extension (bigger take only on true capitulation)
+        vol_win = [c.get("volume", 0.0) for c in h1[max(0, i - 20):i]]
+        vmed = median(vol_win) if vol_win else 0.0
+        capit_base = ((ax[i] or 0.0) < 14.0) and (h1[i].get("volume", 0.0) >= 2.0 * vmed if vmed > 0 else True)
         if side == "long" and (rsi_now < 30.0) and capit_base and _opp_wick_ge_body(h1[i], "long"):
             k_take = 1.2 if VS <= 1.2 else 1.1
         if side == "short" and (rsi_now > 70.0) and capit_base and _opp_wick_ge_body(h1[i], "short"):
             k_take = 1.2 if VS <= 1.2 else 1.1
 
         if side == "long":
-            return Signal(type="BUY", reason="H1 mean‑revert up", stop_dist=k_stop * atr_abs, take_dist=k_take * atr_abs, score=3.5, tf="h1")
+            return Signal(type="BUY", reason="H1 mean‑revert up", stop_dist=0.85 * atr_abs, take_dist=k_take * atr_abs, score=3.5, tf="h1")
         if side == "short":
-            return Signal(type="SELL", reason="H1 mean‑revert down", stop_dist=k_stop * atr_abs, take_dist=k_take * atr_abs, score=3.5, tf="h1")
+            return Signal(type="SELL", reason="H1 mean‑revert down", stop_dist=0.85 * atr_abs, take_dist=k_take * atr_abs, score=3.5, tf="h1")
 
         return Signal(type="WAIT", reason="Near mean")
 
@@ -422,15 +435,19 @@ class RouterV3(Strategy):
             sig = self.h1_mr.evaluate(ctx)
             if sig.type != "WAIT":
                 self.last_strategy = self.h1_mr.name
+                sig.tf = sig.tf or "h1"
                 return sig
             sig2 = self.m1.evaluate(ctx)
             self.last_strategy = self.m1.name if sig2.type != "WAIT" else None
+            sig2.tf = sig2.tf or "m1"
             return sig2
         else:
             sig = self.m1.evaluate(ctx)
             if sig.type != "WAIT":
                 self.last_strategy = self.m1.name
+                sig.tf = sig.tf or "m1"
                 return sig
             sig2 = self.h1_mr.evaluate(ctx)
             self.last_strategy = self.h1_mr.name if sig2.type != "WAIT" else None
+            sig2.tf = sig2.tf or "h1"
             return sig2
