@@ -5,6 +5,8 @@ Highlights:
 - Implements VS (volatility score) and PS (performance score).
 - m1 scalps + selective h1 swings via RouterV3.
 - Giveback stop, day guard, streak governance, cooldowns.
+- Slippage/depth gating using synthetic top-3 notional until real depth is wired.
+- Fallback loosening once/day when H1 is dead but tradeable.
 - Short, human STATUS messages (2–4 words).
 """
 
@@ -19,8 +21,9 @@ from .config import settings
 from .datafeed import seed_klines, poll_tick
 from .broker import PaperBroker, FEE_MAKER
 from .models import Position, Trade
+from .strategies.base import Signal   # FIX: was missing before
 from .strategies.router import RouterV3
-from .ta import atr, rsi, macd_line_signal
+from .ta import atr, rsi, macd_line_signal, adx
 
 
 def sod_sec() -> int:
@@ -70,14 +73,22 @@ class BotEngine:
 
         self._last_open_m1: int = 0
         self._last_open_h1: int = 0
+        self._last_trade_ts: int = 0              # for PS idle decay
+        self._last_ps_decay: int = 0              # throttle PS decay steps
         self._last_decision: dict[str, Any] = {}
 
-        # slippage/depth telemetry (best effort; we only have top of book)
+        # slippage/depth telemetry (approx until depth is wired)
         self._last_spread_bps: Optional[float] = None
         self._last_fee_to_tp: Optional[float] = None
+        self._last_slip_est: Optional[float] = None
+        self._synthetic_top3_notional: float = settings.synthetic_top3_notional
 
         # realized R track
         self._last_Rs: list[float] = []
+
+        # Fallback loosening (once/day)
+        self._fallback_pending_m1: bool = False
+        self._fallback_used_day: Optional[int] = None
 
         # Router
         self.router = RouterV3()
@@ -194,21 +205,23 @@ class BotEngine:
         self._macd_m1 = macd_line_signal(closes_m1, 12, 26, 9)
         self._macd_h1 = macd_line_signal(closes_h1, 12, 26, 9)
 
-    def _update_VS_PS(self) -> None:
-        # VS
+    def _update_VS_PS(self, now: Optional[int] = None) -> None:
+        # VS = clamp( m1_ATR% / median(m1_ATR%, last 50), 0.5, 2.0 )
         atr_ratio = self._atr_ratio_vs_median50()
-        atr_pct = self._atr_pct_m1()
-        if atr_ratio is not None and atr_pct is not None:
-            self.VS = _clamp(atr_pct / max(1e-9, (atr_pct / atr_ratio)), 0.5, 2.0)
-        else:
-            self.VS = 1.0
+        self.VS = _clamp(atr_ratio, 0.5, 2.0) if atr_ratio is not None else 1.0
 
-        # PS
-        day_pct = self._day_pnl_pct() / 100.0
-        PS = 0.5 + 0.10 * day_pct * 100.0 - 0.15 * max(0.0, self._loss_streak)
-        # gentle decay toward 0.5 if idle (handled every cycle)
+        # PS = clamp(0..1, 0.5 + 0.10 * PnL_day_% − 0.15 * loss_streak)
+        day_pct = self._day_pnl_pct()
+        PS = 0.5 + 0.10 * day_pct - 0.15 * max(0.0, self._loss_streak)
         self.PS = _clamp(PS, 0.0, 1.0)
-        self.PS = 0.5 * 0.01 + self.PS * 0.99 if not self.broker.history else self.PS
+
+        # Idle decay toward 0.5 if flat for >= 2h (apply every 10 min)
+        if now is None:
+            now = int(time.time())
+        if self._last_trade_ts and (now - self._last_trade_ts) >= 7200:
+            if (now - self._last_ps_decay) >= 600:
+                self.PS += (0.5 - self.PS) * 0.10
+                self._last_ps_decay = now
 
     def _short_status(self, key: str) -> str:
         """Map reasons to very short statuses (2–4 words)."""
@@ -286,8 +299,8 @@ class BotEngine:
                 self._log(f"Data error: {e}")
 
             # VS/PS, macro/giveback
-            self._update_VS_PS()
             now = int(time.time())
+            self._update_VS_PS(now)
 
             # Macro pause auto-off
             if self._macro_until and now >= self._macro_until:
@@ -334,6 +347,24 @@ class BotEngine:
 
     # --------------- decision & sizing ----------------
 
+    def _maybe_set_fallback(self, now: int) -> None:
+        """Arm fallback loosening for next m1 entry once per UTC day when H1 is quiet but tradable."""
+        # already used today?
+        if self._fallback_used_day == sod_sec():
+            return
+        # last H1 open >= 4h ago?
+        four_hours = 4 * 3600
+        if (now - self._last_open_h1) < four_hours:
+            return
+        # ADX window guard: 15 <= ADX(h1) <= 22
+        iH = len(self.h1) - 2 if len(self.h1) >= 2 else None
+        if iH is None or iH < 1:
+            return
+        ax = adx(self.h1, 14)
+        a = (ax[iH] or 0.0)
+        if 15.0 <= a <= 22.0:
+            self._fallback_pending_m1 = True
+
     async def _maybe_decide(self, now: int) -> None:
         if not self.settings.get("auto_trade"):
             return
@@ -352,6 +383,9 @@ class BotEngine:
         if self._day_pnl_pct() <= -5.0 or self._losses_today >= 4:
             self.status_text = self._short_status("giveback")
             return
+
+        # Try arming fallback loosening if conditions stand
+        self._maybe_set_fallback(now)
 
         # Cooldowns
         cooldown_ok_m1 = (now - self._last_open_m1) > 45
@@ -373,12 +407,11 @@ class BotEngine:
         # VS-driven scheduling: m1 first if VS≥1, else h1 first
         order = ("m1", "h1") if self.VS >= 1.0 else ("h1", "m1")
 
-        sig = None
+        sig: Optional[Signal] = None
         for _ in order:
             s = self.router.evaluate(ctx)
             # Apply extra governance on m1 after 3 losses
             if s.tf == "m1" and self._require_macd_next_m1 and s.type in ("BUY", "SELL"):
-                # Recompute MACD align check: require a fresh cross toward side in last ≤3 bars
                 closes_m1 = [c["close"] for c in self.m1]
                 mline, msignal = macd_line_signal(closes_m1, 12, 26, 9)
                 idx = iC_m1
@@ -422,7 +455,11 @@ class BotEngine:
         equity = max(1e-9, float(self.broker.equity))
         base_risk = 0.008 if sig.tf == "m1" else 0.0025
         atr_pct = self._atr_pct_m1() or 0.0
+
+        # Fallback loosening: once/day, m1 only
         VS_eff = self.VS
+        if sig.tf == "m1" and self._fallback_pending_m1:
+            VS_eff = max(0.9, min(2.0, VS_eff + 0.2))
         atr_norm = min(1.0, atr_pct / max(1e-9, (0.0175 * VS_eff)))
         risk_mult = 1.0 - 0.40 * atr_norm
         eff = base_risk * risk_mult * self.PS
@@ -436,27 +473,43 @@ class BotEngine:
         if sig.tf == "m1" and self.PS >= 0.70 and 0.8 <= self.VS <= 1.4:
             eff *= 1.30
             last5 = self._last_Rs[-5:]
-            if len(last5) >= 3 and (sum(last5) / len(last5)) >= 0.25 and (self._day_high_equity == self.broker.equity) and (self._last_spread_bps or 0) <= 4.0:
+            # only tier-2 uplift if: rolling E[R] ≥ 0.25R, no giveback pause triggered, spread ≤4 bps AND slip ok
+            tier2_ok = (len(last5) >= 3 and (sum(last5) / len(last5)) >= 0.25 and (self._pause_until == 0 or self._pause_until < int(time.time())))
+            if tier2_ok and (self._last_spread_bps or 0) <= 4.0:
+                # slip check later after we compute it
                 eff = min(eff * (50.0 / 30.0), 1.5 * base_risk)
 
         stopd = sig.stop_dist
         qty = (equity * eff) / max(1e-9, stopd)
 
-        # leverage cap (we simulate up to 10x for scalps; 2x for h1)
-        lev_cap = 10.0 if (sig.tf == "m1" and (self._last_spread_bps or 0) <= 4.0) else (2.0 if sig.tf == "h1" else 5.0)
-        qty_cap = (equity * lev_cap) / max(1.0, self.price)
+        # Synthetic top-3 depth and slippage estimate
+        entry_price = self.price
+        order_notional = qty * entry_price
+        top3_notional = self._synthetic_top3_notional
+        top3_qty = top3_notional / max(1e-9, entry_price)
+
+        # Maker-only in paper: slip = spread/2; if bid/ask missing, assume 6 bps total spread conservatively
+        if (self.bid is not None) and (self.ask is not None):
+            spread_abs = self.ask - self.bid
+        else:
+            spread_abs = entry_price * 0.0006  # 6 bps fallback
+        slip_est = spread_abs / 2.0
+        self._last_slip_est = slip_est
+
+        # leverage cap (10× only when spread tight AND slip <= 0.3R; h1 stays at 2×)
+        lev_cap = 10.0 if (sig.tf == "m1" and (self._last_spread_bps or 999) <= 4.0 and slip_est <= 0.3 * stopd) else (2.0 if sig.tf == "h1" else 5.0)
+        qty_cap = (equity * lev_cap) / max(1.0, entry_price)
         qty = max(0.0, min(qty, qty_cap))
 
         # Combined live risk cap (single position in this engine)
         if self.broker.pos:
-            # refuse new entry if implied risk would exceed 1.5% live
             live = (self.broker.pos.stop_dist * self.broker.pos.qty) / equity
             if (live + eff) > 0.015:
                 self._last_wait_reason = "Live risk cap"
                 return
 
         # Spread/fee/TP checks
-        tp_pct = max(1e-9, sig.take_dist / max(1.0, self.price))
+        tp_pct = max(1e-9, sig.take_dist / max(1.0, entry_price))
         fee_to_tp = (2 * FEE_MAKER) / tp_pct
         self._last_fee_to_tp = fee_to_tp
         if fee_to_tp > 0.20:
@@ -466,11 +519,20 @@ class BotEngine:
             self._last_wait_reason = "Spread cap"
             return
 
+        # Slippage & synthetic depth gating (Spec §7)
+        if slip_est > 0.3 * stopd:
+            self._last_wait_reason = "Slip>0.3R"
+            return
+        if top3_notional < 2.0 * order_notional:
+            self._last_wait_reason = "Depth<2x order"
+            return
+
         # Place order (post‑only assumed; crossing logic omitted in paper)
-        entry = self.price
+        entry = entry_price
         stop = entry - stopd if sig.type == "BUY" else entry + stopd
         take = entry + sig.take_dist if sig.type == "BUY" else entry - sig.take_dist
 
+        # Close & reverse if opposite
         if self.broker.pos:
             ps = self.broker.pos.side
             if (sig.type == "BUY" and ps == "short") or (sig.type == "SELL" and ps == "long"):
@@ -484,9 +546,16 @@ class BotEngine:
             )
             if sig.tf == "m1":
                 self._last_open_m1 = now
+                if self._fallback_pending_m1:
+                    self._fallback_pending_m1 = False
+                    self._fallback_used_day = sod_sec()
             else:
                 self._last_open_h1 = now
-            self._log(f"Open {sig.type} {sig.tf} @ {entry:.2f} qty={qty:.6f} R=${stopd:.2f} score={sig.score}", set_status=False)
+            self._log(
+                f"Open {sig.type} {sig.tf} @ {entry:.2f} qty={qty:.6f} R=${stopd:.2f} score={sig.score} "
+                f"(spread={self._last_spread_bps or 0:.2f}bps slip_est=${slip_est:.2f} top3=${top3_notional:,.0f})",
+                set_status=False
+            )
 
     # --------------- management ----------------
 
@@ -566,6 +635,7 @@ class BotEngine:
             net = self.broker.close(p.take if hit_take else self.price)
             r_mult = (net / max(1e-9, base_R_usd)) if net is not None else 0.0
             self._last_Rs.append(r_mult); self._last_Rs = self._last_Rs[-20:]
+            self._last_trade_ts = now
             self._log(f"Close {'TAKE' if hit_take else 'STOP'} {p.tf} PnL {net:+.2f} ({r_mult:+.2f}R)", set_status=False)
 
             if net is not None and net > 0:
