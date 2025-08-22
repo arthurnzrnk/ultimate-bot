@@ -1,11 +1,8 @@
-"""API entry point for the Ultimate Bot backend."""
+"""API entry point (Strategy V3 Dynamic)."""
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Body, Query
-from fastapi.middleware.cors import CORSMiddleware
-import httpx
-import math
-import time
+import httpx, math, time
 
 from .config import settings
 from .engine import BotEngine
@@ -13,26 +10,23 @@ from .models import Status
 
 engine = BotEngine()
 
+
 def _http2_available() -> bool:
-    """
-    Return True only if the 'h2' package is present so httpx can enable HTTP/2.
-    Avoids ImportError on startup when h2 isn't installed.
-    """
     try:
-        import h2  # noqa: F401
+        import h2  # noqa
         return True
     except Exception:
         return False
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # If 'h2' isn't installed, we fall back to HTTP/1.1 automatically.
     client = httpx.AsyncClient(
         http2=_http2_available(),
         follow_redirects=True,
         timeout=httpx.Timeout(connect=3.0, read=2.5, write=2.5, pool=3.0),
         limits=httpx.Limits(max_keepalive_connections=100, max_connections=100),
-        headers={"User-Agent": "UltimateBot/1.3"},
+        headers={"User-Agent": "UltimateBot/3.0"},
     )
     await engine.start(client)
     try:
@@ -43,21 +37,15 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass
 
-app = FastAPI(title="Ultimate Bot API", lifespan=lifespan)
 
-if settings.cors_origins:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=settings.cors_origins,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+app = FastAPI(title="Ultimate Bot API — V3", lifespan=lifespan)
+
 
 def _fmt(n: float | None, d: int = 2):
     if n is None or (isinstance(n, float) and (math.isnan(n) or math.isinf(n))):
         return None
     return round(n, d)
+
 
 @app.get("/status", response_model=Status)
 def get_status() -> Status:
@@ -67,17 +55,33 @@ def get_status() -> Status:
     pnl_today = sum([t.pnl for t in engine.broker.history if (t.close_time or t.open_time) >= sod])
     fills_today = sum(1 for t in engine.broker.history if (t.close_time or t.open_time) >= sod) + (1 if pos else 0)
 
+    # router telemetry
     reg = engine.router.last_regime
     bias = engine.router.last_bias
     adx = engine.router.last_adx
     atr = engine.router.last_atr_pct
     active = engine.router.last_strategy
 
-    atr_band_min = engine.profile.get("ATR_PCT_MIN")
-    atr_band_max = engine.profile.get("ATR_PCT_MAX")
+    # indicators for Conditions
+    iC_m1 = len(engine.m1) - 2 if len(engine.m1) >= 2 else None
+    iC_h1 = len(engine.h1) - 2 if len(engine.h1) >= 2 else None
 
-    # sizing telemetry snapshot
-    st = engine._last_sizing or {}
+    macd_m1_state = "flat"
+    macd_h1_state = "flat"
+    if engine._macd_m1[0] and iC_m1 is not None and iC_m1 < len(engine._macd_m1[0]):
+        l, s = engine._macd_m1
+        prev = (l[iC_m1 - 1] or 0.0) - (s[iC_m1 - 1] or 0.0)
+        cur = (l[iC_m1] or 0.0) - (s[iC_m1] or 0.0)
+        macd_m1_state = "cross" if (prev <= 0 < cur or prev >= 0 > cur) else ("up" if cur > 0 else "down" if cur < 0 else "flat")
+    if engine._macd_h1[0] and iC_h1 is not None and iC_h1 < len(engine._macd_h1[0]):
+        l, s = engine._macd_h1
+        prev = (l[iC_h1 - 1] or 0.0) - (s[iC_h1 - 1] or 0.0)
+        cur = (l[iC_h1] or 0.0) - (s[iC_h1] or 0.0)
+        macd_h1_state = "cross" if (prev <= 0 < cur or prev >= 0 > cur) else ("up" if cur > 0 else "down" if cur < 0 else "flat")
+
+    rsi_m1 = engine._rsi_m1[iC_m1] if (engine._rsi_m1 and iC_m1 is not None and iC_m1 < len(engine._rsi_m1)) else None
+    rsi_h1 = engine._rsi_h1[iC_h1] if (engine._rsi_h1 and iC_h1 is not None and iC_h1 < len(engine._rsi_h1)) else None
+
     return Status(
         price=_fmt(engine.price, 2),
         bid=_fmt(engine.bid, 2),
@@ -87,77 +91,57 @@ def get_status() -> Status:
         pos=pos,
         history=engine.broker.history[-100:],
         candles=[c for c in engine.m1[-150:]],
-        scalpMode=engine.settings.get("scalp_mode", True),
-        autoTrade=engine.settings.get("auto_trade", True),
-        strategy=engine.settings.get("strategy", "Adaptive Router"),
+
+        strategy="Strategy V3 — Dynamic",
         activeStrategy=active,
+
         regime=reg,
         bias=bias,
         adx=_fmt(adx, 0),
         atrPct=_fmt(atr, 4),
+        rsiM1=_fmt(rsi_m1, 1),
+        rsiH1=_fmt(rsi_h1, 1),
+        macdM1=macd_m1_state,
+        macdH1=macd_h1_state,
+
         fillsToday=fills_today,
         pnlToday=_fmt(pnl_today, 2) or 0.0,
         unrealNet=_fmt(unreal, 2) or 0.0,
-        profileMode=engine.settings.get("profile_mode", "AUTO"),
-        profileModeActive=engine.profile_active,
-        atrBandMin=_fmt(atr_band_min, 4),
-        atrBandMax=_fmt(atr_band_max, 4),
 
-        # NEW: sizing telemetry
-        sizingMode=str(st.get("sizing_mode")) if st else None,
-        allocNotionalUsd=_fmt(st.get("alloc_notional_usd"), 2) if st else None,
-        qtyRequested=_fmt(st.get("qty_requested"), 6) if st else None,
-        qtyFinal=_fmt(st.get("qty_final"), 6) if st else None,
-        impliedLossUsd=_fmt(st.get("implied_loss_usd"), 2) if st else None,
-        impliedRiskPct=_fmt(st.get("implied_risk_pct"), 4) if st else None,
-        remainingDailyLossCap=_fmt(st.get("remaining_daily_loss_cap"), 2) if st else None,
-        levUsed=_fmt(st.get("lev_used"), 2) if st else None,
-        lastRejectReason=str(st.get("reason_if_reject")) if st else None,
+        vs=_fmt(engine.VS, 2),
+        ps=_fmt(engine.PS, 2),
+        lossStreak=_fmt(engine._loss_streak, 1) or 0.0,
+        spreadBps=_fmt(engine._last_spread_bps, 2),
+        feeToTp=_fmt(engine._last_fee_to_tp, 3),
+        top3DepthNotional=None,
     )
+
 
 @app.get("/logs")
 def get_logs(limit: int = Query(200, ge=1, le=500)) -> dict:
     return {"ok": True, "logs": engine.logs[-limit:]}
 
+
 @app.post("/settings")
 def update_settings(payload: dict = Body(...)) -> dict:
-    if "profileMode" in payload:
-        v = str(payload["profileMode"]).upper()
-        if v not in ("AUTO", "LIGHT", "HEAVY"):
-            v = "AUTO"
-        engine.settings["profile_mode"] = v
     if "macroPause" in payload:
-        engine.settings["macro_pause"] = bool(payload["macroPause"])
-    if "scalpMode" in payload:
-        engine.settings["scalp_mode"] = bool(payload["scalpMode"])
+        on = bool(payload["macroPause"])
+        engine.settings["macro_pause"] = on
+        if on:
+            engine._macro_until = int(time.time()) + 1800
     if "autoTrade" in payload:
         on = bool(payload["autoTrade"])
         engine.settings["auto_trade"] = on
-        engine.status_text = "Waiting for the next trade" if on else "Off"
-    if "strategy" in payload:
-        engine.settings["strategy"] = str(payload["strategy"])
-
-    # NEW: sizing
-    if "sizingMode" in payload:
-        sm = str(payload["sizingMode"]).upper()
-        if sm not in ("RISK_PCT", "NOTIONAL_FIXED", "HYBRID"):
-            sm = "NOTIONAL_FIXED"
-        engine.settings["sizing_mode"] = sm
-    if "allocNotionalUsd" in payload:
-        try:
-            engine.settings["alloc_notional_usd"] = float(payload["allocNotionalUsd"])
-        except Exception:
-            pass
-    if "strictNotional" in payload:
-        engine.settings["strict_notional"] = bool(payload["strictNotional"])
-
+        engine.status_text = "Waiting setup" if on else "Off"
     return {"ok": True, "settings": engine.settings}
+
 
 @app.post("/start")
 def start_bot() -> dict:
     engine.settings["auto_trade"] = True
-    engine.status_text = "Waiting for the next trade"
+    engine.status_text = "Waiting setup"
     return {"ok": True}
+
 
 @app.post("/stop")
 def stop_bot() -> dict:
@@ -165,61 +149,7 @@ def stop_bot() -> dict:
     engine.status_text = "Off"
     return {"ok": True}
 
-@app.post("/apikeys")
-def save_api_keys(payload: dict = Body(...)) -> dict:
-    return {"ok": True}
 
 @app.get("/health")
 def health() -> dict:
     return {"ok": True, "status": engine.status_text}
-
-# ---------------- DEBUG HELPERS ----------------
-
-@app.post("/debug/open_test")
-def open_test(payload: dict = Body({"side": "BUY", "tf": "m1", "risk_usd": 5.0})):
-    side = str(payload.get("side", "BUY")).upper()
-    tf = "h1" if str(payload.get("tf", "m1")).lower() == "h1" else "m1"
-    risk_usd = float(payload.get("risk_usd", 5.0))
-    if engine.price is None:
-        return {"ok": False, "error": "No price yet."}
-    entry = engine.price
-    stopd = entry * 0.002
-    taked = entry * 0.002
-    qty = max(0.0001, risk_usd / max(1.0, stopd))
-    stop = entry - stopd if side == "BUY" else entry + stopd
-    take = entry + taked if side == "BUY" else entry - taked
-
-    if engine.broker.pos:
-        ps = engine.broker.pos.side
-        if (side == "BUY" and ps == "short") or (side == "SELL" and ps == "long"):
-            engine.broker.close(entry)
-
-    if not engine.broker.pos:
-        engine.broker.open(
-            side, entry, qty, stop, take, stopd, maker=True,
-            tf=tf, profile=engine.profile_active, scratch_after_sec=300, opened_by="DEBUG",
-        )
-        engine.logs.append({"ts": int(time.time()), "text": f"DEBUG: Opened test {side} @ {entry:.2f} qty={qty:.6f}"})
-    return {"ok": True, "pos": engine.broker.pos}
-
-@app.post("/debug/flat")
-def debug_flat() -> dict:
-    p = engine.broker.pos
-    if not p:
-        return {"ok": True, "msg": "No open position"}
-    px = engine.price or p.entry
-    net = engine.broker.close(px)
-    engine.logs.append({"ts": int(time.time()), "text": f"DEBUG: Flat @ {px:.2f} PnL {net:+.2f}"})
-    return {"ok": True, "pnl": _fmt(net, 2)}
-
-@app.post("/debug/partial")
-def debug_partial(payload: dict = Body({"fraction": 0.5})):
-    p = engine.broker.pos
-    if not p:
-        return {"ok": False, "error": "No open position"}
-    frac = float(payload.get("fraction", 0.5))
-    frac = max(0.01, min(0.99, frac))
-    px = engine.price or p.entry
-    net = engine.broker.partial_close(frac, px)
-    engine.logs.append({"ts": int(time.time()), "text": f"DEBUG: Partial {frac*100:.0f}% @ {px:.2f} PnL { (net or 0.0):+.2f}"})
-    return {"ok": True, "pnl": _fmt(net or 0.0, 2), "fraction": frac}
