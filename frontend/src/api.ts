@@ -1,17 +1,19 @@
 const API_BASE = 'http://localhost:8000'
 
-export async function getStatus() {
-  const r = await fetch(`${API_BASE}/status`, {
+export async function getStatus(signal?: AbortSignal) {
+  const r = await fetch(`${API_BASE}/status?t=${Date.now()}`, {
     cache: 'no-store',
     headers: { 'Cache-Control': 'no-store' },
+    signal,
   })
   return r.json()
 }
 
-export async function getLogs(limit: number = 200) {
-  const r = await fetch(`${API_BASE}/logs?limit=${limit}`, {
+export async function getLogs(limit: number = 200, signal?: AbortSignal) {
+  const r = await fetch(`${API_BASE}/logs?limit=${limit}&t=${Date.now()}`, {
     cache: 'no-store',
     headers: { 'Cache-Control': 'no-store' },
+    signal,
   })
   return r.json()
 }
