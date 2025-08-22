@@ -30,6 +30,34 @@ def _macd_state(line, sig, i) -> str:
     return "flat"
 
 
+def _opp_wick_ge_body(c: dict, side: str) -> bool:
+    """Opposing wick at least the body length (used by H1 MR capitulation extension)."""
+    body = abs(c["close"] - c["open"])
+    if body <= 0:
+        return False
+    # opposing wick: for long fades we want a long LOWER wick; for short fades, a long UPPER wick
+    lower = min(c["open"], c["close"]) - c["low"]
+    upper = c["high"] - max(c["open"], c["close"])
+    return (lower >= body) if side == "long" else (upper >= body)
+
+
+def _macd_cross_recent(line, sig, i: int, side: str, lookback: int = 3) -> bool:
+    """True if MACD crossed in the trade direction within last <= lookback bars."""
+    if i is None or i <= 1:
+        return False
+    for k in range(1, lookback + 1):
+        j = i - k
+        if j <= 0:
+            break
+        prev = (line[j - 1] or 0.0) - (sig[j - 1] or 0.0)
+        cur = (line[j] or 0.0) - (sig[j] or 0.0)
+        if side == "long" and (prev <= 0 < cur):
+            return True
+        if side == "short" and (prev >= 0 > cur):
+            return True
+    return False
+
+
 # ---------------- m1 scalper ----------------
 
 class M1Scalp(Strategy):
@@ -99,16 +127,14 @@ class M1Scalp(Strategy):
             return _is_red(b) and (a["close"] > a["open"]) and (b["close"] < a["open"]) and (b["open"] > a["close"])
         def hammer(b):
             rng = _range(b); body = _body(b)
-            lower = min(b["open"], b["close"])
-            lo_w = lower - b["low"]
+            lower = min(b["open"], b["close"]) - b["low"]
             close_pos = (b["close"] - b["low"]) / max(1e-8, rng)
-            return lo_w >= body and close_pos >= 0.75
+            return lower >= body and close_pos >= 0.75
         def shooting_star(b):
             rng = _range(b); body = _body(b)
-            upper = max(b["open"], b["close"])
-            hi_w = b["high"] - upper
+            upper = b["high"] - max(b["open"], b["close"])
             close_pos = (b["close"] - b["low"]) / max(1e-8, rng)
-            return hi_w >= body and close_pos <= 0.25
+            return upper >= body and close_pos <= 0.25
 
         long_pat = bull_engulf(prev, cur) or hammer(cur)
         short_pat = bear_engulf(prev, cur) or shooting_star(cur)
@@ -123,41 +149,33 @@ class M1Scalp(Strategy):
 
         # Overshoot + reclaim
         vprev = ctx["vwap"][i - 1]
-        long_ok_bias = ema_bias_up or allow_ct
-        short_ok_bias = ema_bias_dn or allow_ct
+        long_ok_bias = (ema_bias_up or allow_ct)
+        short_ok_bias = (ema_bias_dn or allow_ct)
 
         over_long = bool(vprev and (m1[i - 1]["low"] <= (vprev * (1 - 1.00 * band_pct))))
-        reclaim_long = bool(cur["close"] >= (ctx["vwap"][i] * (1 - 0.65 * band_pct)) and _is_green(cur))
+        reclaim_long = bool(cur["close"] >= (ctx["vwap"][i] * (1 - 0.65 * band_pct)) and (cur["close"] >= cur["open"]))
         over_short = bool(vprev and (m1[i - 1]["high"] >= (vprev * (1 + 1.00 * band_pct))))
-        reclaim_short = bool(cur["close"] <= (ctx["vwap"][i] * (1 + 0.65 * band_pct)) and _is_red(cur))
+        reclaim_short = bool(cur["close"] <= (ctx["vwap"][i] * (1 + 0.65 * band_pct)) and (cur["close"] <= cur["open"]))
 
-        # Soft scoring
+        # MACD recency check for scoring
         closes_m1 = [c["close"] for c in m1]
         macd_l, macd_s = macd_line_signal(closes_m1, 12, 26, 9)
-        macd_st = _macd_state(macd_l, macd_s, i)
-        macd_align_long = macd_st in ("up", "cross")
-        macd_align_short = macd_st in ("down", "cross")
+        macd_long_recent = _macd_cross_recent(macd_l, macd_s, i, "long", 3)
+        macd_short_recent = _macd_cross_recent(macd_l, macd_s, i, "short", 3)
 
+        # Soft scoring
         score_base = 4.0
         score_long = score_base
         score_short = score_base
-        # rsi extreme
         if rsi_now is not None:
-            if rsi_now < 30.0:
-                score_long += 0.5
-            if rsi_now > 70.0:
-                score_short += 0.5
-        # macd align
-        if macd_align_long:
-            score_long += 0.5
-        if macd_align_short:
-            score_short += 0.5
+            if rsi_now < 30.0: score_long += 0.5
+            if rsi_now > 70.0: score_short += 0.5
+        if macd_long_recent: score_long += 0.5
+        if macd_short_recent: score_short += 0.5
         # (cum delta optional) + h1 rsi extreme
         rsi_h1 = rsi([c["close"] for c in h1], 14); rsi_h1_now = rsi_h1[j] if j is not None else None
-        if rsi_h1_now is not None and rsi_h1_now < 30.0:
-            score_long += 0.5
-        if rsi_h1_now is not None and rsi_h1_now > 70.0:
-            score_short += 0.5
+        if rsi_h1_now is not None and rsi_h1_now < 30.0: score_long += 0.5
+        if rsi_h1_now is not None and rsi_h1_now > 70.0: score_short += 0.5
 
         PS = float(ctx["PS"])
         loss_streak = float(ctx["loss_streak"])
@@ -174,7 +192,7 @@ class M1Scalp(Strategy):
             return Signal(type="SELL", reason="m1 reclaim short", stop_dist=dist, take_dist=dist, score=score_short, tf="m1")
 
         return Signal(type="WAIT", reason="Inside bands")
-        
+
 
 # ---------------- h1 mean reversion ----------------
 
@@ -203,22 +221,28 @@ class H1MeanReversion(Strategy):
         k_entry = 0.75; k_stop = 0.85; k_take = 0.95
         if (ax[i] or 0.0) < 14.0:
             k_entry = 0.85  # deeper entry in dead-range
-        # Capitulation extension (bigger take)
+
+        # Capitulation extension (bigger take only on true capitulation)
         rsi_h1 = rsi([c["close"] for c in h1], 14); rsi_now = rsi_h1[i] or 50.0
         vol_win = [c.get("volume", 0.0) for c in h1[max(0, i - 20):i]]
         vmed = median(vol_win) if vol_win else 0.0
-        capit = (
-            (ax[i] or 0.0) < 14.0
-            and (rsi_now < 30.0 or rsi_now > 70.0)
-            and (h1[i].get("volume", 0.0) >= 2.0 * vmed if vmed > 0 else True)
-        )
-        if capit:
-            k_take = 1.2 if VS <= 1.2 else 1.1
+        capit_base = ((ax[i] or 0.0) < 14.0) and (h1[i].get("volume", 0.0) >= 2.0 * vmed if vmed > 0 else True)
 
         dist = px - mid
+        side: Optional[str] = None
         if dist <= -(k_entry * atr_abs):
+            side = "long"
+        elif dist >= +(k_entry * atr_abs):
+            side = "short"
+
+        if side == "long" and (rsi_now < 30.0) and capit_base and _opp_wick_ge_body(h1[i], "long"):
+            k_take = 1.2 if VS <= 1.2 else 1.1
+        if side == "short" and (rsi_now > 70.0) and capit_base and _opp_wick_ge_body(h1[i], "short"):
+            k_take = 1.2 if VS <= 1.2 else 1.1
+
+        if side == "long":
             return Signal(type="BUY", reason="H1 mean‑revert up", stop_dist=k_stop * atr_abs, take_dist=k_take * atr_abs, score=3.5, tf="h1")
-        if dist >= +(k_entry * atr_abs):
+        if side == "short":
             return Signal(type="SELL", reason="H1 mean‑revert down", stop_dist=k_stop * atr_abs, take_dist=k_take * atr_abs, score=3.5, tf="h1")
 
         return Signal(type="WAIT", reason="Near mean")
@@ -338,8 +362,9 @@ class RouterV3(Strategy):
     def evaluate(self, ctx: dict) -> Signal:
         m1 = ctx["m1"]; h1 = ctx["h1"]
         iC_m1 = ctx.get("iC_m1"); iC_h1 = ctx.get("iC_h1")
+        prefer = ctx.get("preferTF", "m1")  # "m1" or "h1"
 
-        # regime by ADX (hysteresis: Trend ≥25, exit ≤21; Breakout ≤23 with DC break; else Range)
+        # regime by ADX (hysteresis: Trend ≥25, exit ≤21; Breakout ≤23 with DC break and ATR% in band; else Range)
         ax_h1 = adx(h1, 14)
         adx_last = (ax_h1[iC_h1] or 0.0) if iC_h1 is not None else 0.0
         self.last_adx = adx_last
@@ -366,39 +391,46 @@ class RouterV3(Strategy):
             bk_up = (hi_prev is not None) and (px > hi_prev)
             bk_dn = (lo_prev is not None) and (px < lo_prev)
 
+        # Proposed regime
         if adx_last >= 25.0:
-            regime = "Trend"
+            regime_prop = "Trend"
         elif (adx_last <= 23.0) and (bk_up or bk_dn) and (atr_pct is None or (0.0005 <= atr_pct <= 0.0175)):
-            regime = "Breakout"
+            regime_prop = "Breakout"
         else:
-            regime = "Range"
+            regime_prop = "Range"
+
+        # Hysteresis: stay in Trend until ADX <= 21
+        regime = regime_prop
+        if self.last_regime == "Trend" and regime_prop != "Trend" and adx_last > 21.0:
+            regime = "Trend"
+
         self.last_regime = regime
 
-        # Priority: Trend → Breakout → Range
-        sig: Signal = Signal(type="WAIT", reason="—")
+        # Priority: Trend → Breakout → Range (Range order depends on VS preference)
         if regime == "Trend":
             sig = self.h1_tr.evaluate(ctx)
             self.last_strategy = self.h1_tr.name if sig.type != "WAIT" else None
-            if sig.type != "WAIT":
-                return sig
+            return sig
 
         if regime == "Breakout":
             sig = self.h1_bo.evaluate(ctx)
             self.last_strategy = self.h1_bo.name if sig.type != "WAIT" else None
-            if sig.type != "WAIT":
-                return sig
-
-        # Range: try m1 scalp; if not, h1 mean‑reversion when ADX <= 17×VS
-        sig = self.m1.evaluate(ctx)
-        self.last_strategy = self.m1.name if sig.type != "WAIT" else None
-        if sig.type != "WAIT":
             return sig
 
-        # fall back to H1 MR if quiet enough
-        VS = float(ctx["VS"])
-        if adx_last <= 17.0 * VS:
+        # Range: try preferTF first; if not, the other. H1 MR still constrained by ADX <= 17×VS (inside strategy)
+        if prefer == "h1":
+            sig = self.h1_mr.evaluate(ctx)
+            if sig.type != "WAIT":
+                self.last_strategy = self.h1_mr.name
+                return sig
+            sig2 = self.m1.evaluate(ctx)
+            self.last_strategy = self.m1.name if sig2.type != "WAIT" else None
+            return sig2
+        else:
+            sig = self.m1.evaluate(ctx)
+            if sig.type != "WAIT":
+                self.last_strategy = self.m1.name
+                return sig
             sig2 = self.h1_mr.evaluate(ctx)
             self.last_strategy = self.h1_mr.name if sig2.type != "WAIT" else None
             return sig2
-
-        return Signal(type="WAIT", reason="No setup")
