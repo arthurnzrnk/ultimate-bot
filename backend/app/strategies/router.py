@@ -123,21 +123,20 @@ class M1Scalp(Strategy):
 
         # Overshoot + reclaim
         vprev = ctx["vwap"][i - 1]
-        px_prev = prev["close"]
         long_ok_bias = ema_bias_up or allow_ct
         short_ok_bias = ema_bias_dn or allow_ct
 
-        over_long = bool(prev["low"] <= (vprev * (1 - 1.00 * band_pct))) if vprev else False
+        over_long = bool(vprev and (m1[i - 1]["low"] <= (vprev * (1 - 1.00 * band_pct))))
         reclaim_long = bool(cur["close"] >= (ctx["vwap"][i] * (1 - 0.65 * band_pct)) and _is_green(cur))
-        over_short = bool(prev["high"] >= (vprev * (1 + 1.00 * band_pct))) if vprev else False
+        over_short = bool(vprev and (m1[i - 1]["high"] >= (vprev * (1 + 1.00 * band_pct))))
         reclaim_short = bool(cur["close"] <= (ctx["vwap"][i] * (1 + 0.65 * band_pct)) and _is_red(cur))
 
         # Soft scoring
         closes_m1 = [c["close"] for c in m1]
         macd_l, macd_s = macd_line_signal(closes_m1, 12, 26, 9)
-        macd_state = _macd_state(macd_l, macd_s, i)
-        macd_align_long = macd_state in ("up", "cross")
-        macd_align_short = macd_state in ("down", "cross")
+        macd_st = _macd_state(macd_l, macd_s, i)
+        macd_align_long = macd_st in ("up", "cross")
+        macd_align_short = macd_st in ("down", "cross")
 
         score_base = 4.0
         score_long = score_base
@@ -234,7 +233,7 @@ class H1Breakout(Strategy):
         h1 = ctx["h1"]; i = ctx["iC_h1"]
         if i is None or i < max(220, ctx.get("min_h1_bars", 220)):
             return Signal(type="WAIT", reason="Warmup")
-        a14 = atr(h1, 14); ax = adx(h1, 14)
+        a14 = atr(h1, 14)
         dc = donchian(h1, 20)
         px = h1[i]["close"]
         # squeeze→expansion similar to V1; volume threshold scales with VS
@@ -256,11 +255,22 @@ class H1Breakout(Strategy):
         vol_ok = (h1[i].get("volume", 0.0) >= mult * v_med) if v_med > 0 else True
 
         hi_prev = dc["hi"][i - 1]; lo_prev = dc["lo"][i - 1]
-        up = (px > hi_prev) if hi_prev is not None else False
-        dn = (px < lo_prev) if lo_prev is not None else False
+        up = (hi_prev is not None) and (px > hi_prev)
+        dn = (lo_prev is not None) and (px < lo_prev)
 
         if not (squeeze and expand and vol_ok):
             return Signal(type="WAIT", reason="No breakout")
+
+        # MACD cross in direction on the breakout bar (spec requirement)
+        macd_l, macd_s = macd_line_signal([c["close"] for c in h1], 12, 26, 9)
+        prev = (macd_l[i - 1] or 0.0) - (macd_s[i - 1] or 0.0)
+        cur = (macd_l[i] or 0.0) - (macd_s[i] or 0.0)
+        cross_up = prev <= 0 < cur
+        cross_dn = prev >= 0 > cur
+        if up and not cross_up:
+            return Signal(type="WAIT", reason="No MACD confirm")
+        if dn and not cross_dn:
+            return Signal(type="WAIT", reason="No MACD confirm")
 
         if up:
             return Signal(type="BUY", reason="H1 breakout up", stop_dist=1.2 * (a14[i] or 0.0), take_dist=1.1 * (a14[i] or 0.0), score=5.0, tf="h1")
@@ -286,7 +296,7 @@ class H1Trend(Strategy):
         ax = adx(h1, 14)
         dc = donchian(h1, 20)
 
-        VS = float(ctx["VS"]); PS = float(ctx["PS"])
+        PS = float(ctx["PS"])
         thr = 25.0 * (1.0 - 0.20 * (1.0 - PS))   # higher PS → easier engage
         if (ax[i] or 0.0) < thr:
             return Signal(type="WAIT", reason="Trend weak")
@@ -349,7 +359,7 @@ class RouterV3(Strategy):
         # breakout presence
         dc = donchian(h1, 20)
         bk_up = bk_dn = False
-        if iC_h1 and iC_h1 > 0:
+        if iC_h1 is not None and iC_h1 > 0:
             px = h1[iC_h1]["close"]
             hi_prev = dc["hi"][iC_h1 - 1]
             lo_prev = dc["lo"][iC_h1 - 1]
