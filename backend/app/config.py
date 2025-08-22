@@ -37,5 +37,8 @@ class Settings(BaseModel):
     smtp_user: str | None = os.getenv("EMAIL_SMTP_USER") or None
     smtp_pass: str | None = os.getenv("EMAIL_SMTP_PASS") or None
 
+    # Synthetic top-3 depth notional (USD) used for slippage/depth gating until real depth is wired.
+    synthetic_top3_notional: float = float(os.getenv("SYN_TOP3_NOTIONAL", "75000"))
+
 
 settings = Settings()
