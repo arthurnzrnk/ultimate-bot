@@ -1,4 +1,12 @@
-"""Core trading engine for the Ultimate Bot — Strategy V2 (profile-aware)."""
+"""Core trading engine for the Ultimate Bot — Strategy V2 (profile-aware).
+
+Edits in this version:
+- Removed daily P&L guardrail (no ±$500 cap); entries are no longer blocked/downsized by a daily cap.
+- Default notional sizing uses 100% of current paper equity (dynamic), not just the initial START_EQUITY.
+- Removed HEAVY strict implied-risk rejection so full notional can be used even in HEAVY.
+- Startup checklist text updated (removed daily-cap mention).
+- Status text no longer shows "Day guardrail on" for P&L; fill-cap message remains.
+"""
 
 from __future__ import annotations
 
@@ -109,10 +117,11 @@ class BotEngine:
             "macro_pause": False,
             "profile_mode": "AUTO",
 
-            # NEW: sizing controls
+            # Sizing controls
             "sizing_mode": "NOTIONAL_FIXED",   # RISK_PCT | NOTIONAL_FIXED | HYBRID
-            "alloc_notional_usd": settings.start_equity,  # UI: “Trade with this amount”
-            "strict_notional": True,           # if True, never downscale — reject instead
+            # None ⇒ use 100% of current equity dynamically
+            "alloc_notional_usd": None,
+            "strict_notional": True,           # if True, never downscale — reject instead (HEAVY strict cap removed)
         }
 
         self.profile_active: str = "LIGHT"
@@ -240,8 +249,8 @@ class BotEngine:
             f"Engine initialized. Seeded m1={len(self.m1)} bars, h1={len(self.h1)} bars. "
             f"(source: {source})"
         )
-        # Debug checklist (for "no trades"):
-        self._log("DEBUG CHECKLIST: m5 ADX for m1; macro_pause OFF; ATR% units; VWAP slope caps; sane spread; vol window=20 median; one signal per closed bar; AUTO HEAVY 60s-persist; daily cap reset at UTC.", set_status=False)
+        # Debug checklist
+        self._log("DEBUG CHECKLIST: m5 ADX for m1; macro_pause OFF; ATR% units; VWAP slope caps; sane spread; vol window=20 median; one signal per closed bar; AUTO HEAVY 60s-persist.", set_status=False)
         asyncio.create_task(self._run())
 
     def _push_trade_to_m1(self, price: float, iso: str) -> None:
@@ -340,10 +349,9 @@ class BotEngine:
         if self.settings.get("macro_pause"):
             return "Macro pause"
 
-        pnl = self._day_pnl()
         fills = self._fills_today()
-        if pnl <= -500 or pnl >= 500 or (tf == "m1" and fills >= 60):
-            return "Day guardrail on"
+        if tf == "m1" and fills >= 60:
+            return "Fill cap reached"
 
         if tf == "m1":
             if len(self.m1) < 5:
@@ -594,13 +602,7 @@ class BotEngine:
             self.status_text = f"Pausing {_mmss(self._cool_until - now)} to avoid chop"
             return
 
-        pnl = self._day_pnl()
         fills = self._fills_today()
-
-        pnl_ok = (-500 < pnl < 500)
-        if not pnl_ok:
-            self.status_text = "Day guardrail on"
-            return
 
         scalp = bool(self.settings.get("scalp_mode"))
         src = self.m1 if scalp else self.h1
@@ -622,7 +624,8 @@ class BotEngine:
         cooldown_ok_ctx = (now - last_open) > (60 if scalp else 3600)
 
         context = {
-            "daily_ok": (pnl_ok and (fills < 60 if scalp else True)),
+            # Keep this key for strategy compatibility; now it means "fills-ok" only
+            "daily_ok": (fills < 60 if scalp else True),
             "cooldown_ok": cooldown_ok_ctx,
             "fills": fills,
             "max_fills": 60,
@@ -721,12 +724,12 @@ class BotEngine:
                 # log and ignore the signal (do not open)
                 self._emit_sizing_log({
                     "sizing_mode": self.settings.get("sizing_mode"),
-                    "alloc_notional_usd": float(self.settings.get("alloc_notional_usd", 0.0)),
+                    "alloc_notional_usd": float(0.0),
                     "qty_requested": 0.0,
                     "qty_final": 0.0,
                     "implied_loss_usd": 0.0,
                     "implied_risk_pct": 0.0,
-                    "remaining_daily_loss_cap": max(0.0, 500 - max(0.0, -self._day_pnl())),
+                    "remaining_daily_loss_cap": float("inf"),
                     "lev_used": 0.0,
                     "reason_if_reject": "Fees>limitR",
                 })
@@ -737,7 +740,11 @@ class BotEngine:
             # --- SIZING v3: Notional‑first with caps (RISK_PCT | NOTIONAL_FIXED | HYBRID) ---
             equity = max(1e-9, float(self.broker.equity))
             sizing_mode = str(self.settings.get("sizing_mode", "NOTIONAL_FIXED")).upper()
-            alloc_notional = float(self.settings.get("alloc_notional_usd", equity))
+
+            # Use 100% of current equity by default when not provided
+            alloc_cfg = self.settings.get("alloc_notional_usd", None)
+            alloc_notional = equity if (alloc_cfg is None) else float(alloc_cfg)
+
             strict_notional = bool(self.settings.get("strict_notional", True))
             lev_cap = float(self._BASE["LEV_CAP_H1" if is_h1 else "LEV_CAP_SCALP"])
 
@@ -752,23 +759,14 @@ class BotEngine:
             qty_cap = min(qty_requested, (equity * lev_cap) / max(1.0, entry))
             qty_final = max(0.0, min(qty_requested, qty_cap))
 
-            # Step C2 — pre‑trade risk sanity vs daily cap
+            # Step C2 — pre‑trade risk sanity vs (removed) daily cap
             implied_loss_usd = qty_final * stopd
-            remaining_daily_loss_cap = max(0.0, 500 - max(0.0, -self._day_pnl()))
-            reject_reason: str | None = None
-            if implied_loss_usd > remaining_daily_loss_cap:
-                if strict_notional:
-                    reject_reason = "pre-trade risk > daily cap"
-                else:
-                    # downscale to fit daily cap (HYBRID behavior)
-                    qty_final = max(0.0, remaining_daily_loss_cap / max(1e-9, stopd))
-                    qty_final = min(qty_final, qty_cap)
-                    # tiny threshold: notional < $5 ⇒ reject (no meaningful size)
-                    if entry * qty_final < 5.0:
-                        reject_reason = "downsized < $5 notional"
-
-            # Step C3 — profile-aware implied risk cap (only when not strict)
             implied_risk_pct = (qty_final * stopd) / equity if equity > 0 else 0.0
+            remaining_daily_loss_cap = float("inf")  # no daily cap
+
+            reject_reason: str | None = None  # don't reject on daily cap anymore
+
+            # Step C3 — profile-aware implied risk cap (only when not strict) — unchanged
             if reject_reason is None and not strict_notional:
                 if is_h1:
                     cap_for_profile = 0.005 if self.profile_active == "HEAVY" else 0.008
@@ -782,11 +780,7 @@ class BotEngine:
                         reject_reason = "downsized < $5 notional"
                     implied_risk_pct = (qty_final * stopd) / equity if equity > 0 else 0.0
 
-            # Extra: when in HEAVY + strict_notional, auto‑REJECT if implied risk exceeds HEAVY caps
-            if reject_reason is None and self.profile_active == "HEAVY" and strict_notional:
-                heavy_cap = (0.005 if is_h1 else 0.010)
-                if implied_risk_pct > heavy_cap:
-                    reject_reason = "HEAVY cap exceeded (strict)"
+            # NOTE: removed HEAVY strict implied-risk rejection so full notional can be used when strict_notional=True
 
             lev_used = (qty_final * entry) / equity if equity > 0 else 0.0
 
