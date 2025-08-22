@@ -8,6 +8,8 @@ Highlights:
 - Slippage/depth gating using synthetic top-3 notional until real depth is wired.
 - Fallback loosening once/day when H1 is dead but tradeable.
 - Short, human STATUS messages (2–4 words).
+- NEW: UTC day rollover so day PnL / giveback / losses reset at midnight.
+- NEW: True VS-based scheduling (m1 first when VS≥1, else h1 first) honored by the router.
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ from .config import settings
 from .datafeed import seed_klines, poll_tick
 from .broker import PaperBroker, FEE_MAKER
 from .models import Position, Trade
-from .strategies.base import Signal   # FIX: was missing before
+from .strategies.base import Signal
 from .strategies.router import RouterV3
 from .ta import atr, rsi, macd_line_signal, adx
 
@@ -66,6 +68,7 @@ class BotEngine:
         self._require_macd_next_m1: bool = False
         self._risk_downscale_next: bool = False
 
+        self._day_sod: int = sod_sec()
         self._day_open_equity: float = settings.start_equity
         self._day_high_equity: float = settings.start_equity
         self._pause_until: int = 0                 # giveback / streak cooldown
@@ -163,16 +166,15 @@ class BotEngine:
         return len(self.m1) >= 5 and len(self.h1) >= 220
 
     def _day_pnl(self) -> float:
-        sod = sod_sec()
+        sod = self._day_sod
         return sum([t.pnl for t in self.broker.history if (t.close_time or t.open_time) >= sod])
 
     def _day_pnl_pct(self) -> float:
-        cur = self.broker.equity
-        run = (cur - self._day_open_equity)
-        return (_pct(run / max(1e-9, self._day_open_equity)))
+        run = (self.broker.equity - self._day_open_equity)
+        return _pct(run / max(1e-9, self._day_open_equity))
 
     def _fills_today(self) -> int:
-        sod = sod_sec()
+        sod = self._day_sod
         return sum(1 for t in self.broker.history if (t.close_time or t.open_time) >= sod) + (1 if self.broker.pos else 0)
 
     def _atr_pct_m1(self) -> Optional[float]:
@@ -255,6 +257,7 @@ class BotEngine:
         self.h1 = [c.model_dump() if hasattr(c, "model_dump") else dict(c) for c in h1_seed]
         self._rebuild_vwap()
         self._update_indicators()
+        self._day_sod = sod_sec()
         self._day_open_equity = self.broker.equity
         self._day_high_equity = self.broker.equity
         self._log(f"Engine ready. Seeded m1={len(self.m1)} h1={len(self.h1)} (src: {source})", set_status=True)
@@ -298,8 +301,21 @@ class BotEngine:
             except Exception as e:
                 self._log(f"Data error: {e}")
 
-            # VS/PS, macro/giveback
             now = int(time.time())
+
+            # UTC day rollover (reset per-day accounting & once/day flags)
+            new_sod = sod_sec()
+            if new_sod != self._day_sod:
+                self._day_sod = new_sod
+                self._day_open_equity = self.broker.equity
+                self._day_high_equity = self.broker.equity
+                self._losses_today = 0
+                self._fallback_used_day = None
+                self._require_macd_next_m1 = False
+                self._risk_downscale_next = False
+                self._log("New UTC day: counters reset", set_status=False)
+
+            # VS/PS, macro/giveback
             self._update_VS_PS(now)
 
             # Macro pause auto-off
@@ -349,12 +365,10 @@ class BotEngine:
 
     def _maybe_set_fallback(self, now: int) -> None:
         """Arm fallback loosening for next m1 entry once per UTC day when H1 is quiet but tradable."""
-        # already used today?
-        if self._fallback_used_day == sod_sec():
+        if self._fallback_used_day == self._day_sod:
             return
         # last H1 open >= 4h ago?
-        four_hours = 4 * 3600
-        if (now - self._last_open_h1) < four_hours:
+        if (now - self._last_open_h1) < 4 * 3600:
             return
         # ADX window guard: 15 <= ADX(h1) <= 22
         iH = len(self.h1) - 2 if len(self.h1) >= 2 else None
@@ -404,32 +418,37 @@ class BotEngine:
             "loss_streak": self._loss_streak,
         }
 
-        # VS-driven scheduling: m1 first if VS≥1, else h1 first
+        # VS-driven scheduling: m1 first if VS≥1, else h1 first (Router obeys preferTF)
         order = ("m1", "h1") if self.VS >= 1.0 else ("h1", "m1")
 
         sig: Optional[Signal] = None
-        for _ in order:
+        for first in order:
+            ctx["preferTF"] = first
             s = self.router.evaluate(ctx)
-            # Apply extra governance on m1 after 3 losses
+
+            # Extra governance on m1 after 3 losses: require MACD cross in last <=3 bars
             if s.tf == "m1" and self._require_macd_next_m1 and s.type in ("BUY", "SELL"):
                 closes_m1 = [c["close"] for c in self.m1]
                 mline, msignal = macd_line_signal(closes_m1, 12, 26, 9)
                 idx = iC_m1
-                recent = []
-                for k in range(0, 4):
-                    j = (idx - k) if idx is not None and idx - k >= 1 else None
-                    if j is None: break
-                    prev = (mline[j - 1] or 0.0) - (msignal[j - 1] or 0.0)
-                    cur = (mline[j] or 0.0) - (msignal[j] or 0.0)
-                    recent.append((prev, cur))
-                ok = any((p <= 0 < c) or (p >= 0 > c) for (p, c) in recent)
+                ok = False
+                if idx is not None and idx >= 2:
+                    for k in range(1, 4):
+                        j = idx - k
+                        if j <= 0: break
+                        prev = (mline[j - 1] or 0.0) - (msignal[j - 1] or 0.0)
+                        cur = (mline[j] or 0.0) - (msignal[j] or 0.0)
+                        if s.type == "BUY" and (prev <= 0 < cur): ok = True; break
+                        if s.type == "SELL" and (prev >= 0 > cur): ok = True; break
                 if not ok:
-                    s = Signal(type="WAIT", reason="Require MACD confirm")
-            # enforce cooldowns by TF
+                    # try the other TF before giving up
+                    continue
+
+            # enforce per‑TF cooldowns; if this TF is cooling, try the other one
             if s.tf == "m1" and not cooldown_ok_m1:
-                s = Signal(type="WAIT", reason="m1 cooldown")
+                continue
             if s.tf == "h1" and not cooldown_ok_h1:
-                s = Signal(type="WAIT", reason="h1 cooldown")
+                continue
 
             sig = s
             if s.type != "WAIT":
@@ -445,7 +464,7 @@ class BotEngine:
         }
 
         if sig is None or sig.type == "WAIT":
-            self._last_wait_reason = sig.reason if sig else "—"
+            self._last_wait_reason = (sig.reason if sig else "—")
             return
 
         # Sizing & risk
@@ -473,10 +492,8 @@ class BotEngine:
         if sig.tf == "m1" and self.PS >= 0.70 and 0.8 <= self.VS <= 1.4:
             eff *= 1.30
             last5 = self._last_Rs[-5:]
-            # only tier-2 uplift if: rolling E[R] ≥ 0.25R, no giveback pause triggered, spread ≤4 bps AND slip ok
             tier2_ok = (len(last5) >= 3 and (sum(last5) / len(last5)) >= 0.25 and (self._pause_until == 0 or self._pause_until < int(time.time())))
             if tier2_ok and (self._last_spread_bps or 0) <= 4.0:
-                # slip check later after we compute it
                 eff = min(eff * (50.0 / 30.0), 1.5 * base_risk)
 
         stopd = sig.stop_dist
@@ -548,7 +565,7 @@ class BotEngine:
                 self._last_open_m1 = now
                 if self._fallback_pending_m1:
                     self._fallback_pending_m1 = False
-                    self._fallback_used_day = sod_sec()
+                    self._fallback_used_day = self._day_sod
             else:
                 self._last_open_h1 = now
             self._log(
@@ -648,7 +665,7 @@ class BotEngine:
                 self._loss_streak += 1.0
                 self._losses_today += 1
                 if self._loss_streak >= 4.0:
-                    self._pause_until = sod_sec() + 86400  # end day
+                    self._pause_until = self._day_sod + 86400  # end day
                 elif self._loss_streak >= 3.0:
                     self._pause_until = int(time.time()) + 2700  # 45m
                     self._require_macd_next_m1 = True
@@ -668,7 +685,6 @@ class BotEngine:
         if self.broker.pos:
             self.status_text = self._short_status("managing"); return
 
-        # simple mapping from last wait reason → short status
         r = (self._last_wait_reason or "").lower()
         if "atr" in r or "quiet" in r:
             self.status_text = self._short_status("vol_low")
