@@ -113,7 +113,8 @@ def get_status() -> Status:
         lossStreak=_fmt(engine._loss_streak, 1) or 0.0,
         spreadBps=_fmt(engine._last_spread_bps, 2),
         feeToTp=_fmt(engine._last_fee_to_tp, 3),
-        top3DepthNotional=None,
+        slipEst=_fmt(engine._last_slip_est, 2),
+        top3DepthNotional=_fmt(engine._synthetic_top3_notional, 0),
     )
 
 
