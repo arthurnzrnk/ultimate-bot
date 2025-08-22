@@ -43,7 +43,6 @@ class PaperBroker:
         maker: bool = True,
         *,
         tf: str = "m1",
-        profile: str = "LIGHT",
         scratch_after_sec: int = 300,
         opened_by: str | None = None,
     ) -> None:
@@ -58,8 +57,7 @@ class PaperBroker:
             stop_dist: Distance between entry and stop (1R).
             maker: Whether to use maker or taker fee.
             tf: 'm1' (scalper) or 'h1' (swing).
-            profile: 'LIGHT' or 'HEAVY' at entry.
-            scratch_after_sec: optional time-based scratch window (HEAVY scalper).
+            scratch_after_sec: optional time-based scratch window (scalper).
             opened_by: strategy name that opened the trade (for H1 partials policy).
         """
         fee_rate = FEE_MAKER if maker else FEE_TAKER
@@ -76,7 +74,6 @@ class PaperBroker:
             lo=entry,
             be=False,
             tf="m1" if tf == "m1" else "h1",
-            profile="HEAVY" if profile == "HEAVY" else "LIGHT",
             partial_taken=False,
             scratch_after_sec=scratch_after_sec,
             opened_by=opened_by,
