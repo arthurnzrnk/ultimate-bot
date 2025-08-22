@@ -10,6 +10,8 @@ Highlights:
 - Short, human STATUS messages (2–4 words).
 - NEW: UTC day rollover so day PnL / giveback / losses reset at midnight.
 - NEW: True VS-based scheduling (m1 first when VS≥1, else h1 first) honored by the router.
+- NEW: Tier‑2 uplift tokenization (next two scalps).
+- NEW: H1 signal timestamp (fallback uses “no H1 signal for 4h”).
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ from .broker import PaperBroker, FEE_MAKER
 from .models import Position, Trade
 from .strategies.base import Signal
 from .strategies.router import RouterV3
-from .ta import atr, rsi, macd_line_signal, adx
+from .ta import atr, rsi, macd_line_signal, adx, ema
 
 
 def sod_sec() -> int:
@@ -73,9 +75,11 @@ class BotEngine:
         self._day_high_equity: float = settings.start_equity
         self._pause_until: int = 0                 # giveback / streak cooldown
         self._macro_until: int = 0                 # macro pause auto‑off
+        self._giveback_triggered_today: bool = False
 
         self._last_open_m1: int = 0
         self._last_open_h1: int = 0
+        self._last_h1_signal_ts: int = 0          # last time any H1 signal (non-WAIT) appeared
         self._last_trade_ts: int = 0              # for PS idle decay
         self._last_ps_decay: int = 0              # throttle PS decay steps
         self._last_decision: dict[str, Any] = {}
@@ -92,6 +96,9 @@ class BotEngine:
         # Fallback loosening (once/day)
         self._fallback_pending_m1: bool = False
         self._fallback_used_day: Optional[int] = None
+
+        # Tier‑2 tokens (apply +50% to the next two scalps)
+        self._uplift_tokens: int = 0
 
         # Router
         self.router = RouterV3()
@@ -260,6 +267,7 @@ class BotEngine:
         self._day_sod = sod_sec()
         self._day_open_equity = self.broker.equity
         self._day_high_equity = self.broker.equity
+        self._giveback_triggered_today = False
         self._log(f"Engine ready. Seeded m1={len(self.m1)} h1={len(self.h1)} (src: {source})", set_status=True)
         asyncio.create_task(self._run())
 
@@ -313,6 +321,8 @@ class BotEngine:
                 self._fallback_used_day = None
                 self._require_macd_next_m1 = False
                 self._risk_downscale_next = False
+                self._giveback_triggered_today = False
+                self._uplift_tokens = 0
                 self._log("New UTC day: counters reset", set_status=False)
 
             # VS/PS, macro/giveback
@@ -333,6 +343,7 @@ class BotEngine:
                 gb_limit = 0.30
             if runup > 0 and giveback >= gb_limit * runup and self._pause_until < now + 1800:
                 self._pause_until = now + 1800  # 30m
+                self._giveback_triggered_today = True
                 self._log("Giveback guard: pausing 30m", set_status=False)
 
             # Macro pause via ATR spike
@@ -367,8 +378,8 @@ class BotEngine:
         """Arm fallback loosening for next m1 entry once per UTC day when H1 is quiet but tradable."""
         if self._fallback_used_day == self._day_sod:
             return
-        # last H1 open >= 4h ago?
-        if (now - self._last_open_h1) < 4 * 3600:
+        # no H1 signal for >= 4h?
+        if (now - (self._last_h1_signal_ts or 0)) < 4 * 3600:
             return
         # ADX window guard: 15 <= ADX(h1) <= 22
         iH = len(self.h1) - 2 if len(self.h1) >= 2 else None
@@ -425,6 +436,10 @@ class BotEngine:
         for first in order:
             ctx["preferTF"] = first
             s = self.router.evaluate(ctx)
+
+            # Track H1 signal timestamp for fallback logic
+            if s.tf == "h1" and s.type in ("BUY", "SELL"):
+                self._last_h1_signal_ts = now
 
             # Extra governance on m1 after 3 losses: require MACD cross in last <=3 bars
             if s.tf == "m1" and self._require_macd_next_m1 and s.type in ("BUY", "SELL"):
@@ -488,23 +503,9 @@ class BotEngine:
             eff *= 0.5
             self._risk_downscale_next = False
 
-        # Uplift (m1)
-        if sig.tf == "m1" and self.PS >= 0.70 and 0.8 <= self.VS <= 1.4:
-            eff *= 1.30
-            last5 = self._last_Rs[-5:]
-            tier2_ok = (len(last5) >= 3 and (sum(last5) / len(last5)) >= 0.25 and (self._pause_until == 0 or self._pause_until < int(time.time())))
-            if tier2_ok and (self._last_spread_bps or 0) <= 4.0:
-                eff = min(eff * (50.0 / 30.0), 1.5 * base_risk)
-
+        # Placeholder slip before we compute below
         stopd = sig.stop_dist
-        qty = (equity * eff) / max(1e-9, stopd)
-
-        # Synthetic top-3 depth and slippage estimate
         entry_price = self.price
-        order_notional = qty * entry_price
-        top3_notional = self._synthetic_top3_notional
-        top3_qty = top3_notional / max(1e-9, entry_price)
-
         # Maker-only in paper: slip = spread/2; if bid/ask missing, assume 6 bps total spread conservatively
         if (self.bid is not None) and (self.ask is not None):
             spread_abs = self.ask - self.bid
@@ -512,6 +513,27 @@ class BotEngine:
             spread_abs = entry_price * 0.0006  # 6 bps fallback
         slip_est = spread_abs / 2.0
         self._last_slip_est = slip_est
+
+        # Uplift (m1) — Tier‑1 always under its conditions; Tier‑2 via tokens (next two scalps)
+        if sig.tf == "m1" and self.PS >= 0.70 and 0.8 <= self.VS <= 1.4:
+            eff *= 1.30  # Tier‑1
+            # Grant Tier‑2 tokens if not already granted and all strict conditions pass
+            last5 = self._last_Rs[-5:]
+            last5_avg = (sum(last5) / len(last5)) if last5 else -1.0
+            spread_ok = (self._last_spread_bps or 999) <= 4.0
+            slip_ok = slip_est <= 0.3 * stopd
+            giveback_ok = not self._giveback_triggered_today
+            if self._uplift_tokens == 0 and last5 and last5_avg >= 0.25 and spread_ok and slip_ok and giveback_ok:
+                self._uplift_tokens = 2
+        if sig.tf == "m1" and self._uplift_tokens > 0:
+            eff = min(eff * (50.0 / 30.0), 1.5 * base_risk)
+
+        qty = (equity * eff) / max(1e-9, stopd)
+
+        # Synthetic top-3 depth and slippage estimate
+        order_notional = qty * entry_price
+        top3_notional = self._synthetic_top3_notional
+        top3_qty = top3_notional / max(1e-9, entry_price)
 
         # leverage cap (10× only when spread tight AND slip <= 0.3R; h1 stays at 2×)
         lev_cap = 10.0 if (sig.tf == "m1" and (self._last_spread_bps or 999) <= 4.0 and slip_est <= 0.3 * stopd) else (2.0 if sig.tf == "h1" else 5.0)
@@ -544,6 +566,40 @@ class BotEngine:
             self._last_wait_reason = "Depth<2x order"
             return
 
+        # Compose meta for telemetry logging
+        vol_mult = None
+        candle_type = None
+        if sig.tf == "m1":
+            i = len(self.m1) - 2
+            win = self.m1[max(0, i - 20):i]
+            vols = [c.get("volume", 0.0) for c in win]
+            vmed = (sum(vols) / len(vols)) if vols else 0.0
+            cur_vol = self.m1[i].get("volume", 0.0) if i >= 0 else 0.0
+            vol_mult = (cur_vol / vmed) if vmed > 0 else None
+            if i >= 1:
+                prev = self.m1[i - 1]; cur = self.m1[i]
+                body = abs(cur["close"] - cur["open"])
+                rng = max(1e-9, cur["high"] - cur["low"])
+                hi_wick = cur["high"] - max(cur["open"], cur["close"])
+                lo_wick = min(cur["open"], cur["close"]) - cur["low"]
+                bull_eng = (cur["close"] >= cur["open"]) and (prev["close"] < prev["open"]) and (cur["close"] > prev["open"]) and (cur["open"] < prev["close"])
+                bear_eng = (cur["close"] <= cur["open"]) and (prev["close"] > prev["open"]) and (cur["close"] < prev["open"]) and (cur["open"] > prev["close"])
+                hammer = (lo_wick >= body) and ((cur["close"] - cur["low"]) / rng >= 0.75)
+                star = (hi_wick >= body) and ((cur["close"] - cur["low"]) / rng <= 0.25)
+                candle_type = "bullish_engulfing" if bull_eng else "bearish_engulfing" if bear_eng else "hammer" if hammer else "shooting_star" if star else "other"
+
+        meta = {
+            "strategy": self._last_decision.get("active"),
+            "regime": self._last_decision.get("regime"),
+            "VS": self.VS, "PS": self.PS,
+            "spread_bps": self._last_spread_bps,
+            "slip_est": slip_est,
+            "fee_to_tp": fee_to_tp,
+            "score": sig.score,
+            "vol_multiple": vol_mult,
+            "candle_type": candle_type,
+        }
+
         # Place order (post‑only assumed; crossing logic omitted in paper)
         entry = entry_price
         stop = entry - stopd if sig.type == "BUY" else entry + stopd
@@ -559,10 +615,14 @@ class BotEngine:
         if not self.broker.pos and qty > 0.0:
             self.broker.open(
                 sig.type, entry, qty, stop, take, stopd,
-                maker=True, tf=sig.tf or "m1", scratch_after_sec=240, opened_by=self._last_decision.get("active")
+                maker=True, tf=sig.tf or "m1", scratch_after_sec=240, opened_by=self._last_decision.get("active"),
+                meta=meta
             )
             if sig.tf == "m1":
                 self._last_open_m1 = now
+                # consume a Tier‑2 token if present
+                if self._uplift_tokens > 0:
+                    self._uplift_tokens -= 1
                 if self._fallback_pending_m1:
                     self._fallback_pending_m1 = False
                     self._fallback_used_day = self._day_sod
@@ -625,7 +685,7 @@ class BotEngine:
                 prev = (line[i - 1] or 0.0) - (sig[i - 1] or 0.0)
                 if (p.side == "long" and cur < prev) or (p.side == "short" and cur > prev):
                     tighten = True
-            k = (0.6 if tighten else 0.8) * max(0.6, min(1.5, self.VS))
+            k = (0.6 if tighten else 0.8) * self.VS
             if p.side == "long":
                 new_stop = self.price - (k * R)
                 if new_stop > p.stop:
