@@ -91,4 +91,5 @@ class Status(BaseModel):
     lossStreak: float = 0.0
     spreadBps: Optional[float] = None
     feeToTp: Optional[float] = None
+    slipEst: Optional[float] = None
     top3DepthNotional: Optional[float] = None
