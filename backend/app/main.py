@@ -2,6 +2,7 @@
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Body, Query
+from fastapi.middleware.cors import CORSMiddleware
 import httpx, math, time
 
 from .config import settings
@@ -39,6 +40,15 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Ultimate Bot API — V3", lifespan=lifespan)
+
+# ---- CORS (use .env CORS_ORIGINS) ----
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins or ["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def _fmt(n: float | None, d: int = 2):
@@ -115,6 +125,8 @@ def get_status() -> Status:
         feeToTp=_fmt(engine._last_fee_to_tp, 3),
         slipEst=_fmt(engine._last_slip_est, 2),
         top3DepthNotional=_fmt(engine._synthetic_top3_notional, 0),
+
+        autoTrade=bool(engine.settings.get("auto_trade", False)),
     )
 
 
@@ -148,6 +160,16 @@ def start_bot() -> dict:
 def stop_bot() -> dict:
     engine.settings["auto_trade"] = False
     engine.status_text = "Off"
+    return {"ok": True}
+
+
+# ---- API keys (frontend expects this; store server-side only) ----
+_api_keys_store = {"apiKey": "", "apiSecret": ""}
+
+@app.post("/apikeys")
+def save_apikeys(payload: dict = Body(...)) -> dict:
+    _api_keys_store["apiKey"] = str(payload.get("apiKey") or "")
+    _api_keys_store["apiSecret"] = str(payload.get("apiSecret") or "")
     return {"ok": True}
 
 
