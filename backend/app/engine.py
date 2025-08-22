@@ -564,7 +564,8 @@ class BotEngine:
                 self._log(f"Error in loop: {e}", set_status=False)
 
             self._maybe_auto_switch()
-            await asyncio.sleep(1.0)
+            # ADAPTIVE SLEEP: tighter when live, gentler when stale
+            await asyncio.sleep(0.5 if self.price is not None else 1.0)
 
     def _emit_sizing_log(self, payload: dict[str, Any]) -> None:
         self._last_sizing = payload.copy()
