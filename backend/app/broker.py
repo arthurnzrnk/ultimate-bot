@@ -45,6 +45,7 @@ class PaperBroker:
         tf: str = "m1",
         scratch_after_sec: int = 300,
         opened_by: str | None = None,
+        meta: dict | None = None,
     ) -> None:
         """Open a new position.
 
@@ -59,6 +60,7 @@ class PaperBroker:
             tf: 'm1' (scalper) or 'h1' (swing).
             scratch_after_sec: optional time-based scratch window (scalper).
             opened_by: strategy name that opened the trade (for H1 partials policy).
+            meta: optional metadata for telemetry (strategy/regime/VS/PS/score/etc).
         """
         fee_rate = FEE_MAKER if maker else FEE_TAKER
         self.pos = Position(
@@ -77,6 +79,8 @@ class PaperBroker:
             partial_taken=False,
             scratch_after_sec=scratch_after_sec,
             opened_by=opened_by,
+            extra_scaled=False,
+            meta=meta or {},
         )
 
     def _close_amount(self, qty_to_close: float, px: float) -> float:
@@ -90,6 +94,8 @@ class PaperBroker:
         self.equity += net
         base_R_usd = p.stop_dist * qty_to_close
         r_mult = (net / base_R_usd) if base_R_usd > 0 else None
+
+        meta = p.meta or {}
         self.history.append(
             Trade(
                 side=p.side,
@@ -99,6 +105,18 @@ class PaperBroker:
                 open_time=p.open_time,
                 close_time=self._now(),
                 r_multiple=r_mult,
+                # Telemetry (optional, ignored by UI table but useful for logs)
+                tf=p.tf,
+                strategy=p.opened_by or meta.get("strategy"),
+                regime=meta.get("regime"),
+                vs=meta.get("VS"),
+                ps=meta.get("PS"),
+                spread_bps=meta.get("spread_bps"),
+                slip_est=meta.get("slip_est"),
+                fee_to_tp=meta.get("fee_to_tp"),
+                score=meta.get("score"),
+                vol_multiple=meta.get("vol_multiple"),
+                candle_type=meta.get("candle_type"),
             )
         )
         p.qty = max(0.0, p.qty - qty_to_close)
