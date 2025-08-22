@@ -1,10 +1,9 @@
-"""Data models for the Ultimate Bot backend."""
+"""Data models for the Ultimate Bot backend — Strategy V3 Dynamic."""
 
 from pydantic import BaseModel, Field
 from typing import Literal, Optional, List
 
 Side = Literal["long", "short"]
-ProfileMode = Literal["LIGHT", "HEAVY", "AUTO"]
 
 
 class Candle(BaseModel):
@@ -22,21 +21,17 @@ class Position(BaseModel):
     entry: float
     stop: float
     take: float
-    stop_dist: float
+    stop_dist: float                 # 1R in absolute $
     fee_rate: float
     open_time: int
     hi: float
     lo: float
-    be: bool = False  # breakeven flag
-
-    # V2 additions
-    tf: Literal["m1", "h1"] = "m1"            # which timeframe strategy opened this
-    profile: Literal["LIGHT", "HEAVY"] = "LIGHT"
-    partial_taken: bool = False               # partial at +0.5R taken?
-    scratch_after_sec: int = 300              # HEAVY scalper scratch rule
-
-    # NEW: record which strategy opened the trade (for H1 partial fractions)
-    opened_by: Optional[str] = None
+    be: bool = False                 # moved stop to BE?
+    tf: Literal["m1", "h1"] = "m1"   # which timeframe opened this
+    partial_taken: bool = False      # partial at +0.5R taken?
+    scratch_after_sec: int = 240     # used for time‑scratch logic (scalper)
+    opened_by: Optional[str] = None  # strategy label
+    extra_scaled: bool = False       # RSI extreme extra scale‑out taken?
 
 
 class Trade(BaseModel):
@@ -46,61 +41,54 @@ class Trade(BaseModel):
     pnl: float
     open_time: int
     close_time: int
+    r_multiple: Optional[float] = None  # realized R at close (pnl / (qty*stop_dist))
 
 
 class Settings(BaseModel):
-    # kept for compatibility; hidden in UI now
-    scalp_mode: bool = True
     auto_trade: bool = False
-    strategy: str = "Adaptive Router"
     macro_pause: bool = False
-
-    # V2: profile picker
-    profile_mode: ProfileMode = "AUTO"
 
 
 class Status(BaseModel):
+    # Prices
     price: Optional[float] = None
     bid: Optional[float] = None
     ask: Optional[float] = None
+
+    # Human status (2–4 words)
     status: str = "Loading..."
+
+    # Account
     equity: float
     pos: Optional[Position] = None
     history: List[Trade] = Field(default_factory=list)
+
+    # Chart
     candles: List[Candle] = Field(default_factory=list)
 
-    # UI flags (legacy, still emitted; UI ignores toggles)
-    scalpMode: bool = True
-    autoTrade: bool = False
+    # Labels
+    strategy: str = "Strategy V3 — Dynamic"
+    activeStrategy: Optional[str] = None
 
-    # Strategy labels
-    strategy: str = "Adaptive Router"          # overall (from settings)
-    activeStrategy: Optional[str] = None       # router-selected sub-strategy
-
-    # Telemetry for explanations
-    regime: Optional[str] = None               # Range | Trending | Breakout
-    bias: Optional[str] = None                 # Bullish | Bearish
+    # Market conditions only (for the Conditions line)
+    regime: Optional[str] = None          # Range | Trend | Breakout
+    bias: Optional[str] = None            # Bullish | Bearish (h1 EMA200)
     adx: Optional[float] = None
-    atrPct: Optional[float] = None             # e.g., 0.0043 (0.43%)
+    atrPct: Optional[float] = None        # e.g., 0.0043 (0.43%)
+    rsiM1: Optional[float] = None
+    rsiH1: Optional[float] = None
+    macdM1: Optional[str] = None          # up | down | cross | flat
+    macdH1: Optional[str] = None
+
+    # Session metrics
     fillsToday: int = 0
     pnlToday: float = 0.0
     unrealNet: float = 0.0
 
-    # V2 profile telemetry
-    profileMode: ProfileMode = "AUTO"          # user setting (AUTO/LIGHT/HEAVY)
-    profileModeActive: Literal["LIGHT", "HEAVY"] = "LIGHT"
-
-    # Active ATR band so UI can show why ATR gate is blocking
-    atrBandMin: Optional[float] = None         # e.g., 0.0004
-    atrBandMax: Optional[float] = None         # e.g., 0.0200
-
-    # NEW: Sizing telemetry (exposed each decision)
-    sizingMode: Optional[str] = None
-    allocNotionalUsd: Optional[float] = None
-    qtyRequested: Optional[float] = None
-    qtyFinal: Optional[float] = None
-    impliedLossUsd: Optional[float] = None
-    impliedRiskPct: Optional[float] = None
-    remainingDailyLossCap: Optional[float] = None
-    levUsed: Optional[float] = None
-    lastRejectReason: Optional[str] = None
+    # Telemetry (not shown in Conditions, but handy)
+    vs: Optional[float] = None            # Volatility Score
+    ps: Optional[float] = None            # Performance Score
+    lossStreak: float = 0.0
+    spreadBps: Optional[float] = None
+    feeToTp: Optional[float] = None
+    top3DepthNotional: Optional[float] = None
