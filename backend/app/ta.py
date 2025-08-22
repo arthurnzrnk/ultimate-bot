@@ -1,12 +1,10 @@
-"""Technical analysis utilities for the Ultimate Bot backend.
+"""Technical analysis utilities for the Ultimate Bot backend (Strategy V3).
 
-This module implements EMA, RMA, ATR, ADX and Donchian channels. All
-indicator functions are dependency‑free and operate on lists of numbers
-or OHLC dictionaries.
+Adds RSI and MACD alongside EMA/RMA/ATR/ADX/Donchian.
 """
 
 from collections.abc import Sequence
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
 
 def ema(values: Sequence[float], period: int) -> List[Optional[float]]:
@@ -54,8 +52,51 @@ def atr(ohlc: List[Dict[str, Any]], period: int = 14) -> List[Optional[float]]:
             hc = abs(c["high"] - pc)
             lc = abs(c["low"] - pc)
             tr[i] = max(hl, hc, lc)
-    # Fill Nones with 0.0 before EMA
     return ema([t if t is not None else 0.0 for t in tr], period)
+
+
+def rsi(closes: Sequence[float], period: int = 14) -> List[Optional[float]]:
+    n = len(closes)
+    if n == 0 or period < 1:
+        return []
+    gains = [0.0] * n
+    losses = [0.0] * n
+    for i in range(1, n):
+        diff = closes[i] - closes[i - 1]
+        gains[i] = max(0.0, diff)
+        losses[i] = max(0.0, -diff)
+    avg_gain = rma(gains, period)
+    avg_loss = rma(losses, period)
+    out: List[Optional[float]] = [None] * n
+    for i in range(n):
+        ag = avg_gain[i]
+        al = avg_loss[i]
+        if ag is None or al is None or al == 0:
+            out[i] = None if ag is None or al is None else 100.0
+        else:
+            rs = ag / al if al > 0 else 0.0
+            out[i] = 100.0 - (100.0 / (1.0 + rs))
+    return out
+
+
+def macd_line_signal(
+    closes: Sequence[float],
+    fast: int = 12,
+    slow: int = 26,
+    signal_period: int = 9,
+) -> Tuple[List[Optional[float]], List[Optional[float]]]:
+    if not closes:
+        return [], []
+    ema_fast = ema(closes, fast)
+    ema_slow = ema(closes, slow)
+    macd_line: List[Optional[float]] = [None] * len(closes)
+    for i in range(len(closes)):
+        if ema_fast[i] is None or ema_slow[i] is None:
+            macd_line[i] = None
+        else:
+            macd_line[i] = (ema_fast[i] or 0.0) - (ema_slow[i] or 0.0)
+    sig = ema([x if x is not None else 0.0 for x in macd_line], signal_period)
+    return macd_line, sig
 
 
 def adx(ohlc: List[Dict[str, Any]], period: int = 14) -> List[Optional[float]]:
