@@ -643,13 +643,18 @@ class BotEngine:
             return
         R = p.stop_dist
 
-        # Partial at +0.5R (m1 60% if VS<1 else 50%; h1 25–33%)
+        # Partial at +0.5R (m1 60% if VS<1 else 50%; H1 MR 30%; H1 Breakout/Trend 25%)
         hit_half = (self.price >= p.entry + 0.5 * R) if p.side == "long" else (self.price <= p.entry - 0.5 * R)
         if hit_half and not p.partial_taken:
             if p.tf == "m1":
                 frac = 0.60 if self.VS < 1.0 else 0.50
             else:
-                frac = 0.30
+                # Identify H1 strategy from label captured at open
+                ob = (p.opened_by or "").lower()
+                if "breakout" in ob or "trend" in ob:
+                    frac = 0.25
+                else:
+                    frac = 0.30
             self.broker.partial_close(frac, self.price)
             if self.broker.pos:
                 self.broker.pos.stop = self.broker.pos.entry + (0.1 * R if p.side == "long" else -0.1 * R)
