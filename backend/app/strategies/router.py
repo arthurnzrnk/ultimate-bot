@@ -72,11 +72,11 @@ class M1Scalp(Strategy):
         atr_pct = (a14[i] or 0.0) / max(1.0, px)
         tp_floor = 0.0015  # 0.15%
         VS = float(ctx["VS"])
-        # ATR band scale
-        atr_min = 0.0005
-        atr_max = 0.0175
-        atr_min *= VS
-        atr_max *= VS
+        # ATR band scale + hard clamp to [0.05%, 1.75%]
+        base_min = 0.0005
+        base_max = 0.0175
+        atr_min = max(base_min, min(base_max, base_min * VS))
+        atr_max = max(base_min, min(base_max, base_max * VS))
         if atr_pct < atr_min or atr_pct > atr_max:
             return Signal(type="WAIT", reason="ATR band")
         # VWAP slope cap
@@ -95,7 +95,7 @@ class M1Scalp(Strategy):
             spread_bps = ((ask - bid) / max(1e-9, mid)) * 10000.0
             if spread_bps > 8.0:
                 return Signal(type="WAIT", reason="Spread")
-        # MTF alignment (EMA200 on h1), with CT exception
+        # MTF alignment (EMA200 on h1), with CT exception (side-specific, RSI extreme only)
         h1 = ctx["h1"]; j = ctx["iC_h1"]
         closes_h1 = [c["close"] for c in h1]
         e200 = ema(closes_h1, 200)
@@ -104,10 +104,10 @@ class M1Scalp(Strategy):
         ax_h1 = adx(h1, 14); adx_h1 = (ax_h1[j] or 0.0) if j is not None else 0.0
         rsi_m1 = rsi([c["close"] for c in m1], 14); rsi_now = rsi_m1[i] or 50.0
         rsi_prev = rsi_m1[i - 1] if i - 1 >= 0 else None
-        allow_ct = (adx_h1 < 20.0 * VS) and (
-            (rsi_now < 25.0 and (rsi_prev is not None and rsi_now > rsi_prev)) or
-            (rsi_now > 75.0 and (rsi_prev is not None and rsi_now < rsi_prev))
-        )
+
+        # Spec: single CT exception, side-specific
+        allow_ct_long = (adx_h1 < 20.0 * VS) and (rsi_now < 25.0)
+        allow_ct_short = (adx_h1 < 20.0 * VS) and (rsi_now > 75.0)
 
         # Volume quality on reclaim candle
         win = m1[max(0, i - 20):i]
@@ -150,8 +150,9 @@ class M1Scalp(Strategy):
 
         # Overshoot + reclaim
         vprev = ctx["vwap"][i - 1]
-        long_ok_bias = (ema_bias_up or allow_ct)
-        short_ok_bias = (ema_bias_dn or allow_ct)
+
+        long_ok_bias = (ema_bias_up or allow_ct_long)
+        short_ok_bias = (ema_bias_dn or allow_ct_short)
 
         over_long = bool(vprev and (m1[i - 1]["low"] <= (vprev * (1 - 1.00 * band_pct))))
         reclaim_long = bool(cur["close"] >= (ctx["vwap"][i] * (1 - 0.65 * band_pct)) and (cur["close"] >= cur["open"]))
@@ -169,7 +170,7 @@ class M1Scalp(Strategy):
         score_long = score_base
         score_short = score_base
 
-        # RSI extreme + direction
+        # RSI extreme + direction (for score only)
         if rsi_prev is not None and rsi_now is not None:
             if rsi_now < 30.0 and rsi_now > rsi_prev:  # rising
                 score_long += 0.5
