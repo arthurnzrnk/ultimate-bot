@@ -1,54 +1,41 @@
-"""Core trading engine for the Ultimate Bot — Strategy V2 (profile-aware).
+"""Core trading engine — Strategy V3 (Dynamic VS/PS, no modes).
 
-Edits in this version:
-- Removed daily P&L guardrail (no ±$500 cap); entries are no longer blocked/downsized by a daily cap.
-- Default notional sizing uses 100% of current paper equity (dynamic), not just the initial START_EQUITY.
-- Removed HEAVY strict implied-risk rejection so full notional can be used even in HEAVY.
-- Startup checklist text updated (removed daily-cap mention).
-- Status text no longer shows "Day guardrail on" for P&L; fill-cap message remains.
+Highlights:
+- Removes LIGHT/HEAVY/AUTO + 1m/1h UI modes entirely.
+- Implements VS (volatility score) and PS (performance score).
+- m1 scalps + selective h1 swings via RouterV3.
+- Giveback stop, day guard, streak governance, cooldowns.
+- Short, human STATUS messages (2–4 words).
 """
 
 from __future__ import annotations
 
-import asyncio
-import time
+import asyncio, time, math
 from datetime import datetime
-from typing import Any
 from statistics import median
+from typing import Any, Optional
 
 from .config import settings
 from .datafeed import seed_klines, poll_tick
-from .broker import PaperBroker, FEE_MAKER, FEE_TAKER
-from .strategies.router import StrategyRouter
-from .ta import atr, donchian  # (ema removed as unused)
+from .broker import PaperBroker, FEE_MAKER
+from .models import Position, Trade
+from .strategies.router import RouterV3
+from .ta import atr, rsi, macd_line_signal
 
 
 def sod_sec() -> int:
     return int((int(time.time()) // 86400) * 86400)
 
 
-def _normalize_hyphens(s: str) -> str:
-    if not isinstance(s, str):
-        return s
-    return (
-        s.replace("\u2011", "-")
-         .replace("\u2013", "-")
-         .replace("\u2014", "-")
-         .replace("\u2010", "-")
-         .replace("\u2212", "-")
-    )
+def _clamp(a: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, a))
 
 
-def _mmss(sec: int) -> str:
-    sec = max(0, int(sec))
-    m = sec // 60
-    s = sec % 60
-    return f"{m}:{s:02d}"
+def _pct(x: float) -> float:
+    return x * 100.0
 
 
 class BotEngine:
-    """Main engine orchestrating data feed, strategy evaluation and trading."""
-
     def __init__(self) -> None:
         self.client = None
         self.m1: list[dict[str, Any]] = []
@@ -62,98 +49,53 @@ class BotEngine:
         self.status_text: str = "Loading..."
         self.logs: list[dict[str, Any]] = []
 
-        # Watchdog for net staleness
-        self._stale_count: int = 0
-        self._stale_threshold: int = 5   # was 3; loosen to avoid noisy flips
-        self._net_stale: bool = False
+        # Indicators cache
+        self._rsi_m1: list[Optional[float]] = []
+        self._rsi_h1: list[Optional[float]] = []
+        self._macd_m1: tuple[list[Optional[float]], list[Optional[float]]] = ([], [])
+        self._macd_h1: tuple[list[Optional[float]], list[Optional[float]]] = ([], [])
 
-        # Last-good tick cache (used for micro-hiccups)
-        self._last_tick_ts: float = 0.0
-        self._last_px: float | None = None
-        self._last_bid: float | None = None
-        self._last_ask: float | None = None
-        self._reuse_ttl_sec: float = 6.0  # reuse last tick within 6s
+        # VS/PS & session
+        self.VS: float = 1.0
+        self.PS: float = 0.5
+        self._loss_streak: float = 0.0
+        self._losses_today: int = 0
+        self._require_macd_next_m1: bool = False
+        self._risk_downscale_next: bool = False
 
-        self._PROFILES = {
-            "LIGHT": {
-                "ATR_PCT_MIN": 0.0004,
-                "ATR_PCT_MAX": 0.0200,
-                "VWAP_SLOPE_MAX": 0.00060,
-                "SCALP_VOL_MULT": 1.5,
-                "MR_ADX_CAP": 18,
-                "TREND_ADX_MIN": 25,
-                "BRK_VOL_MULT": 1.2,
-                "SCALP_PARTIAL_FRAC": 0.50,
-                "VOL_PAUSE_RATIO": 1.5,
-            },
-            "HEAVY": {
-                "ATR_PCT_MIN": 0.0006,
-                "ATR_PCT_MAX": 0.0150,
-                "VWAP_SLOPE_MAX": 0.00045,
-                "SCALP_VOL_MULT": 2.0,
-                "MR_ADX_CAP": 16,
-                "TREND_ADX_MIN": 30,
-                "BRK_VOL_MULT": 1.5,
-                "SCALP_PARTIAL_FRAC": 0.60,
-                "VOL_PAUSE_RATIO": 1.3,
-            },
-        }
+        self._day_open_equity: float = settings.start_equity
+        self._day_high_equity: float = settings.start_equity
+        self._pause_until: int = 0                 # giveback / streak cooldown
+        self._macro_until: int = 0                 # macro pause auto‑off
 
-        self._BASE = {
-            "SPREAD_BPS_MAX": 10,
-            "TP_FLOOR": 0.0020,
-            "FEE_R_MAX": 0.25,
-            "RISK_PCT_SCALP": 0.010,
-            "RISK_PCT_H1": 0.003,
-            "LEV_CAP_SCALP": 8,
-            "LEV_CAP_H1": 1,
-        }
+        self._last_open_m1: int = 0
+        self._last_open_h1: int = 0
+        self._last_decision: dict[str, Any] = {}
 
-        # NOTE: default auto_trade is OFF (you toggle it in the UI)
-        self.settings: dict[str, Any] = {
-            "scalp_mode": True,
-            "auto_trade": False,          # <-- OFF by default
-            "strategy": "Adaptive Router",
-            "macro_pause": False,
-            "profile_mode": "AUTO",
+        # slippage/depth telemetry (best effort; we only have top of book)
+        self._last_spread_bps: Optional[float] = None
+        self._last_fee_to_tp: Optional[float] = None
 
-            # Sizing controls
-            "sizing_mode": "NOTIONAL_FIXED",   # RISK_PCT | NOTIONAL_FIXED | HYBRID
-            # None ⇒ use 100% of current equity dynamically
-            "alloc_notional_usd": None,
-            "strict_notional": True,           # if True, never downscale — reject instead (HEAVY strict cap removed)
-        }
+        # realized R track
+        self._last_Rs: list[float] = []
 
-        self.profile_active: str = "LIGHT"
-        self.profile: dict[str, Any] = self._compose_profile(self.profile_active)
+        # Router
+        self.router = RouterV3()
 
-        self.router = StrategyRouter()
+        # Paper broker
         self.broker = PaperBroker(start_equity=settings.start_equity)
 
-        self._cool_until: int = 0
-        self._loss_streak: int = 0
+        # Controls
+        self.settings: dict[str, Any] = {
+            "auto_trade": False,
+            "macro_pause": False,
+        }
 
-        self._heavy_locked_until: int | None = None
-        self._last_trade_was_loss: bool = False
-        self._last_close_ts: int | None = None
-        self._entered_heavy_at: int | None = None
+        self._last_wait_reason: Optional[str] = None
 
-        # NEW: persist ATR-spike candidate to avoid 1-bar wiggles forcing HEAVY
-        self._heavy_candidate_since: int | None = None
+    # ---------------- helpers ----------------
 
-        # Sizing telemetry for /status
-        self._last_sizing: dict[str, Any] = {}
-
-        self._last_wait_reason: dict[str, str | None] = {"m1": None, "h1": None}
-
-    # --------------- helpers ----------------
-
-    def _compose_profile(self, name: str) -> dict[str, Any]:
-        p = self._PROFILES["HEAVY" if name == "HEAVY" else "LIGHT"].copy()
-        p.update(self._BASE)
-        return p
-
-    def _log(self, text: str, set_status: bool = True) -> None:
+    def _log(self, text: str, set_status: bool = False) -> None:
         if set_status:
             self.status_text = text
         self.logs.append({"ts": int(time.time()), "text": text})
@@ -206,15 +148,23 @@ class BotEngine:
             by_time[t] = bar
         self.h1 = sorted(by_time.values(), key=lambda x: x["time"])
 
+    def _warm_ok(self) -> bool:
+        return len(self.m1) >= 5 and len(self.h1) >= 220
+
     def _day_pnl(self) -> float:
         sod = sod_sec()
         return sum([t.pnl for t in self.broker.history if (t.close_time or t.open_time) >= sod])
+
+    def _day_pnl_pct(self) -> float:
+        cur = self.broker.equity
+        run = (cur - self._day_open_equity)
+        return (_pct(run / max(1e-9, self._day_open_equity)))
 
     def _fills_today(self) -> int:
         sod = sod_sec()
         return sum(1 for t in self.broker.history if (t.close_time or t.open_time) >= sod) + (1 if self.broker.pos else 0)
 
-    def _atr_pct_m1(self) -> float | None:
+    def _atr_pct_m1(self) -> Optional[float]:
         if len(self.m1) < 16:
             return None
         a14 = atr(self.m1, 14)
@@ -222,7 +172,7 @@ class BotEngine:
         px = self.m1[i]["close"]
         return (a14[i] or 0.0) / max(1.0, px)
 
-    def _atr_pct_m1_ratio_to_med50(self) -> float | None:
+    def _atr_ratio_vs_median50(self) -> Optional[float]:
         if len(self.m1) < 65:
             return None
         a14 = atr(self.m1, 14)
@@ -234,26 +184,70 @@ class BotEngine:
         cur = self._atr_pct_m1()
         if med is None or not cur:
             return None
-        return cur / max(1e-8, med)
+        return cur / max(1e-9, med)
 
-    # --------------- lifecycle ----------------
+    def _update_indicators(self) -> None:
+        closes_m1 = [c["close"] for c in self.m1]
+        closes_h1 = [c["close"] for c in self.h1]
+        self._rsi_m1 = rsi(closes_m1, 14)
+        self._rsi_h1 = rsi(closes_h1, 14)
+        self._macd_m1 = macd_line_signal(closes_m1, 12, 26, 9)
+        self._macd_h1 = macd_line_signal(closes_h1, 12, 26, 9)
+
+    def _update_VS_PS(self) -> None:
+        # VS
+        atr_ratio = self._atr_ratio_vs_median50()
+        atr_pct = self._atr_pct_m1()
+        if atr_ratio is not None and atr_pct is not None:
+            self.VS = _clamp(atr_pct / max(1e-9, (atr_pct / atr_ratio)), 0.5, 2.0)
+        else:
+            self.VS = 1.0
+
+        # PS
+        day_pct = self._day_pnl_pct() / 100.0
+        PS = 0.5 + 0.10 * day_pct * 100.0 - 0.15 * max(0.0, self._loss_streak)
+        # gentle decay toward 0.5 if idle (handled every cycle)
+        self.PS = _clamp(PS, 0.0, 1.0)
+        self.PS = 0.5 * 0.01 + self.PS * 0.99 if not self.broker.history else self.PS
+
+    def _short_status(self, key: str) -> str:
+        """Map reasons to very short statuses (2–4 words)."""
+        m = {
+            "off": "Off",
+            "macro": "Macro pause",
+            "cool": "Cooling off",
+            "waiting": "Waiting setup",
+            "vol_low": "Too quiet",
+            "vol_high": "Too wild",
+            "spread": "Spread too wide",
+            "fees": "Fees too high",
+            "pullback": "Waiting pullback",
+            "managing": "Managing trade",
+            "trailing": "Trailing stop",
+            "partial": "Taking partials",
+            "scratch": "Scratching trade",
+            "giveback": "Protecting day",
+            "trend": "Trend play",
+            "range": "Range fade",
+            "break": "Breakout watch",
+        }
+        return m.get(key, "Standing by")
+
+    # ---------------- lifecycle ----------------
 
     async def start(self, client) -> None:
-        """Begin polling and trading loop using the provided HTTP client."""
         self.client = client
         m1_seed, h1_seed, source = await seed_klines(client)
         self.m1 = [c.model_dump() if hasattr(c, "model_dump") else dict(c) for c in m1_seed]
         self.h1 = [c.model_dump() if hasattr(c, "model_dump") else dict(c) for c in h1_seed]
         self._rebuild_vwap()
-        self._log(
-            f"Engine initialized. Seeded m1={len(self.m1)} bars, h1={len(self.h1)} bars. "
-            f"(source: {source})"
-        )
-        # Debug checklist
-        self._log("DEBUG CHECKLIST: m5 ADX for m1; macro_pause OFF; ATR% units; VWAP slope caps; sane spread; vol window=20 median; one signal per closed bar; AUTO HEAVY 60s-persist.", set_status=False)
+        self._update_indicators()
+        self._day_open_equity = self.broker.equity
+        self._day_high_equity = self.broker.equity
+        self._log(f"Engine ready. Seeded m1={len(self.m1)} h1={len(self.h1)} (src: {source})", set_status=True)
         asyncio.create_task(self._run())
 
-    def _push_trade_to_m1(self, price: float, iso: str) -> None:
+    def _push_m1(self, price: float, iso: str) -> None:
         if "T" in iso:
             ts = datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
         else:
@@ -269,562 +263,356 @@ class BotEngine:
             c["close"] = price
             c["volume"] = (c.get("volume", 0.0) or 0.0) + 1.0
 
-    def _apply_profile(self, name: str) -> None:
-        if name not in ("LIGHT", "HEAVY"):
-            name = "LIGHT"
-        self.profile_active = name
-        self.profile = self._compose_profile(name)
-
-    def _maybe_auto_switch(self) -> None:
-        if self.settings.get("profile_mode") != "AUTO":
-            self._apply_profile("HEAVY" if self.settings["profile_mode"] == "HEAVY" else "LIGHT")
-            return
-
-        now = int(time.time())
-        sod = sod_sec()
-
-        if self._heavy_locked_until and now >= self._heavy_locked_until:
-            self._heavy_locked_until = None
-            self._apply_profile("LIGHT")
-            self._entered_heavy_at = None
-
-        day_pnl = self._day_pnl()
-        atr_ratio = self._atr_pct_m1_ratio_to_med50()
-        macro_pause = bool(self.settings.get("macro_pause"))
-
-        # Determine causes for escalation
-        escalate_by_streak = self._loss_streak >= 2
-        escalate_by_pnl = day_pnl <= -200
-        escalate_by_atr = (atr_ratio is not None and atr_ratio > 1.5)
-        escalate_by_macro = macro_pause
-
-        # Persistence guard only for ATR spike condition
-        if (escalate_by_atr and not (escalate_by_streak or escalate_by_pnl or escalate_by_macro)) and self.profile_active != "HEAVY":
-            if self._heavy_candidate_since is None:
-                self._heavy_candidate_since = now
-            if now - self._heavy_candidate_since >= 60:
-                self._apply_profile("HEAVY")
-                self._entered_heavy_at = now
-                self._heavy_locked_until = sod + 86400
-                self._heavy_candidate_since = None
-                self._log("AUTO: Escalated to HEAVY (ATR spike persisted 60s).", set_status=False)
-        else:
-            self._heavy_candidate_since = None
-            escalate = (escalate_by_streak or escalate_by_pnl or escalate_by_macro)
-            if escalate and self.profile_active != "HEAVY":
-                self._apply_profile("HEAVY")
-                self._entered_heavy_at = now
-                self._heavy_locked_until = sod + 86400
-                self._log("AUTO: Escalated to HEAVY for safety (rest of UTC day).", set_status=False)
-
-        if self.profile_active == "HEAVY" and self._entered_heavy_at:
-            elapsed = now - self._entered_heavy_at
-            if elapsed >= 3600:
-                revert_ok = True
-                if day_pnl < 0:
-                    revert_ok = False
-                if atr_ratio is None or atr_ratio > 1.2:
-                    revert_ok = False
-                recent = [t for t in self.broker.history if t.close_time >= (now - 1800)]
-                if len(recent) >= 2 and (recent[-1].pnl < 0 and recent[-2].pnl < 0):
-                    revert_ok = False
-                if revert_ok:
-                    self._apply_profile("LIGHT")
-                    self._entered_heavy_at = None
-                    self._log("AUTO: Reverted to LIGHT (conditions normalized).", set_status=False)
-
-    def _friendly_status(self, *, sig_reason: str | None, tf: str, now: int) -> str:
-        if not self.settings.get("auto_trade"):
-            return "Off"
-
-        p = self.broker.pos
-        if p:
-            when = datetime.utcfromtimestamp(p.open_time).strftime("%H:%M:%S")
-            side = "Entered long" if p.side == "long" else "Entered short"
-            return f"{side} @ ${p.entry:.2f} • {when} UTC"
-
-        if now < self._cool_until:
-            return f"Pausing {_mmss(self._cool_until - now)} to avoid chop"
-
-        if self.settings.get("macro_pause"):
-            return "Macro pause"
-
-        fills = self._fills_today()
-        if tf == "m1" and fills >= 60:
-            return "Fill cap reached"
-
-        if tf == "m1":
-            if len(self.m1) < 5:
-                return "Loading recent prices"
-            if not self.vwap or self.vwap[-2] is None:
-                return "Building average line"
-        else:
-            if len(self.h1) < 240:
-                return "Need H1 history"
-
-        atr_ratio = self._atr_pct_m1_ratio_to_med50()
-        if atr_ratio is not None:
-            if self.profile_active == "LIGHT" and tf == "m1" and atr_ratio > self._PROFILES["LIGHT"]["VOL_PAUSE_RATIO"]:
-                return "Volatility pause"
-            if self.profile_active == "HEAVY" and atr_ratio > self._PROFILES["HEAVY"]["VOL_PAUSE_RATIO"]:
-                return "Volatility pause"
-
-        r = (sig_reason or "").lower()
-
-        def _pct(x: float | None) -> str:
-            return f"{(x or 0.0) * 100:.2f}%"
-
-        if "atr range" in r:
-            ap = self._atr_pct_m1()
-            mn = self.profile.get("ATR_PCT_MIN", 0.0004)
-            mx = self.profile.get("ATR_PCT_MAX", 0.02)
-            if ap is None:
-                return "Loading recent prices"
-            return ("Movement too small (" + _pct(ap) + " < " + _pct(mn) + " min)") if ap < mn else \
-                   ("Movement too wild (" + _pct(ap) + " > " + _pct(mx) + " max)")
-
-        if "spread" in r:
-            return "Spread too wide"
-        if "fee" in r:
-            return "Thinking fees will eat this one"
-        if "pause" in r or "cooldown" in r:
-            return "Pausing to avoid chop"
-        if "vwap" in r or "slope" in r or "trend" in r:
-            return "One-way move. Waiting pullback"
-
-        if "inside bands" in r and tf == "m1" and self.vwap and len(self.m1) >= 2:
-            i = len(self.m1) - 2
-            px = self.m1[i]["close"]
-            vw = self.vwap[i]
-            if vw is not None:
-                return "Need red close toward average" if px > vw else "Need green close toward average"
-
-        if "waiting donchian break" in r and len(self.h1) >= 2:
-            dc = donchian(self.h1, 20)
-            i = len(self.h1) - 2
-            hi = dc["hi"][i - 1] if i - 1 >= 0 else None
-            lo = dc["lo"][i - 1] if i - 1 >= 0 else None
-            px = self.h1[i]["close"]
-            if hi is not None and lo is not None:
-                if abs(px - hi) < abs(px - lo):
-                    return "Need break above last high"
-                else:
-                    return "Need break below last low"
-
-        return "Waiting for the next trade"
-
     async def _run(self) -> None:
         last_m1_closed = 0
         last_h1_closed = 0
+
         while True:
+            # poll
             try:
                 px, bid, ask = await poll_tick(self.client)
-
-                # If nothing arrived this loop, consider reusing the last good tick
-                if px is None and bid is None and ask is None:
-                    now = time.time()
-                    if self._last_tick_ts and (now - self._last_tick_ts) <= self._reuse_ttl_sec:
-                        # Reuse last good values — do NOT mark stale.
-                        px, bid, ask = self._last_px, self._last_bid, self._last_ask
-                        # keep stale counters reset
-                        self._stale_count = 0
-                        self._net_stale = False
-                    else:
-                        self._stale_count += 1
-                        if self._stale_count >= self._stale_threshold:
-                            if not self._net_stale:
-                                self._log("DATA: Feed stale (no tick ≥3s). Waiting for providers…", set_status=False)
-                                self._net_stale = True
-                            self.price = None  # Signal UI: NET: STALE
-                        await asyncio.sleep(1.0)
-                        self._maybe_auto_switch()
-                        continue
-                else:
-                    # We got *something* new — reset stale flags and cache it.
-                    if self._net_stale:
-                        self._log("DATA: Feed recovered.", set_status=False)
-                    self._stale_count = 0
-                    self._net_stale = False
-                    now = time.time()
-                    # Cache last seen (favor bid/ask if present)
-                    if (bid is not None) and (ask is not None):
-                        self._last_px = (bid + ask) / 2.0
-                        self._last_bid = bid
-                        self._last_ask = ask
-                    elif px is not None:
-                        self._last_px = px
-                        # leave last_bid/ask as-is if we only had spot
-                    self._last_tick_ts = now
-
-                # Update live price snapshot
                 if (bid is not None) and (ask is not None):
                     self.bid, self.ask = bid, ask
+                    self._last_spread_bps = ((ask - bid) / max(1e-9, (bid + ask) / 2.0)) * 10000.0
                 shown = ((bid + ask) / 2.0) if ((bid is not None) and (ask is not None)) else (px if px is not None else None)
                 if shown is not None:
                     self.price = shown
                     iso = datetime.utcnow().isoformat() + "Z"
-                    self._push_trade_to_m1(shown, iso)
+                    self._push_m1(shown, iso)
                     self._rebuild_vwap()
                     self._aggregate_h1()
-
-                # Position management & exits
-                if self.broker.pos and self.price is not None:
-                    _ = self.broker.mark(self.price)
-                    p = self.broker.pos
-                    R = p.stop_dist
-
-                    if p.tf == "m1":
-                        if p.profile == "HEAVY" and not p.be and (int(time.time()) - p.open_time) >= p.scratch_after_sec:
-                            hit_qtr = (self.price >= p.entry + 0.25 * R) if p.side == "long" else (self.price <= p.entry - 0.25 * R)
-                            if not hit_qtr:
-                                p.stop = p.entry
-                                p.be = True
-
-                        if not p.partial_taken:
-                            hit_half = (self.price >= p.entry + 0.5 * R) if p.side == "long" else (self.price <= p.entry - 0.5 * R)
-                            if hit_half:
-                                frac_default = 0.60 if p.profile == "HEAVY" else 0.50
-                                prof_conf = self._PROFILES.get(p.profile, {})
-                                frac_conf = prof_conf.get("SCALP_PARTIAL_FRAC", frac_default)
-                                try:
-                                    frac = float(frac_conf)
-                                except Exception:
-                                    frac = frac_default
-                                frac = max(0.05, min(0.90, frac))
-                                self.broker.partial_close(frac, self.price)
-                                if self.broker.pos:
-                                    self.broker.pos.stop = self.broker.pos.entry
-                                    self.broker.pos.be = True
-                                    self.broker.pos.partial_taken = True
-
-                        if self.broker.pos:
-                            p = self.broker.pos
-                            if p.side == "long":
-                                new_stop = self.price - R
-                                if new_stop > p.stop:
-                                    p.stop = new_stop
-                            else:
-                                new_stop = self.price + R
-                                if new_stop < p.stop:
-                                    p.stop = new_stop
-
-                    else:
-                        # --- H1 parity: partial at +0.5R, move to BE, then 1R trail ---
-                        if not p.partial_taken:
-                            hit_half = (self.price >= p.entry + 0.5 * R) if p.side == "long" else (self.price <= p.entry - 0.5 * R)
-                            if hit_half:
-                                name = (p.opened_by or "").lower()
-                                if "mean reversion" in name:
-                                    frac = 0.33
-                                else:
-                                    # Trend‑Following or Breakout
-                                    frac = 0.25
-                                frac = max(0.05, min(0.90, frac))
-                                self.broker.partial_close(frac, self.price)
-                                if self.broker.pos:
-                                    self.broker.pos.stop = self.broker.pos.entry
-                                    self.broker.pos.be = True
-                                    self.broker.pos.partial_taken = True
-
-                        # Trail remainder by 1R (same logic as m1)
-                        if self.broker.pos:
-                            p = self.broker.pos
-                            if p.side == "long":
-                                new_stop = self.price - R
-                                if new_stop > p.stop:
-                                    p.stop = new_stop
-                            else:
-                                new_stop = self.price + R
-                                if new_stop < p.stop:
-                                    p.stop = new_stop
-
-                    p = self.broker.pos
-                    if p:
-                        hit_stop = (self.price <= p.stop) if p.side == "long" else (self.price >= p.stop)
-                        hit_take = (self.price >= p.take) if p.side == "long" else (self.price <= p.take)
-                        if hit_take or hit_stop:
-                            net = self.broker.close(p.take if hit_take else self.price)
-                            if hit_take:
-                                self._log(f"Closed on TAKE ({p.side}); PnL {net:+.2f}")
-                            else:
-                                self._log(f"Closed on STOP ({p.side}); PnL {net:+.2f}")
-                            if net is not None and net > 0:
-                                self._loss_streak = 0
-                                self._last_trade_was_loss = False
-                            elif net is not None and net < 0:
-                                self._loss_streak += 1
-                                self._last_trade_was_loss = True
-                            self._last_close_ts = int(time.time())
-                            if self._loss_streak >= 3:
-                                self._cool_until = int(time.time()) + 1800
-                                self._log("Cooling off after 3 losses (30 min).")
-                                self._loss_streak = 0
-
-                # Signal on closed bars only
-                if len(self.m1) >= 2 and self.m1[-2]["time"] != last_m1_closed:
-                    last_m1_closed = self.m1[-2]["time"]
-                    await self._maybe_signal(tf="m1")
-                if len(self.h1) >= 2 and self.h1[-2]["time"] != last_h1_closed:
-                    last_h1_closed = self.h1[-2]["time"]
-                    await self._maybe_signal(tf="h1")
+                    self._update_indicators()
             except Exception as e:
-                self.status_text = f"Error loop: {e}"
-                self._log(f"Error in loop: {e}", set_status=False)
+                self._log(f"Data error: {e}")
 
-            self._maybe_auto_switch()
-            # ADAPTIVE SLEEP: tighter when live, gentler when stale
-            await asyncio.sleep(0.5 if self.price is not None else 1.0)
+            # VS/PS, macro/giveback
+            self._update_VS_PS()
+            now = int(time.time())
 
-    def _emit_sizing_log(self, payload: dict[str, Any]) -> None:
-        self._last_sizing = payload.copy()
-        # Compact log line for UI
-        sm = payload.get("sizing_mode")
-        al = payload.get("alloc_notional_usd")
-        qr = payload.get("qty_requested")
-        qf = payload.get("qty_final")
-        il = payload.get("implied_loss_usd")
-        ir = payload.get("implied_risk_pct")
-        rl = payload.get("remaining_daily_loss_cap")
-        lv = payload.get("lev_used")
-        rr = payload.get("reason_if_reject")
-        txt = (f"SIZING[{sm}] alloc=${al:.2f} qty_req={qr:.6f} qty_final={qf:.6f} "
-               f"implied_loss=${il:.2f} implied_risk={ir*100:.2f}% rem_daily_cap=${rl:.2f} lev={lv:.2f} "
-               + (f"REJECT: {rr}" if rr else "OK"))
-        self._log(txt, set_status=False)
+            # Macro pause auto-off
+            if self._macro_until and now >= self._macro_until:
+                self._macro_until = 0
+                self.settings["macro_pause"] = False
 
-    async def _maybe_signal(self, tf: str) -> None:
-        now = int(time.time())
+            # Giveback stop
+            if self.broker.equity > self._day_high_equity:
+                self._day_high_equity = self.broker.equity
+            runup = self._day_high_equity - self._day_open_equity
+            giveback = self._day_high_equity - self.broker.equity
+            gb_limit = 0.35
+            if self.VS >= 1.5 and self.PS <= 0.4:
+                gb_limit = 0.30
+            if runup > 0 and giveback >= gb_limit * runup and self._pause_until < now + 1800:
+                self._pause_until = now + 1800  # 30m
+                self._log("Giveback guard: pausing 30m", set_status=False)
+
+            # Macro pause via ATR spike
+            atr_ratio = self._atr_ratio_vs_median50()
+            if atr_ratio is not None and atr_ratio > 1.8 and not self.settings.get("macro_pause"):
+                self.settings["macro_pause"] = True
+                self._macro_until = now + 1800  # 30m
+                self._log("Macro pause: volatility spike", set_status=False)
+
+            # Manage position
+            if self.broker.pos and self.price is not None:
+                self._manage_position(now)
+
+            # On closed bars, schedule signals: m1 first if VS≥1 else h1 first
+            m1_closed = (len(self.m1) >= 2 and self.m1[-2]["time"] != last_m1_closed)
+            h1_closed = (len(self.h1) >= 2 and self.h1[-2]["time"] != last_h1_closed)
+            if m1_closed or h1_closed:
+                if m1_closed:
+                    last_m1_closed = self.m1[-2]["time"]
+                if h1_closed:
+                    last_h1_closed = self.h1[-2]["time"]
+                await self._maybe_decide(now)
+
+            # STATUS (short & human)
+            self._status_tick(now)
+
+            await asyncio.sleep(0.5)
+
+    # --------------- decision & sizing ----------------
+
+    async def _maybe_decide(self, now: int) -> None:
+        if not self.settings.get("auto_trade"):
+            return
+        if not self._warm_ok():
+            self.status_text = self._short_status("waiting")
+            return
 
         if self.settings.get("macro_pause"):
-            self.status_text = "Macro pause"
+            self.status_text = self._short_status("macro")
             return
-        if now < self._cool_until:
-            self.status_text = f"Pausing {_mmss(self._cool_until - now)} to avoid chop"
+        if now < self._pause_until:
+            self.status_text = self._short_status("cool")
             return
 
-        fills = self._fills_today()
+        # Hard day guard
+        if self._day_pnl_pct() <= -5.0 or self._losses_today >= 4:
+            self.status_text = self._short_status("giveback")
+            return
 
-        scalp = bool(self.settings.get("scalp_mode"))
-        src = self.m1 if scalp else self.h1
-        iC = (len(src) - 2) if len(src) >= 2 else None
+        # Cooldowns
+        cooldown_ok_m1 = (now - self._last_open_m1) > 45
+        cooldown_ok_h1 = (now - self._last_open_h1) > 1800
 
-        iC_h1 = (len(self.h1) - 2) if len(self.h1) >= 2 else None
-        iC_m1 = (len(self.m1) - 2) if len(self.m1) >= 2 else None
-
-        atr_ratio = self._atr_pct_m1_ratio_to_med50()
-        if atr_ratio is not None:
-            if self.profile_active == "LIGHT" and scalp and atr_ratio > self._PROFILES["LIGHT"]["VOL_PAUSE_RATIO"]:
-                self.status_text = "Volatility pause"
-                return
-            if self.profile_active == "HEAVY" and atr_ratio > self._PROFILES["HEAVY"]["VOL_PAUSE_RATIO"]:
-                self.status_text = "Volatility pause"
-                return
-
-        last_open = self.broker.history[-1].open_time if self.broker.history else 0
-        cooldown_ok_ctx = (now - last_open) > (60 if scalp else 3600)
-
-        context = {
-            # Keep this key for strategy compatibility; now it means "fills-ok" only
-            "daily_ok": (fills < 60 if scalp else True),
-            "cooldown_ok": cooldown_ok_ctx,
-            "fills": fills,
-            "max_fills": 60,
-            "fee_rate": FEE_MAKER,
-            "fee_taker": FEE_TAKER,
-            "profile": {
-                "ATR_PCT_MIN": self.profile["ATR_PCT_MIN"],
-                "ATR_PCT_MAX": self.profile["ATR_PCT_MAX"],
-                "VWAP_SLOPE_MAX": self.profile["VWAP_SLOPE_MAX"],
-                "SPREAD_BPS_MAX": self.profile["SPREAD_BPS_MAX"],
-                "TP_FLOOR": self.profile["TP_FLOOR"],
-                "FEE_R_MAX": self.profile["FEE_R_MAX"],
-                "SCALP_VOL_MULT": self.profile["SCALP_VOL_MULT"],
-            },
-            "adx_trend_min": self.profile["TREND_ADX_MIN"],
-            "adx_range_max": self.profile["MR_ADX_CAP"],
-            "breakout_vol_mult": self.profile["BRK_VOL_MULT"],
+        # Router context
+        iC_m1 = len(self.m1) - 2 if len(self.m1) >= 2 else None
+        iC_h1 = len(self.h1) - 2 if len(self.h1) >= 2 else None
+        ctx = {
+            "m1": self.m1, "h1": self.h1,
+            "iC_m1": iC_m1, "iC_h1": iC_h1,
             "vwap": self.vwap,
-            "bid": self.bid,
-            "ask": self.ask,
-            "m1": self.m1,
-            "h1": self.h1,
-            "iC": iC,
-            "iC_m1": iC_m1,
-            "iC_h1": iC_h1,
-            "min_bars": 5,
-            "min_h1_bars": 240,
-            "profile_mode_active": self.profile_active,
-            "scalp_mode": scalp,
-            "macro_pause": self.settings.get("macro_pause"),
+            "bid": self.bid, "ask": self.ask,
+            "min_bars": 5, "min_h1_bars": 220,
+            "VS": self.VS, "PS": self.PS,
+            "loss_streak": self._loss_streak,
         }
 
-        strategy_router = self.router.pick(scalp)
-        sig = strategy_router.evaluate(src, context)
+        # VS-driven scheduling: m1 first if VS≥1, else h1 first
+        order = ("m1", "h1") if self.VS >= 1.0 else ("h1", "m1")
 
-        self.status_text = self._friendly_status(
-            sig_reason=getattr(sig, "reason", None),
-            tf=("m1" if scalp else "h1"),
-            now=now,
-        )
+        sig = None
+        for _ in order:
+            s = self.router.evaluate(ctx)
+            # Apply extra governance on m1 after 3 losses
+            if s.tf == "m1" and self._require_macd_next_m1 and s.type in ("BUY", "SELL"):
+                # Recompute MACD align check: require a fresh cross toward side in last ≤3 bars
+                closes_m1 = [c["close"] for c in self.m1]
+                mline, msignal = macd_line_signal(closes_m1, 12, 26, 9)
+                idx = iC_m1
+                recent = []
+                for k in range(0, 4):
+                    j = (idx - k) if idx is not None and idx - k >= 1 else None
+                    if j is None: break
+                    prev = (mline[j - 1] or 0.0) - (msignal[j - 1] or 0.0)
+                    cur = (mline[j] or 0.0) - (msignal[j] or 0.0)
+                    recent.append((prev, cur))
+                ok = any((p <= 0 < c) or (p >= 0 > c) for (p, c) in recent)
+                if not ok:
+                    s = Signal(type="WAIT", reason="Require MACD confirm")
+            # enforce cooldowns by TF
+            if s.tf == "m1" and not cooldown_ok_m1:
+                s = Signal(type="WAIT", reason="m1 cooldown")
+            if s.tf == "h1" and not cooldown_ok_h1:
+                s = Signal(type="WAIT", reason="h1 cooldown")
 
-        if sig.type == "WAIT":
-            key = "m1" if scalp else "h1"
-            prev = self._last_wait_reason.get(key)
-            if sig.reason != prev:
-                text = f"WAIT[{key}]: {sig.reason}"
-                if "ATR range" in (sig.reason or ""):
-                    ap = self._atr_pct_m1() or 0.0
-                    mn = self.profile.get("ATR_PCT_MIN", 0.0004)
-                    mx = self.profile.get("ATR_PCT_MAX", 0.0200)
-                    text += f" (ATR% {ap*100:.2f}% in band {mn*100:.2f}–{mx*100:.2f}%)"
-                elif "Inside bands" in (sig.reason or "") and key == "m1" and len(self.m1) >= 3 and self.vwap:
-                    i = len(self.m1) - 2
-                    prev_bar = self.m1[i - 1] if i - 1 >= 0 else None
-                    vprev = self.vwap[i - 1] if i - 1 >= 0 else None
-                    atr_pct = self._atr_pct_m1() or 0.0
-                    tp_floor = self.profile.get("TP_FLOOR", 0.0020)
-                    band_pct = max(tp_floor, 0.7 * atr_pct)
-                    if prev_bar and vprev:
-                        dlow = max(0.0, (vprev - prev_bar["low"]) / max(1e-12, vprev))
-                        dhigh = max(0.0, (prev_bar["high"] - vprev) / max(1e-12, vprev))
-                        text += f" (need ≥{band_pct*100:.2f}% overshoot; prev LΔ={dlow*100:.2f}%, HΔ={dhigh*100:.2f}%)"
-                self._last_wait_reason[key] = sig.reason
-                self._log(text, set_status=False)
+            sig = s
+            if s.type != "WAIT":
+                break
 
-        if sig.type in ("BUY", "SELL") and self.settings.get("auto_trade") and self.price is not None:
-            tf_from_sig = getattr(sig, "tf", None)
-            if tf_from_sig in ("m1", "h1"):
-                trade_tf = tf_from_sig
-                is_h1 = (trade_tf == "h1")
+        # Telemetry for UI
+        self._last_decision = {
+            "regime": self.router.last_regime,
+            "bias": self.router.last_bias,
+            "adx": self.router.last_adx,
+            "atrPct": self.router.last_atr_pct,
+            "active": self.router.last_strategy if sig and sig.type != "WAIT" else None,
+        }
+
+        if sig is None or sig.type == "WAIT":
+            self._last_wait_reason = sig.reason if sig else "—"
+            return
+
+        # Sizing & risk
+        if self.price is None or sig.stop_dist is None or sig.take_dist is None:
+            return
+
+        equity = max(1e-9, float(self.broker.equity))
+        base_risk = 0.008 if sig.tf == "m1" else 0.0025
+        atr_pct = self._atr_pct_m1() or 0.0
+        VS_eff = self.VS
+        atr_norm = min(1.0, atr_pct / max(1e-9, (0.0175 * VS_eff)))
+        risk_mult = 1.0 - 0.40 * atr_norm
+        eff = base_risk * risk_mult * self.PS
+        if self.PS < 0.5:
+            eff = min(eff, 0.8 * base_risk)
+        if self._risk_downscale_next:
+            eff *= 0.5
+            self._risk_downscale_next = False
+
+        # Uplift (m1)
+        if sig.tf == "m1" and self.PS >= 0.70 and 0.8 <= self.VS <= 1.4:
+            eff *= 1.30
+            last5 = self._last_Rs[-5:]
+            if len(last5) >= 3 and (sum(last5) / len(last5)) >= 0.25 and (self._day_high_equity == self.broker.equity) and (self._last_spread_bps or 0) <= 4.0:
+                eff = min(eff * (50.0 / 30.0), 1.5 * base_risk)
+
+        stopd = sig.stop_dist
+        qty = (equity * eff) / max(1e-9, stopd)
+
+        # leverage cap (we simulate up to 10x for scalps; 2x for h1)
+        lev_cap = 10.0 if (sig.tf == "m1" and (self._last_spread_bps or 0) <= 4.0) else (2.0 if sig.tf == "h1" else 5.0)
+        qty_cap = (equity * lev_cap) / max(1.0, self.price)
+        qty = max(0.0, min(qty, qty_cap))
+
+        # Combined live risk cap (single position in this engine)
+        if self.broker.pos:
+            # refuse new entry if implied risk would exceed 1.5% live
+            live = (self.broker.pos.stop_dist * self.broker.pos.qty) / equity
+            if (live + eff) > 0.015:
+                self._last_wait_reason = "Live risk cap"
+                return
+
+        # Spread/fee/TP checks
+        tp_pct = max(1e-9, sig.take_dist / max(1.0, self.price))
+        fee_to_tp = (2 * FEE_MAKER) / tp_pct
+        self._last_fee_to_tp = fee_to_tp
+        if fee_to_tp > 0.20:
+            self._last_wait_reason = "Fees>TP"
+            return
+        if (self._last_spread_bps or 0) > 8.0 and sig.tf == "m1":
+            self._last_wait_reason = "Spread cap"
+            return
+
+        # Place order (post‑only assumed; crossing logic omitted in paper)
+        entry = self.price
+        stop = entry - stopd if sig.type == "BUY" else entry + stopd
+        take = entry + sig.take_dist if sig.type == "BUY" else entry - sig.take_dist
+
+        if self.broker.pos:
+            ps = self.broker.pos.side
+            if (sig.type == "BUY" and ps == "short") or (sig.type == "SELL" and ps == "long"):
+                self.broker.close(entry)
+                self._log("Reversed position", set_status=False)
+
+        if not self.broker.pos and qty > 0.0:
+            self.broker.open(
+                sig.type, entry, qty, stop, take, stopd,
+                maker=True, tf=sig.tf or "m1", scratch_after_sec=240, opened_by=self._last_decision.get("active")
+            )
+            if sig.tf == "m1":
+                self._last_open_m1 = now
             else:
-                active_name = strategy_router.last_strategy or ""
-                active_name_norm = _normalize_hyphens(active_name)
-                is_h1 = active_name_norm in {"Mean Reversion (H1)", "Breakout", "Trend-Following"}
-                trade_tf = "h1" if is_h1 else "m1"
+                self._last_open_h1 = now
+            self._log(f"Open {sig.type} {sig.tf} @ {entry:.2f} qty={qty:.6f} R=${stopd:.2f} score={sig.score}", set_status=False)
 
-            last_open = self.broker.history[-1].open_time if self.broker.history else 0
-            cooldown_ok = (now - last_open) > (3600 if trade_tf == "h1" else 60)
-            if not cooldown_ok:
-                return
+    # --------------- management ----------------
 
-            series = self.h1 if is_h1 else self.m1
-            i_entry = (len(series) - 2)
-            if i_entry is None or i_entry < 0 or i_entry >= len(series):
-                return
-            entry = series[i_entry]["close"]
+    def _manage_position(self, now: int) -> None:
+        _ = self.broker.mark(self.price or 0.0)
+        p = self.broker.pos
+        if not p:
+            return
+        R = p.stop_dist
 
-            # Distances from signal (absolute $ distances)
-            stopd = sig.stop_dist or (entry * 0.005)
-            taked = sig.take_dist or (entry * 0.005)
-
-            # --- Fee→TP gate (enforced on all strategies; was scalper-only before) ---
-            tp_pct = max(1e-9, taked / max(1.0, entry))
-            fee_r = (2 * FEE_MAKER) / tp_pct
-            if fee_r > self.profile.get("FEE_R_MAX", 0.25):
-                # log and ignore the signal (do not open)
-                self._emit_sizing_log({
-                    "sizing_mode": self.settings.get("sizing_mode"),
-                    "alloc_notional_usd": float(0.0),
-                    "qty_requested": 0.0,
-                    "qty_final": 0.0,
-                    "implied_loss_usd": 0.0,
-                    "implied_risk_pct": 0.0,
-                    "remaining_daily_loss_cap": float("inf"),
-                    "lev_used": 0.0,
-                    "reason_if_reject": "Fees>limitR",
-                })
-                key = "h1" if is_h1 else "m1"
-                self._last_wait_reason[key] = "Fees>limitR"
-                return
-
-            # --- SIZING v3: Notional‑first with caps (RISK_PCT | NOTIONAL_FIXED | HYBRID) ---
-            equity = max(1e-9, float(self.broker.equity))
-            sizing_mode = str(self.settings.get("sizing_mode", "NOTIONAL_FIXED")).upper()
-
-            # Use 100% of current equity by default when not provided
-            alloc_cfg = self.settings.get("alloc_notional_usd", None)
-            alloc_notional = equity if (alloc_cfg is None) else float(alloc_cfg)
-
-            strict_notional = bool(self.settings.get("strict_notional", True))
-            lev_cap = float(self._BASE["LEV_CAP_H1" if is_h1 else "LEV_CAP_SCALP"])
-
-            # Step C1 — compute requested size
-            if sizing_mode == "RISK_PCT":
-                risk_pct = float(self._BASE["RISK_PCT_H1" if is_h1 else "RISK_PCT_SCALP"])
-                risk_usd = max(0.0, equity * risk_pct)
-                qty_requested = max(0.0, risk_usd / max(1e-9, stopd))
+        # Partial at +0.5R (m1 60% if VS<1 else 50%; h1 25–33%)
+        hit_half = (self.price >= p.entry + 0.5 * R) if p.side == "long" else (self.price <= p.entry - 0.5 * R)
+        if hit_half and not p.partial_taken:
+            if p.tf == "m1":
+                frac = 0.60 if self.VS < 1.0 else 0.50
             else:
-                # NOTIONAL_FIXED or HYBRID
-                qty_requested = max(0.0, alloc_notional / max(1.0, entry))
-            qty_cap = min(qty_requested, (equity * lev_cap) / max(1.0, entry))
-            qty_final = max(0.0, min(qty_requested, qty_cap))
-
-            # Step C2 — pre‑trade risk sanity vs (removed) daily cap
-            implied_loss_usd = qty_final * stopd
-            implied_risk_pct = (qty_final * stopd) / equity if equity > 0 else 0.0
-            remaining_daily_loss_cap = float("inf")  # no daily cap
-
-            reject_reason: str | None = None  # don't reject on daily cap anymore
-
-            # Step C3 — profile-aware implied risk cap (only when not strict) — unchanged
-            if reject_reason is None and not strict_notional:
-                if is_h1:
-                    cap_for_profile = 0.005 if self.profile_active == "HEAVY" else 0.008
-                else:
-                    cap_for_profile = 0.010 if self.profile_active == "HEAVY" else 0.020
-                if implied_risk_pct > cap_for_profile:
-                    # HYBRID: scale down to the cap
-                    qty_final = (cap_for_profile * equity) / max(1e-9, stopd)
-                    qty_final = min(qty_final, qty_cap)
-                    if entry * qty_final < 5.0:
-                        reject_reason = "downsized < $5 notional"
-                    implied_risk_pct = (qty_final * stopd) / equity if equity > 0 else 0.0
-
-            # NOTE: removed HEAVY strict implied-risk rejection so full notional can be used when strict_notional=True
-
-            lev_used = (qty_final * entry) / equity if equity > 0 else 0.0
-
-            # Emit sizing telemetry
-            self._emit_sizing_log({
-                "sizing_mode": sizing_mode,
-                "alloc_notional_usd": float(alloc_notional),
-                "qty_requested": float(qty_requested),
-                "qty_final": float(qty_final),
-                "implied_loss_usd": float(qty_final * stopd),
-                "implied_risk_pct": float(implied_risk_pct),
-                "remaining_daily_loss_cap": float(remaining_daily_loss_cap),
-                "lev_used": float(lev_used),
-                "reason_if_reject": reject_reason,
-            })
-
-            if reject_reason:
-                key = "h1" if is_h1 else "m1"
-                self._last_wait_reason[key] = reject_reason
-                return
-
-            # Compute concrete stop/take
-            stop = (entry - stopd) if sig.type == "BUY" else (entry + stopd)
-            take = (entry + taked) if sig.type == "BUY" else (entry - taked)
-
-            # Flip if opposite position present
+                frac = 0.30
+            self.broker.partial_close(frac, self.price)
             if self.broker.pos:
-                ps = self.broker.pos.side
-                if (sig.type == "BUY" and ps == "short") or (sig.type == "SELL" and ps == "long"):
-                    self.broker.close(entry)
-                    self._log(f"Reversed position at {entry:.2f}")
+                self.broker.pos.stop = self.broker.pos.entry + (0.1 * R if p.side == "long" else -0.1 * R)
+                self.broker.pos.be = True
+                self.broker.pos.partial_taken = True
+            self.status_text = self._short_status("partial")
 
-            # Place order
-            if not self.broker.pos:
-                self.broker.open(
-                    sig.type, entry, qty_final, stop, take, stopd, maker=True,
-                    tf=trade_tf,
-                    profile=self.profile_active,
-                    scratch_after_sec=300,
-                    opened_by=(strategy_router.last_strategy or None),
-                )
-                notional = qty_final * entry
-                self._log(
-                    f"Open {sig.type} @ {entry:.2f} | qty={qty_final:.6f} notional≈${notional:.2f} "
-                    f"stop={stop:.2f} take={take:.2f} score={sig.score}",
-                    set_status=False,
-                )
+        # RSI extreme extra scale‑out 25%
+        if self.broker.pos and not self.broker.pos.extra_scaled:
+            if p.tf == "m1":
+                idx = len(self.m1) - 2
+                rsi_now = self._rsi_m1[idx] if idx is not None and idx < len(self._rsi_m1) else None
+            else:
+                idx = len(self.h1) - 2
+                rsi_now = self._rsi_h1[idx] if idx is not None and idx < len(self._rsi_h1) else None
+            if rsi_now is not None:
+                if (p.side == "long" and rsi_now > 80.0) or (p.side == "short" and rsi_now < 20.0):
+                    self.broker.partial_close(0.25, self.price)
+                    if self.broker.pos:
+                        self.broker.pos.extra_scaled = True
+
+        # Trail: 0.8R×VS (tighten 0.6R×VS on MACD fade/div)
+        if self.broker.pos:
+            tighten = False
+            if p.tf == "m1":
+                line, sig = self._macd_m1
+                i = len(self.m1) - 2
+            else:
+                line, sig = self._macd_h1
+                i = len(self.h1) - 2
+            if i is not None and i > 1 and i < len(line):
+                cur = (line[i] or 0.0) - (sig[i] or 0.0)
+                prev = (line[i - 1] or 0.0) - (sig[i - 1] or 0.0)
+                if (p.side == "long" and cur < prev) or (p.side == "short" and cur > prev):
+                    tighten = True
+            k = (0.6 if tighten else 0.8) * max(0.6, min(1.5, self.VS))
+            if p.side == "long":
+                new_stop = self.price - (k * R)
+                if new_stop > p.stop:
+                    p.stop = new_stop
+            else:
+                new_stop = self.price + (k * R)
+                if new_stop < p.stop:
+                    p.stop = new_stop
+            self.status_text = self._short_status("trailing")
+
+        # Time‑scratch (m1, VS<1): +0.25R not in 4 min → BE
+        if p.tf == "m1" and self.VS < 1.0 and not p.be and (now - p.open_time) >= 240:
+            hit_qtr = (self.price >= p.entry + 0.25 * R) if p.side == "long" else (self.price <= p.entry - 0.25 * R)
+            if not hit_qtr:
+                p.stop = p.entry
+                p.be = True
+                self.status_text = self._short_status("scratch")
+
+        # Exit on stop/take
+        hit_stop = (self.price <= p.stop) if p.side == "long" else (self.price >= p.stop)
+        hit_take = (self.price >= p.take) if p.side == "long" else (self.price <= p.take)
+        if hit_stop or hit_take:
+            base_R_usd = p.qty * p.stop_dist
+            net = self.broker.close(p.take if hit_take else self.price)
+            r_mult = (net / max(1e-9, base_R_usd)) if net is not None else 0.0
+            self._last_Rs.append(r_mult); self._last_Rs = self._last_Rs[-20:]
+            self._log(f"Close {'TAKE' if hit_take else 'STOP'} {p.tf} PnL {net:+.2f} ({r_mult:+.2f}R)", set_status=False)
+
+            if net is not None and net > 0:
+                self._loss_streak = 0.0
+                self._require_macd_next_m1 = False
+            elif net is not None and abs(net) < max(1.0, 0.02 * base_R_usd) and p.be:
+                # scratch → relief
+                self._loss_streak = max(0.0, self._loss_streak - 0.5)
+            else:
+                self._loss_streak += 1.0
+                self._losses_today += 1
+                if self._loss_streak >= 4.0:
+                    self._pause_until = sod_sec() + 86400  # end day
+                elif self._loss_streak >= 3.0:
+                    self._pause_until = int(time.time()) + 2700  # 45m
+                    self._require_macd_next_m1 = True
+                elif self._loss_streak >= 2.0:
+                    self._pause_until = int(time.time()) + 900   # 15m
+                    self._risk_downscale_next = True
+
+    # --------------- status ----------------
+
+    def _status_tick(self, now: int) -> None:
+        if not self.settings.get("auto_trade"):
+            self.status_text = self._short_status("off"); return
+        if self.settings.get("macro_pause"):
+            self.status_text = self._short_status("macro"); return
+        if now < self._pause_until:
+            self.status_text = self._short_status("cool"); return
+        if self.broker.pos:
+            self.status_text = self._short_status("managing"); return
+
+        # simple mapping from last wait reason → short status
+        r = (self._last_wait_reason or "").lower()
+        if "atr" in r or "quiet" in r:
+            self.status_text = self._short_status("vol_low")
+        elif "wild" in r or "macro" in r:
+            self.status_text = self._short_status("vol_high")
+        elif "spread" in r:
+            self.status_text = self._short_status("spread")
+        elif "fee" in r:
+            self.status_text = self._short_status("fees")
+        elif "break" in r:
+            self.status_text = self._short_status("break")
+        elif "trend" in r:
+            self.status_text = self._short_status("trend")
+        elif "mean" in r or "bands" in r or "pullback" in r:
+            self.status_text = self._short_status("pullback")
+        else:
+            self.status_text = self._short_status("waiting")
