@@ -1,7 +1,7 @@
 """Data models for the Ultimate Bot backend — Strategy V3 Dynamic."""
 
 from pydantic import BaseModel, Field
-from typing import Literal, Optional, List
+from typing import Literal, Optional, List, Dict, Any
 
 Side = Literal["long", "short"]
 
@@ -32,6 +32,7 @@ class Position(BaseModel):
     scratch_after_sec: int = 240     # used for time‑scratch logic (scalper)
     opened_by: Optional[str] = None  # strategy label
     extra_scaled: bool = False       # RSI extreme extra scale‑out taken?
+    meta: Optional[Dict[str, Any]] = None  # telemetry snapshot at open
 
 
 class Trade(BaseModel):
@@ -42,6 +43,19 @@ class Trade(BaseModel):
     open_time: int
     close_time: int
     r_multiple: Optional[float] = None  # realized R at close (pnl / (qty*stop_dist))
+
+    # Optional telemetry fields (for §10 logs; UI table ignores them)
+    tf: Optional[str] = None
+    strategy: Optional[str] = None
+    regime: Optional[str] = None
+    vs: Optional[float] = None
+    ps: Optional[float] = None
+    spread_bps: Optional[float] = None
+    slip_est: Optional[float] = None
+    fee_to_tp: Optional[float] = None
+    score: Optional[float] = None
+    vol_multiple: Optional[float] = None
+    candle_type: Optional[str] = None
 
 
 class Settings(BaseModel):
