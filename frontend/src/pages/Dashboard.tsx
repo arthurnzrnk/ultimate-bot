@@ -1,7 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { getStatus, postSettings, getLogs } from '../api'
 
-type ProfileMode = 'LIGHT' | 'HEAVY' | 'AUTO'
 type LogLine = { ts: number; text: string }
 
 type Candle = {
@@ -20,11 +19,7 @@ export default function Dashboard() {
   const [data, setData] = useState<any>({
     history: [],
     candles: [],
-    profileMode: 'AUTO',
-    profileModeActive: 'LIGHT',
-    strategy: 'Adaptive Router',
-    autoTrade: false,   // OFF by default (changed from true)
-    scalpMode: true,
+    autoTrade: false,
   })
   const [dir, setDir] = useState<'up' | 'down' | null>(null)
   const lastShown = useRef<number | undefined>(undefined)
@@ -156,11 +151,7 @@ export default function Dashboard() {
       })
     })
 
-    // Guard bad ranges
-    if (!isFinite(lo) || !isFinite(hi) || hi <= lo) {
-      // Not enough valid data to render
-      return
-    }
+    if (!isFinite(lo) || !isFinite(hi) || hi <= lo) return
 
     const xPer = chartW / Math.max(1, Math.min(limit, n - start))
     const y = (p: number) => padT + (hi - p) * (chartH / Math.max(1e-8, (hi - lo)))
@@ -241,7 +232,6 @@ export default function Dashboard() {
 
     const candles = (data.candles || []) as Candle[]
 
-    // Guard: only draw when we truly have real history
     if (!Array.isArray(candles) || candles.length < 5) {
       const ctx = canvas.getContext('2d')
       if (!ctx) return
@@ -263,19 +253,10 @@ export default function Dashboard() {
   }, [data.candles, data.pos, barCount])
 
   // UI actions
-  async function toggleScalp() {
-    const next = !data.scalpMode
-    await postSettings({ scalpMode: next })
-    setData((d: any) => ({ ...d, scalpMode: next }))
-  }
   async function toggleAuto() {
     const next = !data.autoTrade
     await postSettings({ autoTrade: next })
     setData((d: any) => ({ ...d, autoTrade: next }))
-  }
-  async function setProfileMode(mode: ProfileMode) {
-    await postSettings({ profileMode: mode })
-    setData((d: any) => ({ ...d, profileMode: mode }))
   }
 
   const px = data?.price ?? null
@@ -287,18 +268,11 @@ export default function Dashboard() {
   const atrLine = (() => {
     const a = data.atrPct
     if (a == null) return null
-    const bandMin = data.atrBandMin
-    const bandMax = data.atrBandMax
-    const pct = typeof a === 'number' ? (a * 100) : null
-    const bmin = typeof bandMin === 'number' ? (bandMin * 100) : null
-    const bmax = typeof bandMax === 'number' ? (bandMax * 100) : null
-    return (pct != null && bmin != null && bmax != null)
-      ? `ATR%: ${fmt(pct, 2)}% (band ${fmt(bmin, 2)}–${fmt(bmax, 2)}%)`
-      : `ATR%: ${fmt((a || 0) * 100, 2)}%`
+    return `ATR%: ${fmt((a || 0) * 100, 2)}%`
   })()
 
+  // CONDITIONS: market only (no bot internals / no strategy name)
   const conditionsText = [
-    data.activeStrategy ?? data.strategy ?? '—',
     data.regime ? `Regime: ${data.regime}` : null,
     data.bias ? `Bias: ${data.bias}` : null,
     data.adx != null ? `ADX: ${fmt(data.adx, 0)}` : null,
@@ -320,7 +294,6 @@ export default function Dashboard() {
           </div>
         </div>
         <div className="header-chips">
-          <span className={`chip ${data.scalpMode ? 'green' : ''}`}>{data.scalpMode ? '1m' : '1h'}</span>
           <span className={`chip ${netLive ? 'green' : 'red'}`}>{netLive ? 'NET: LIVE' : 'NET: STALE'}</span>
         </div>
       </div>
@@ -331,7 +304,7 @@ export default function Dashboard() {
         </div>
         <div className="glass status-pill">
           <b>CONDITIONS:</b>&nbsp;&nbsp;{conditionsText || '—'}
-          <span className="cond-meta"> (P&amp;L today: {fmt(pnlToday, 2)}; fills {fills}/60)</span>
+          <span className="cond-meta"> (P&amp;L today: {fmt(pnlToday, 2)}; fills {fills})</span>
         </div>
       </div>
 
@@ -372,29 +345,10 @@ export default function Dashboard() {
 
         <div className="right-col">
           <section className="glass pcard">
-            <h2 className="card-title">Toggles</h2>
-            <button className={`btn-pill ${data.scalpMode ? 'on' : ''}`} onClick={toggleScalp}>
-              Mode: {data.scalpMode ? 'Scalper (1m)' : 'High‑Hit (1h)'}
-            </button>
+            <h2 className="card-title">Trading</h2>
             <button className={`btn-pill ${data.autoTrade ? 'on' : ''}`} onClick={toggleAuto}>
               Auto Trading is {data.autoTrade ? 'ON' : 'OFF'}
             </button>
-          </section>
-
-          <section className="glass pcard">
-            <h2 className="card-title">Profile Mode</h2>
-            <select
-              className="select"
-              value={(data.profileMode as ProfileMode) ?? 'AUTO'}
-              onChange={e => setProfileMode(e.target.value as ProfileMode)}
-            >
-              <option value="AUTO">AUTO (recommended)</option>
-              <option value="LIGHT">LIGHT</option>
-              <option value="HEAVY">HEAVY</option>
-            </select>
-            <div className="muted">
-              Active today: <b>{data.profileModeActive}</b>
-            </div>
           </section>
 
           <section className="glass pcard">
