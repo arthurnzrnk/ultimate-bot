@@ -16,20 +16,6 @@ from .base import Strategy, Signal
 from ..ta import ema, atr, adx, donchian, rsi, macd_line_signal
 
 
-def _macd_state(line, sig, i) -> str:
-    if i is None or i <= 0 or i >= len(line) or line[i] is None or sig[i] is None:
-        return "flat"
-    prev = (line[i - 1] or 0.0) - (sig[i - 1] or 0.0)
-    cur = (line[i] or 0.0) - (sig[i] or 0.0)
-    if prev <= 0 < cur or prev >= 0 > cur:
-        return "cross"
-    if cur > 0:
-        return "up"
-    if cur < 0:
-        return "down"
-    return "flat"
-
-
 def _opp_wick_ge_body(c: dict, side: str) -> bool:
     """Opposing wick at least the body length (used by H1 MR capitulation extension)."""
     body = abs(c["close"] - c["open"])
