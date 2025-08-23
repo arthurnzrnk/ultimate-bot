@@ -16,7 +16,7 @@ Highlights:
 
 from __future__ import annotations
 
-import asyncio, time, math
+import asyncio, time
 from datetime import datetime
 from statistics import median
 from typing import Any, Optional
