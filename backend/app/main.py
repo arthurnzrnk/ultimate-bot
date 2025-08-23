@@ -1,5 +1,6 @@
-"""API entry point (Strategy V3 Dynamic)."""
+"""API entry point (Strategy V3.4)."""
 
+from __future__ import annotations
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Body, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,7 +28,7 @@ async def lifespan(app: FastAPI):
         follow_redirects=True,
         timeout=httpx.Timeout(connect=3.0, read=2.5, write=2.5, pool=3.0),
         limits=httpx.Limits(max_keepalive_connections=100, max_connections=100),
-        headers={"User-Agent": "UltimateBot/3.0"},
+        headers={"User-Agent": "UltimateBot/3.4"},
     )
     await engine.start(client)
     try:
@@ -39,9 +40,9 @@ async def lifespan(app: FastAPI):
             pass
 
 
-app = FastAPI(title="Ultimate Bot API — V3", lifespan=lifespan)
+app = FastAPI(title="Ultimate Bot API — V3.4", lifespan=lifespan)
 
-# ---- CORS (use .env CORS_ORIGINS) ----
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins or ["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -65,14 +66,12 @@ def get_status() -> Status:
     pnl_today = sum([t.pnl for t in engine.broker.history if (t.close_time or t.open_time) >= sod])
     fills_today = sum(1 for t in engine.broker.history if (t.close_time or t.open_time) >= sod) + (1 if pos else 0)
 
-    # router telemetry
     reg = engine.router.last_regime
     bias = engine.router.last_bias
     adx = engine.router.last_adx
     atr = engine.router.last_atr_pct
     active = engine.router.last_strategy
 
-    # indicators for Conditions
     iC_m1 = len(engine.m1) - 2 if len(engine.m1) >= 2 else None
     iC_h1 = len(engine.h1) - 2 if len(engine.h1) >= 2 else None
 
@@ -92,6 +91,11 @@ def get_status() -> Status:
     rsi_m1 = engine._rsi_m1[iC_m1] if (engine._rsi_m1 and iC_m1 is not None and iC_m1 < len(engine._rsi_m1)) else None
     rsi_h1 = engine._rsi_h1[iC_h1] if (engine._rsi_h1 and iC_h1 is not None and iC_h1 < len(engine._rsi_h1)) else None
 
+    # Day-lock & fast-tape UI flags
+    taker_fails = len([t for t in engine._taker_fail_events if int(time.time()) - t <= settings.spec.FAST_TAPE_DISABLE_WINDOW_MIN * 60])
+    day_lock_armed = 1 if engine._day_lock_armed else 0
+    day_lock_floor = engine._day_lock_floor_pct
+
     return Status(
         price=_fmt(engine.price, 2),
         bid=_fmt(engine.bid, 2),
@@ -101,31 +105,19 @@ def get_status() -> Status:
         pos=pos,
         history=engine.broker.history[-100:],
         candles=[c for c in engine.m1[-150:]],
-
-        strategy="Strategy V3 — Dynamic",
+        strategy="Strategy V3.4",
         activeStrategy=active,
-
-        regime=reg,
-        bias=bias,
-        adx=_fmt(adx, 0),
-        atrPct=_fmt(atr, 4),
-        rsiM1=_fmt(rsi_m1, 1),
-        rsiH1=_fmt(rsi_h1, 1),
-        macdM1=macd_m1_state,
-        macdH1=macd_h1_state,
-
-        fillsToday=fills_today,
-        pnlToday=_fmt(pnl_today, 2) or 0.0,
-        unrealNet=_fmt(unreal, 2) or 0.0,
-
-        vs=_fmt(engine.VS, 2),
-        ps=_fmt(engine.PS, 2),
-        lossStreak=_fmt(engine._loss_streak, 1) or 0.0,
-        spreadBps=_fmt(engine._last_spread_bps, 2),
-        feeToTp=_fmt(engine._last_fee_to_tp, 3),
-        slipEst=_fmt(engine._last_slip_est, 2),
-        top3DepthNotional=_fmt(engine._synthetic_top3_notional, 0),
-
+        regime=reg, bias=bias, adx=_fmt(adx, 0), atrPct=_fmt(atr, 4),
+        rsiM1=_fmt(rsi_m1, 1), rsiH1=_fmt(rsi_h1, 1),
+        macdM1=macd_m1_state, macdH1=macd_h1_state,
+        fillsToday=fills_today, pnlToday=_fmt(pnl_today, 2) or 0.0, unrealNet=_fmt(unreal, 2) or 0.0,
+        vs=_fmt(engine.VS, 2), ps=_fmt(engine.PS, 2), lossStreak=_fmt(engine._loss_streak, 1) or 0.0,
+        spreadBps=_fmt(engine._last_spread_bps, 2), feeToTp=_fmt(engine._last_fee_to_tp, 3),
+        slipEst=_fmt(engine._last_slip_est, 2), top3DepthNotional=_fmt(engine._synthetic_top3_notional, 0),
+        dayLockArmed=day_lock_armed, dayLockFloorPct=_fmt(day_lock_floor, 2),
+        redDayLevel=1 if engine._day_pnl_pct() <= settings.spec.RED_DAY_L1_PCT else (2 if engine._day_pnl_pct() <= settings.spec.RED_DAY_L2_PCT else 0),
+        fastTapeDisabled=1 if (int(time.time()) < engine._fast_tape_disabled_until) else 0,
+        takerFailCount30m=taker_fails,
         autoTrade=bool(engine.settings.get("auto_trade", False)),
     )
 
@@ -141,7 +133,7 @@ def update_settings(payload: dict = Body(...)) -> dict:
         on = bool(payload["macroPause"])
         engine.settings["macro_pause"] = on
         if on:
-            engine._macro_until = int(time.time()) + 1800
+            engine._macro_until = int(time.time()) + settings.spec.MACRO_PAUSE_MIN * 60
     if "autoTrade" in payload:
         on = bool(payload["autoTrade"])
         engine.settings["auto_trade"] = on
@@ -163,7 +155,7 @@ def stop_bot() -> dict:
     return {"ok": True}
 
 
-# ---- API keys (frontend expects this; store server-side only) ----
+# Server-side API key bucket (kept for UI compatibility)
 _api_keys_store = {"apiKey": "", "apiSecret": ""}
 
 @app.post("/apikeys")
@@ -171,8 +163,3 @@ def save_apikeys(payload: dict = Body(...)) -> dict:
     _api_keys_store["apiKey"] = str(payload.get("apiKey") or "")
     _api_keys_store["apiSecret"] = str(payload.get("apiSecret") or "")
     return {"ok": True}
-
-
-@app.get("/health")
-def health() -> dict:
-    return {"ok": True, "status": engine.status_text}
