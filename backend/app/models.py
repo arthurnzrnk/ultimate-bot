@@ -58,11 +58,6 @@ class Trade(BaseModel):
     candle_type: Optional[str] = None
 
 
-class Settings(BaseModel):
-    auto_trade: bool = False
-    macro_pause: bool = False
-
-
 class Status(BaseModel):
     # Prices
     price: Optional[float] = None
