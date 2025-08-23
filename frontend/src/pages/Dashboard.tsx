@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import { getStatus, postSettings, getLogs } from '../api'
 
 type LogLine = { ts: number; text: string }
@@ -107,8 +107,6 @@ export default function Dashboard() {
     return out
   }
 
-  const vwap = useMemo(() => buildSessionVWAPArray((data.candles || []) as Candle[]), [data.candles])
-
   function drawChart(
     canvas: HTMLCanvasElement,
     candles: Candle[],
@@ -190,13 +188,14 @@ export default function Dashboard() {
     // overlays
     overlays?.forEach(o => {
       if (!o.data) return
+      const n2 = o.data.length
       ctx.strokeStyle = o.color || '#fff'
       ctx.lineWidth = 1.6
       ctx.setLineDash(o.dashed ? [4, 3] : [])
       ctx.beginPath()
       let started = false
       let j = 0
-      for (let i = start; i < n && i < o.data.length; i++, j++) {
+      for (let i = start; i < n && i < n2; i++, j++) {
         const v = o.data[i]
         if (v == null) continue
         const xx = padL + j * xPer + xPer / 2
