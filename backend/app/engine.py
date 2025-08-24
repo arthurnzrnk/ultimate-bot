@@ -11,6 +11,11 @@ New in this edit (spec‑correctness hardening):
 - Spread‑instability block is now **m1‑only** for 3 minutes (H1 remains allowed).
 - If m1 is blocked (instability, bottom‑hour gate, or red‑day L1 top‑hours rule),
   we **fallback to H1** immediately (router re‑asked with preferTF='h1').
+
+Additional corrections (this commit):
+- Record the last time ANY H1 strategy produced a tradeable signal (for fallback timing).
+- Latency halt is **m1‑only** (30m), not a global pause.
+- Trail distance uses exact R‑units per spec (no extra VS multiplier).
 """
 
 from __future__ import annotations
@@ -100,8 +105,9 @@ class BotEngine:
         self._spread_std_10s: float | None = None
         self._spread_median_60s: float | None = None
 
-        # m1‑only instability gate (new)
-        self._m1_block_until: int = 0
+        # m1‑only blocks
+        self._m1_block_until: int = 0             # spread instability / rules
+        self._m1_latency_block_until: int = 0     # NEW: m1‑only latency halt window (30m)
 
         # top3 crumble tracking
         self._top3_hist: Deque[tuple[int, float]] = deque(maxlen=120)
@@ -304,13 +310,13 @@ class BotEngine:
                 # naive tick latency
                 self._tick_latency_ms_p95 = max(0.0, (t1 - t0) * 1000.0)
 
-                # latency guard: three hits over threshold → pause 30m
+                # latency guard: three hits over threshold → m1 pause 30m
                 if (self._tick_latency_ms_p95 or 0) > settings.spec.TICK_LATENCY_HALT_MS:
                     self._latency_hits_tick.append(int(t1))
                     wins = [t for t in self._latency_hits_tick if int(t1) - t <= 300]
                     if len(wins) >= 3:
-                        self._pause_until = int(time.time()) + 30 * 60
-                        self._log("Latency halt: tick p95 over limit thrice, pausing 30m")
+                        self._m1_latency_block_until = int(time.time()) + 30 * 60
+                        self._log("Latency halt: m1 paused 30m", set_status=False)
 
                 if (bid is not None) and (ask is not None):
                     self.bid, self.ask = bid, ask
@@ -397,7 +403,6 @@ class BotEngine:
                 self._log("Macro pause: volatility spike", set_status=False)
 
             # Spread instability: **m1-only** block for 3 minutes
-            # Gate becomes active as soon as ratio breaches; it persists until the deadline.
             if (self._spread_std_10s is not None) and (self._spread_median_60s is not None) and self._spread_median_60s > 0:
                 if (self._spread_std_10s / self._spread_median_60s) > settings.spec.SPREAD_STD_TO_MEDIAN_MAX:
                     if now >= self._m1_block_until:
@@ -530,6 +535,11 @@ class BotEngine:
             VS=self.VS, PS=self.PS, loss_streak=self._loss_streak, red_level=red_level,
         )
 
+        # helper: record when any H1 strategy produces a tradeable signal
+        def _record_h1_signal(sig: Optional[Signal]) -> None:
+            if sig and sig.tf == "h1" and sig.type != "WAIT":
+                self._last_h1_signal_ts = now
+
         # Base preference: m1 first if VS≥1.0
         order = ("m1", "h1") if self.VS >= 1.0 else ("h1", "m1")
 
@@ -537,21 +547,26 @@ class BotEngine:
         sig: Optional[Signal] = None
         first = order[0]; second = order[1]
         s = self._try_router(ctx.copy(), first, cooldown_ok_m1, cooldown_ok_h1)
+        _record_h1_signal(s)
         sig = s if s and s.type != "WAIT" else None
         if sig is None:
             s2 = self._try_router(ctx.copy(), second, cooldown_ok_m1, cooldown_ok_h1)
+            _record_h1_signal(s2)
             sig = s2 if s2 and s2.type != "WAIT" else None
             if sig is None:
                 return
 
-        # m1‑only blocks: spread instability window, bottom‑hours, or red‑day L1 top‑hours gate
+        # m1‑only blocks: spread instability window, bottom‑hours, red‑day L1 top‑hours gate, latency halt
         def need_block_m1_now(choice: Signal) -> Tuple[bool, str]:
             if choice.tf != "m1":
                 return False, ""
+            # latency halt active?
+            if now < self._m1_latency_block_until:
+                return True, "Latency halt (m1‑only)"
             # spread instability window active?
             if now < self._m1_block_until:
                 return True, "Spread instability window"
-            # bottom‑2 hours (placeholder buckets)
+            # bottom‑2 hours (placeholder buckets, UTC)
             hr = datetime.utcnow().hour
             if settings.spec.M1_BLOCK_BOTTOM_HOURS and hr in (5, 6):
                 return True, "Bottom-hour block"
@@ -564,6 +579,7 @@ class BotEngine:
         if blocked:
             # Try an immediate H1 alternative before giving up
             alt = self._try_router(ctx.copy(), "h1", cooldown_ok_m1, cooldown_ok_h1)
+            _record_h1_signal(alt)
             if alt and alt.type != "WAIT":
                 sig = alt
             else:
@@ -790,7 +806,8 @@ class BotEngine:
                 self._fee_violation_events.append(now)
                 last10m = [t for t in self._fee_violation_events if now - t <= 600]
                 if len(last10m) >= settings.spec.FEE_TP_VIOLATIONS_IN_10M:
-                    self._pause_until = now + settings.spec.PAUSE_AFTER_FEE_TP_BREAK_MIN * 60
+                    # m1-only pause for fee-bound breaker
+                    self._m1_latency_block_until = max(self._m1_latency_block_until, now + settings.spec.PAUSE_AFTER_FEE_TP_BREAK_MIN * 60)
                 self._log("Reject m1: fee_to_tp bound", set_status=False)
                 return
             tp_pct_dec_final = tp_pct_dec
@@ -971,7 +988,7 @@ class BotEngine:
                     if self.broker.pos:
                         self.broker.pos.extra_scaled = True
 
-        # Trail
+        # Trail (R-units exact; tighten on MACD fade)
         if self.broker.pos:
             tighten = False
             if p.tf == "m1":
@@ -983,12 +1000,12 @@ class BotEngine:
                 prev = (line[i - 1] or 0.0) - (sig[i - 1] or 0.0)
                 if (p.side == "long" and cur < prev) or (p.side == "short" and cur > prev):
                     tighten = True
-            k = (settings.spec.TRAIL_R_TIGHT_ON_MACD_FADE if tighten else settings.spec.TRAIL_R_VS) * self.VS
+            kR = settings.spec.TRAIL_R_TIGHT_ON_MACD_FADE if tighten else settings.spec.TRAIL_R_VS
             if p.side == "long":
-                new_stop = self.price - (k * R)
+                new_stop = self.price - (kR * R)
                 if new_stop > p.stop: p.stop = new_stop
             else:
-                new_stop = self.price + (k * R)
+                new_stop = self.price + (kR * R)
                 if new_stop < p.stop: p.stop = new_stop
             self.status_text = self._short_status("trailing")
 
@@ -1069,7 +1086,7 @@ class BotEngine:
             self.status_text = self._short_status("vol_low")
         elif "wild" in r or "macro" in r:
             self.status_text = self._short_status("vol_high")
-        elif "spread" in r or (now < self._m1_block_until):
+        elif "spread" in r or (now < self._m1_block_until) or (now < self._m1_latency_block_until):
             self.status_text = self._short_status("spread")
         elif "fee" in r:
             self.status_text = self._short_status("fees")
