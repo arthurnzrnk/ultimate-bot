@@ -8,15 +8,15 @@ body {
 /* Background */
 .bg { position: fixed; inset: 0; background: #0a0f1a; }
 
-/* Static glow from V2 (kept but dimmed by the dynamic glow we add on the page) */
+/* Static glow (dim) */
 .glow {
   position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
   width: 60vw; height: 60vw; border-radius: 9999px;
-  filter: blur(60px); opacity: 0.15;   /* lower so dynamic glow dominates */
+  filter: blur(60px); opacity: 0.15;
   background: linear-gradient(135deg, #fbbf24, #f59e0b, #ef4444);
 }
 
-/* Dynamic V1-style glow (tone changes with bot state) */
+/* Dynamic glow (state‑tinted) */
 .glow-dynamic {
   position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
   width: 60vw; height: 60vw; border-radius: 9999px;
@@ -30,12 +30,12 @@ body {
 /* Header */
 .app-header {
   display: flex; justify-content: space-between; align-items: center;
-  padding: 12px 16px;
+  padding: 12px 16px; position: relative; z-index: 1;
 }
 .brand { font-weight: 800; letter-spacing: .2px; }
 .nav { display: flex; gap: 12px; }
 
-/* Glass look (heavier, like the old UI) */
+/* Glass look */
 .glass {
   position: relative; border-radius: 22px;
   background: rgba(220, 228, 255, 0.06);
@@ -86,9 +86,9 @@ body {
 .table th, .table td { padding: .35rem .5rem; border-top: 1px solid rgba(255,255,255,0.1); }
 .price-up { color: #86efac; }
 .price-down { color: #fca5a5; }
-.capitalize { text-transform: capitalize; }
+.capitalize, .cap { text-transform: capitalize; }
 
-/* Header card bits */
+/* Header card */
 .header-card {
   padding: 12px; display: flex; justify-content: space-between; align-items: center;
 }
@@ -105,45 +105,34 @@ body {
   height: 48px; display: flex; align-items: center; padding: 0 12px;
   font-weight: 600; border-radius: 18px;
 }
-.status-green { background: rgba(16,185,129,.16); border: 1px solid rgba(16,185,129,.35); }
-.status-red   { background: rgba(244,63,94,.18); border: 1px solid rgba(244,63,94,.35); }
-.cond-meta { margin-left: 6px; opacity: .8; font-weight: 400; }
+.status-green { background: rgba(16,185,129,0.16); border: 1px solid rgba(16,185,129,0.35); }
+.status-red   { background: rgba(244,63,94,0.18); border: 1px solid rgba(244,63,94,0.35); }
 
-/* Grid */
-.main-grid {
-  display: grid; grid-template-columns: 2fr 1fr; gap: 12px; margin-top: 12px;
-}
-.left-col { display: grid; gap: 12px; grid-template-rows: auto auto; }
-.right-col { display: grid; gap: 12px; grid-auto-rows: min-content; }
+/* Main grid */
+.main-grid { display: grid; grid-template-columns: 2fr 1fr; gap: 12px; margin-top: 12px; }
+.left-col { display: grid; gap: 12px; }
+.right-col { display: grid; gap: 12px; }
 
 /* Chart */
-.chart-wrap { overflow: hidden; }
-.chart { display: block; width: 100%; height: 420px; }
+.chart-wrap { height: 360px; padding: 10px; }
+.chart { width: 100%; height: 100%; display: block; }
 
 /* Cards */
-.card-title { font-size: .95rem; font-weight: 600; margin: 6px 0 8px; }
-.history-card { padding: 12px; max-height: 300px; overflow: auto; }
 .pcard { padding: 12px; }
+.history-card { padding: 12px; }
+.card-title { margin: 0 0 8px 0; font-weight: 600; }
+
+/* Account / position blocks */
+.acct-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .mini { padding: 10px; }
-.num-lg { font-weight: 800; font-size: 18px; }
-.muted { opacity: .8; font-size: 14px; }
-.muted-xs { opacity: .8; font-size: 12px; }
-.cap { text-transform: capitalize; }
+.num-lg { font-size: 20px; font-weight: 700; }
+.muted { opacity: 0.8; }
+.muted-xs { opacity: 0.7; font-size: 12px; }
 
-/* Account grid */
-.acct-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 6px; }
-.pos-grid {
-  display: grid; grid-template-columns: repeat(6, 1fr); gap: 6px;
-  font-size: 13px; margin-top: 10px;
-}
-.pos-grid > div > span { opacity: .8; display: block; }
-.pos-grid > div > b { font-weight: 700; }
+.pos-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-top: 8px; }
+.pos-grid span { display: block; font-size: 11px; opacity: 0.7; }
+.pos-grid b { display: block; font-size: 13px; }
 
-/* Select */
-.select {
-  width: 100%; background: transparent; color: #e5e7eb;
-  border: 1px solid rgba(255,255,255,0.28); border-radius: 12px;
-  padding: .5rem .7rem; margin-top: 6px;
-  outline: none;
-}
-.select:focus { border-color: #7dd3fc; }
+/* Links */
+a { color: #93c5fd; text-decoration: none; }
+a:hover { text-decoration: underline; }
