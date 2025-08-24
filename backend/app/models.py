@@ -84,7 +84,7 @@ class Trade(BaseModel):
 
     # Lifecycle
     partials: Optional[int] = None
-    pyramid_adds: Optional[str] = None
+    pyramid_adds: Optional[Dict[str, Any]] = None  # {count, size_R: [..], times: [..]}
     trail_events: Optional[int] = None
     win_R: Optional[float] = None
     loss_R: Optional[float] = None
@@ -102,6 +102,7 @@ class Trade(BaseModel):
     fast_tape_disabled: Optional[int] = None
     taker_fail_count_30m: Optional[int] = None
     latency_halt: Optional[int] = None
+    fee_breaker_pause: Optional[int] = None
     tick_p95_ms: Optional[float] = None
     order_ack_p95_ms: Optional[float] = None
     spread_instability_block: Optional[int] = None
