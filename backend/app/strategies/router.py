@@ -1,25 +1,7 @@
 """Router + Strategies for Strategy V3.4.
 
-- Regime: Trend / Breakout / Range with hysteresis (25/21 and 23).
-- Bias: EMA200(h1).
-- m1: Enhanced Level King (VWAP MR + asymmetric TP & A+ gating via meta).
-- h1: MR / Breakout / Trend-Following per spec.
-
-Hard micro gates for m1:
-  - Reclaim candle vol >= 2× median(20)
-  - Candlestick quality (engulfing/hammer, shooting-star)
-  - Spread <= 8 bps (if BBO exists)
-  - ATR% band [0.05%, 1.75%] × VS
-  - VWAP slope cap 0.050% × VS
-  - MTF alignment or CT exception (ADX_h1 < 20×VS and RSI_m1 extreme)
-  - z‑VWAP confirm
-
-Scoring:
-  +0.5 each: RSI extreme + favorable delta (proxy with RSI slope), MACD cross recent, h1 RSI extreme
-  +0.25 each (proxies for micro flow): spread stability, TOD boost, etc. (lightweight)
-  Threshold: 5.25 base; +0.50 when PS<0.4 or loss_streak=2; **+RED_DAY_L1_SCORE_ADD when red_level==1**.
-
-The engine finalizes fee-aware targets (asym/A+) using Signal.meta hints.
+Fix: m1 ATR% band now honors [0.05%, 1.75%] × VS exactly (no absolute clamp).
+Other logic unchanged.
 """
 
 from __future__ import annotations
@@ -67,11 +49,11 @@ class M1Scalp(Strategy):
         VS = float(ctx["VS"])
         PS = float(ctx["PS"])
 
-        # ATR% band (scaled by VS, then hard clamp)
+        # ATR% band (× VS exactly)
         a14 = atr(m1, 14)
         atr_pct = (a14[i] or 0.0) / max(1.0, px)
-        band_min = max(0.0005, 0.0005 * VS)
-        band_max = min(0.0175 * VS, 0.0175)
+        band_min = 0.0005 * VS   # 0.05% × VS
+        band_max = 0.0175 * VS   # 1.75% × VS
         if atr_pct < band_min or atr_pct > band_max:
             return Signal(type="WAIT", reason="ATR band")
 
@@ -137,8 +119,7 @@ class M1Scalp(Strategy):
         over_long = bool(vprev and (m1[i - 1]["low"] <= (vprev * (1 - 1.00 * band_pct))))
         over_short = bool(vprev and (m1[i - 1]["high"] >= (vprev * (1 + 1.00 * band_pct))))
 
-        # --- z‑VWAP confirm (Spec §2/§6A) ---
-        # z is computed on (close - vwap) over the last ZVWAP_STD_WINDOW_M1 bars
+        # --- z‑VWAP confirm ---
         W = settings.spec.ZVWAP_STD_WINDOW_M1
         if i < W:
             return Signal(type="WAIT", reason="zVWAP warmup")
@@ -180,7 +161,7 @@ class M1Scalp(Strategy):
         if rsi_h1_now is not None and rsi_h1_now < 30.0: score_long += 0.5
         if rsi_h1_now is not None and rsi_h1_now > 70.0: score_short += 0.5
 
-        # Light micro bonuses (proxies): spread stable + TOD (kept lightweight)
+        # Light micro bonuses (proxies)
         score_long += 0.25
         score_short += 0.25
 
@@ -189,13 +170,12 @@ class M1Scalp(Strategy):
         if PS < 0.4 or float(ctx.get("loss_streak", 0.0)) >= 2.0:
             min_score += 0.50  # 5.75
         if int(ctx.get("red_level", 0)) == 1:
-            min_score += settings.spec.RED_DAY_L1_SCORE_ADD  # harder on L1
+            min_score += settings.spec.RED_DAY_L1_SCORE_ADD
 
         # Bias + CT exception
         long_ok_bias = (ema_up or allow_ct_long)
         short_ok_bias = (ema_dn or allow_ct_short)
 
-        # If passes, emit signal with meta hints so engine can do asym/A+ fee math
         if over_long and reclaim_long and vol_ok and long_pat and long_ok_bias and z_ok_long and score_long >= min_score:
             tp_pct_raw = max(0.0015, 0.85 * band_pct) * (1.0 + 0.2 * max(0.0, VS - 1.0))
             dist = px * tp_pct_raw
@@ -429,7 +409,6 @@ class RouterV3(Strategy):
             sig.tf = sig.tf or "h1"; 
             if sig.type != "WAIT":
                 return sig
-            # pass loss_streak/red_level for m1 threshold raise
             ctx2 = dict(ctx); ctx2["loss_streak"] = ctx.get("loss_streak", 0.0)
             sig2 = self.m1.evaluate(ctx2)
             self.last_strategy = self.m1.name if sig2.type != "WAIT" else None
