@@ -16,6 +16,8 @@ Additional corrections (this commit):
 - Record the last time ANY H1 strategy produced a tradeable signal (for fallback timing).
 - Latency halt is **m1‑only** (30m), not a global pause.
 - Trail distance uses exact R‑units per spec (no extra VS multiplier).
+- Telemetry now includes `latency_halt` flag.
+- Lifecycle telemetry updates: we increment `partials` and `trail_events` live.
 """
 
 from __future__ import annotations
@@ -107,7 +109,7 @@ class BotEngine:
 
         # m1‑only blocks
         self._m1_block_until: int = 0             # spread instability / rules
-        self._m1_latency_block_until: int = 0     # NEW: m1‑only latency halt window (30m)
+        self._m1_latency_block_until: int = 0     # m1‑only latency halt window (30m)
 
         # top3 crumble tracking
         self._top3_hist: Deque[tuple[int, float]] = deque(maxlen=120)
@@ -589,7 +591,6 @@ class BotEngine:
 
         # --- execution continues with 'sig' (either m1 allowed now, or H1 fallback) ---
 
-        # Sizing & fee-aware targets
         if self.price is None or sig.stop_dist is None:
             return
 
@@ -810,7 +811,7 @@ class BotEngine:
                     self._m1_latency_block_until = max(self._m1_latency_block_until, now + settings.spec.PAUSE_AFTER_FEE_TP_BREAK_MIN * 60)
                 self._log("Reject m1: fee_to_tp bound", set_status=False)
                 return
-            tp_pct_dec_final = tp_pct_dec
+            tp_pct_dec_final = fee_to_tp and tp_pct_dec  # keep actual TP% we will use
 
         # Re-entry guard (must also have micro‑triad + (top‑hour or z‑VWAP confirm))
         if reentry_active:
@@ -856,12 +857,16 @@ class BotEngine:
             "taker_fail_count_30m": len([t for t in self._taker_fail_events if now - t <= settings.spec.FAST_TAPE_DISABLE_WINDOW_MIN * 60]),
             "tick_p95_ms": self._tick_latency_ms_p95,
             "order_ack_p95_ms": self._order_ack_p95_ms,
+            "latency_halt": int(now < self._m1_latency_block_until),     # NEW: explicit flag
             "spread_instability_block": int(now < self._m1_block_until),
             "top3_notional_drop_pct_3s": self._top3_notional_drop_3s,
             "cooldown_bonus_on": 0,
             "score": sig.score,
             "z_vwap": (sig.meta or {}).get("z_vwap"),
             "blocked_bottom_hour": 1 if (sig.tf == "m1" and datetime.utcnow().hour in (5, 6) and settings.spec.M1_BLOCK_BOTTOM_HOURS) else 0,
+            # lifecycle counters start at 0 so §11 fields are present
+            "partials": 0,
+            "trail_events": 0,
         }
 
         # Telemetry requirement sanity (must-have set for commit)
@@ -946,6 +951,9 @@ class BotEngine:
                 partial_frac = 0.25 if ("breakout" in (p.opened_by or "").lower() or "trend" in (p.opened_by or "").lower()) else 0.30
                 if p.tf == "m1": partial_frac = 0.60
             self.broker.partial_close(partial_frac, self.price, exit_type="partial")
+            # lifecycle telemetry: count partials
+            if self.broker.pos and self.broker.pos.meta is not None:
+                self.broker.pos.meta["partials"] = int((self.broker.pos.meta.get("partials") or 0)) + 1
             if self.broker.pos:
                 be_off = settings.spec.BE_BUFFER_R * R
                 self.broker.pos.stop = self.broker.pos.entry + (be_off if p.side == "long" else -be_off)
@@ -987,6 +995,8 @@ class BotEngine:
                     self.broker.partial_close(0.25, self.price, exit_type="scale")
                     if self.broker.pos:
                         self.broker.pos.extra_scaled = True
+                        if self.broker.pos.meta is not None:
+                            self.broker.pos.meta["partials"] = int((self.broker.pos.meta.get("partials") or 0)) + 1
 
         # Trail (R-units exact; tighten on MACD fade)
         if self.broker.pos:
@@ -1001,12 +1011,15 @@ class BotEngine:
                 if (p.side == "long" and cur < prev) or (p.side == "short" and cur > prev):
                     tighten = True
             kR = settings.spec.TRAIL_R_TIGHT_ON_MACD_FADE if tighten else settings.spec.TRAIL_R_VS
+            did_trail = False
             if p.side == "long":
                 new_stop = self.price - (kR * R)
-                if new_stop > p.stop: p.stop = new_stop
+                if new_stop > p.stop: p.stop = new_stop; did_trail = True
             else:
                 new_stop = self.price + (kR * R)
-                if new_stop < p.stop: p.stop = new_stop
+                if new_stop < p.stop: p.stop = new_stop; did_trail = True
+            if did_trail and self.broker.pos and self.broker.pos.meta is not None:
+                self.broker.pos.meta["trail_events"] = int((self.broker.pos.meta.get("trail_events") or 0)) + 1
             self.status_text = self._short_status("trailing")
 
         # Runner accel ratchet
@@ -1039,6 +1052,12 @@ class BotEngine:
         hit_take = (self.price >= p.take) if p.side == "long" else (self.price <= p.take)
         if hit_stop or hit_take:
             base_R_usd = p.qty * p.stop_dist
+            # mark win/loss flag into meta for logs before closing
+            if p.meta is not None:
+                if hit_take:
+                    p.meta["win_R"] = 1.0
+                else:
+                    p.meta["loss_R"] = -1.0
             net = self.broker.close(p.take if hit_take else self.price, exit_type=("take" if hit_take else "stop"))
             r_mult = (net / max(1e-9, base_R_usd)) if net is not None else 0.0
             self._last_Rs.append(r_mult); self._last_Rs = self._last_Rs[-20:]
