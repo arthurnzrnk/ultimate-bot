@@ -28,6 +28,11 @@ Additional corrections (this commit):
 **This file (PS idle-decay correction to match Spec §3):**
 - Track `_last_activity_ts` and decay PS toward 0.5 when idle ≥ `PS_DECAY_HOURS_IF_IDLE`.
 - Update `_last_activity_ts` on opens, partials/extra scales, scale‑ins, and final closes; reset on UTC rollover.
+
+**This file (hour-buckets + cooldown scope, Spec §§5,6,11):**
+- Dynamic hour buckets: derive TOP‑2 and BOTTOM‑2 hours from rolling median ATR% and median spread.
+- Use TOP‑2 for A+ gate and cooldown relax; block m1 in BOTTOM‑2 (H1 still allowed).
+- Reset cooldown-loss flags per hour and per day.
 """
 
 from __future__ import annotations
@@ -156,6 +161,7 @@ class BotEngine:
         self._last_open_m1: int = 0
         self._last_open_h1: int = 0
         self._lost_in_hour: dict[int, bool] = {}
+        self._last_hr_seen: Optional[int] = None
 
         # Latencies (placeholders)
         self._tick_latency_ms_p95: float | None = None
@@ -172,6 +178,14 @@ class BotEngine:
 
         # ---------- NEW: last activity tracking for PS decay ----------
         self._last_activity_ts: int = int(time.time())
+
+        # ---------- NEW: hour-bucket stats (dynamic top/bottom hours) ----------
+        self._hour_stats: dict[int, dict[str, Deque[float]]] = {
+            h: {"spreads": deque(maxlen=600), "atrpcts": deque(maxlen=400)} for h in range(24)
+        }
+        self._top2_hours: tuple[int, int] = (13, 14)   # fallback until enough data
+        self._bottom2_hours: tuple[int, int] = (5, 6)  # fallback until enough data
+        self._last_hour_computed: int = -1
 
     # --------- utils ---------
 
@@ -276,6 +290,37 @@ class BotEngine:
         if (now - (self._last_activity_ts or self._day_sod)) >= settings.spec.PS_DECAY_HOURS_IF_IDLE * 3600:
             # gentle pull 10% toward 0.5 each tick while idle
             self.PS += (0.5 - self.PS) * 0.10
+
+    # ---------- NEW: hour-bucket helpers ----------
+
+    def _record_hour_stats(self) -> None:
+        """Collect spread bps and ATR% into current UTC hour buckets."""
+        hr = datetime.utcnow().hour
+        if self._last_spread_bps is not None:
+            self._hour_stats[hr]["spreads"].append(self._last_spread_bps)
+        atrp = self._atr_pct_m1()
+        if atrp is not None:
+            self._hour_stats[hr]["atrpcts"].append(atrp)
+
+    def _recompute_hour_buckets(self) -> None:
+        """Compute dynamic top‑2 and bottom‑2 hours from rolling medians."""
+        scores: list[tuple[float, int]] = []
+        for h in range(24):
+            spreads = list(self._hour_stats[h]["spreads"])
+            atrs = list(self._hour_stats[h]["atrpcts"])
+            if len(spreads) >= 30 and len(atrs) >= 10:
+                med_spread = median(spreads)  # bps
+                med_atr = median(atrs)        # decimal (ATR%)
+                # Quality score: higher with higher ATR% and tighter spread
+                score = (med_atr * 10000.0) / max(1e-6, med_spread)
+                scores.append((score, h))
+        if len(scores) >= 4:
+            scores.sort(reverse=True)  # best first
+            top2 = (scores[0][1], scores[1][1])
+            bottom2 = (scores[-1][1], scores[-2][1])
+            # Keep them ordered for readability
+            self._top2_hours = tuple(sorted(top2))  # type: ignore
+            self._bottom2_hours = tuple(sorted(bottom2))  # type: ignore
 
     def _short_status(self, key: str) -> str:
         m = {
@@ -406,6 +451,7 @@ class BotEngine:
                 self._reentry_until_ts = 0
                 self._m1_fee_pause_until = 0
                 self._last_activity_ts = new_sod  # reset activity clock at SOD
+                self._lost_in_hour.clear()        # NEW: reset cooldown loss flags per day
                 self._log("New UTC day: counters reset", set_status=False)
 
             # VS/PS
@@ -429,6 +475,19 @@ class BotEngine:
                     if now >= self._m1_block_until:
                         self._log("Spread instability: m1 wait 3m", set_status=False)
                     self._m1_block_until = max(self._m1_block_until, now + 180)
+
+            # Hour bucket stats maintenance
+            self._record_hour_stats()
+            cur_hr = datetime.utcnow().hour
+            if cur_hr != (self._last_hr_seen if self._last_hr_seen is not None else cur_hr):
+                # Reset per-hour cooldown-loss flags on hour change
+                self._lost_in_hour.clear()
+                self._recompute_hour_buckets()
+            self._last_hr_seen = cur_hr
+            if cur_hr != self._last_hour_computed:
+                # at least recompute once on entering a new hour
+                self._recompute_hour_buckets()
+                self._last_hour_computed = cur_hr
 
             # Giveback guard
             if self.broker.equity > self._day_high_equity:
@@ -590,12 +649,12 @@ class BotEngine:
             # spread instability window active?
             if now < self._m1_block_until:
                 return True, "Spread instability window"
-            # bottom‑2 hours (placeholder buckets, UTC)
+            # bottom‑2 hours (dynamic buckets)
             hr = datetime.utcnow().hour
-            if settings.spec.M1_BLOCK_BOTTOM_HOURS and hr in (5, 6):
+            if settings.spec.M1_BLOCK_BOTTOM_HOURS and hr in self._bottom2_hours:
                 return True, "Bottom-hour block"
             # red‑day L1 “top hours only”
-            if red_level == 1 and settings.spec.RED_DAY_L1_TOP_HOURS_ONLY and hr not in (13, 14):
+            if red_level == 1 and settings.spec.RED_DAY_L1_TOP_HOURS_ONLY and hr not in self._top2_hours:
                 return True, "Red‑day L1 top-hours gate"
             return False, ""
 
@@ -679,9 +738,9 @@ class BotEngine:
 
             # A+ gate
             spread_abs = (self.ask - self.bid)
-            micro_triad_ok = bool((sig.meta or {}).get("micro_triad_ok", True))
+            micro_triad_ok = bool((sig.meta or {}).get("micro_triad_ok", False))
             regime = (self.router.last_regime or "Range").lower()
-            top2_hour = datetime.utcnow().hour in (13, 14)
+            top2_hour = datetime.utcnow().hour in self._top2_hours
             spread_to_R_pre = spread_abs / (2.0 * max(1e-9, R_prelim))
             a_plus_gate_on = int(
                 settings.spec.A_PLUS_TP_ENABLE
@@ -761,7 +820,7 @@ class BotEngine:
         if sig.tf == "m1":
             spread_abs = (self.ask - self.bid)
             spread_to_R = spread_abs / (2.0 * max(1e-9, R))
-            micro_triad_ok = bool((sig.meta or {}).get("micro_triad_ok", True))
+            micro_triad_ok = bool((sig.meta or {}).get("micro_triad_ok", False))
             consider_taker = (not fast_tape_disabled) \
                              and (macd_accel_ok if settings.spec.FAST_TAPE_NEED_MACD_ACCEL else True) \
                              and micro_triad_ok \
@@ -789,7 +848,7 @@ class BotEngine:
                     tp_pct_dec = take_dist / entry_price
                     round_trip_fee_pct = round_trip_fee_pct_base
                     self._taker_fail_events.append(now)
-                    # --- NEW: prune to 30m window and self‑throttle immediately per §8E ---
+                    # prune window & self‑throttle per §8E
                     while self._taker_fail_events and now - self._taker_fail_events[0] > settings.spec.FAST_TAPE_DISABLE_WINDOW_MIN * 60:
                         self._taker_fail_events.popleft()
                     if len(self._taker_fail_events) >= settings.spec.FAST_TAPE_DISABLE_AFTER_FAILS:
@@ -843,7 +902,7 @@ class BotEngine:
 
         # Re-entry guard (must also have micro‑triad + (top‑hour or z‑VWAP confirm))
         if reentry_active:
-            ok_top_hour = (datetime.utcnow().hour in (13, 14))
+            ok_top_hour = (datetime.utcnow().hour in self._top2_hours)
             zv = (sig.meta or {}).get("z_vwap")
             ok_z = (zv is not None)
             micro_ok = bool((sig.meta or {}).get("micro_triad_ok", False))
@@ -892,7 +951,7 @@ class BotEngine:
             "cooldown_bonus_on": 0,
             "score": sig.score,
             "z_vwap": (sig.meta or {}).get("z_vwap"),
-            "blocked_bottom_hour": 1 if (sig.tf == "m1" and datetime.utcnow().hour in (5, 6) and settings.spec.M1_BLOCK_BOTTOM_HOURS) else 0,
+            "blocked_bottom_hour": 1 if (sig.tf == "m1" and datetime.utcnow().hour in self._bottom2_hours and settings.spec.M1_BLOCK_BOTTOM_HOURS) else 0,
             # lifecycle counters and open‑time anchors
             "partials": 0,
             "trail_events": 0,
@@ -918,7 +977,7 @@ class BotEngine:
             # Cooldown relax in top hours (if clean tape + not already lost)
             if sig.tf == "m1":
                 hr = datetime.utcnow().hour
-                in_top = hr in (13, 14)
+                in_top = hr in self._top2_hours
                 spread_to_R_for_cd = meta["spread_to_stop_ratio"]
                 slip_R_for_cd = (self._last_slip_est or 0)/max(1e-9, R)
                 if in_top and (spread_to_R_for_cd <= settings.spec.COOLDOWN_TOP_HOUR_GATE["spread_to_stop_max"]) \
