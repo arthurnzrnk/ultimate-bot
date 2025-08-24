@@ -372,40 +372,30 @@ export default function Dashboard() {
                 <div><span>Entry</span><b>${fmt(data.pos.entry, 2)}</b></div>
                 <div><span>Stop</span><b>${fmt(data.pos.stop, 2)}</b></div>
                 <div><span>Take</span><b>${fmt(data.pos.take, 2)}</b></div>
+                <div><span>1R ($)</span><b>${fmt(data.pos.stop_dist, 2)}</b></div>
+                <div><span>BE?</span><b>{data.pos.be ? 'Yes' : 'No'}</b></div>
               </div>
-            ) : <div className="muted-xs" style={{ marginTop: 8 }}>No open position.</div>}
+            ) : (
+              <div className="muted">No open position.</div>
+            )}
           </section>
 
           <section className="glass pcard">
-            <h2 className="card-title">Bot Status Feed</h2>
-            {loadingLogs && logs.length === 0 ? (
-              <p className="muted">Loading logs…</p>
-            ) : logs.length === 0 ? (
-              <p className="muted">No logs yet. Engine events will show here.</p>
-            ) : (
-              <div
-                ref={logBoxRef}
-                style={{
-                  maxHeight: 420,
-                  overflow: 'auto',
-                  padding: 8,
-                  borderRadius: 12,
-                  background: 'rgba(0,0,0,0.25)',
-                  border: '1px solid rgba(255,255,255,0.12)',
-                }}
-              >
-                <ul style={{ listStyleType: 'none', paddingLeft: 0, margin: 0 }}>
-                  {logs.map((l, idx) => (
-                    <li key={idx} style={{ padding: '4px 0', fontSize: 12, lineHeight: 1.3 }}>
-                      <span style={{ opacity: 0.6, marginRight: 8 }}>
-                        {new Date(l.ts * 1000).toLocaleTimeString()}
-                      </span>
-                      {l.text}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
+            <h2 className="card-title">Recent Logs</h2>
+            <div ref={logBoxRef} className="logbox">
+              {loadingLogs ? (
+                <div className="muted">Loading logs…</div>
+              ) : logs.length === 0 ? (
+                <div className="muted">No logs yet.</div>
+              ) : (
+                logs.map((l, idx) => (
+                  <div key={idx} className="logline">
+                    <span className="ts">{new Date(l.ts * 1000).toLocaleTimeString()}</span>
+                    <span className="txt">{l.text}</span>
+                  </div>
+                ))
+              )}
+            </div>
           </section>
         </div>
       </div>
