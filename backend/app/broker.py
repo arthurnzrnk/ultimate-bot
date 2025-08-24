@@ -65,6 +65,20 @@ class PaperBroker:
             },
         )
 
+    # --- new: scale-in for pyramids (keeps stop/take intact) ---
+    def scale_in(self, add_qty: float, add_entry: float) -> None:
+        if not self.pos or add_qty <= 0:
+            return
+        p = self.pos
+        # volume-weighted average entry
+        new_qty = p.qty + add_qty
+        p.entry = (p.entry * p.qty + add_entry * add_qty) / max(1e-9, new_qty)
+        p.qty = new_qty
+        p.hi = max(p.hi, add_entry)
+        p.lo = min(p.lo, add_entry)
+        # recompute 1R in $ vs new averaged entry distance to current stop
+        p.stop_dist = abs(p.entry - p.stop)
+
     def _close_amount(self, qty_to_close: float, px: float) -> float:
         if not self.pos or qty_to_close <= 0:
             return 0.0
@@ -90,6 +104,7 @@ class PaperBroker:
                 regime=meta.get("regime"),
                 vs=meta.get("VS"),
                 ps=meta.get("PS"),
+                loss_streak=meta.get("loss_streak"),  # keep streak snapshot
                 spread_bps=meta.get("spread_bps"),
                 spread_std_10s=meta.get("spread_std_10s"),
                 spread_median_60s=meta.get("spread_median_60s"),
