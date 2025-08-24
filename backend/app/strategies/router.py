@@ -17,7 +17,7 @@ Hard micro gates for m1:
 Scoring:
   +0.5 each: RSI extreme + favorable delta (proxy with RSI slope), MACD cross recent, h1 RSI extreme
   +0.25 each (proxies for micro flow): spread stability, TOD boost, etc. (lightweight)
-  Threshold: 5.25 base; 5.75 when PS<0.4 or loss_streak=2
+  Threshold: 5.25 base; +0.50 when PS<0.4 or loss_streak=2; **+RED_DAY_L1_SCORE_ADD when red_level==1**.
 
 The engine finalizes fee-aware targets (asym/A+) using Signal.meta hints.
 """
@@ -90,7 +90,7 @@ class M1Scalp(Strategy):
         if bid and ask:
             mid = (bid + ask) / 2.0
             spread_bps = ((ask - bid) / max(1e-9, mid)) * 10000.0
-            if spread_bps > 8.0:
+            if spread_bps > settings.spread_cap_bps_m1:
                 return Signal(type="WAIT", reason="Spread")
 
         # MTF bias on h1 EMA200 with CT exception
@@ -180,13 +180,16 @@ class M1Scalp(Strategy):
         if rsi_h1_now is not None and rsi_h1_now < 30.0: score_long += 0.5
         if rsi_h1_now is not None and rsi_h1_now > 70.0: score_short += 0.5
 
-        # Light micro bonuses (proxies): spread stable + TOD (we let the engine mark top-hour; we just nudge base)
+        # Light micro bonuses (proxies): spread stable + TOD (kept lightweight)
         score_long += 0.25
         score_short += 0.25
 
+        # Threshold with red-day add
         min_score = 5.25
-        if PS < 0.4 or float(ctx["loss_streak"]) >= 2.0:
-            min_score = 5.75
+        if PS < 0.4 or float(ctx.get("loss_streak", 0.0)) >= 2.0:
+            min_score += 0.50  # 5.75
+        if int(ctx.get("red_level", 0)) == 1:
+            min_score += settings.spec.RED_DAY_L1_SCORE_ADD  # harder on L1
 
         # Bias + CT exception
         long_ok_bias = (ema_up or allow_ct_long)
@@ -422,9 +425,11 @@ class RouterV3(Strategy):
         # Range: try preferred TF first
         if prefer == "h1":
             sig = self.h1_mr.evaluate(ctx)
+            self.last_strategy = self.h1_mr.name if sig.type != "WAIT" else None
+            sig.tf = sig.tf or "h1"; 
             if sig.type != "WAIT":
-                self.last_strategy = self.h1_mr.name; sig.tf = sig.tf or "h1"; return sig
-            # pass loss_streak for m1 threshold raise
+                return sig
+            # pass loss_streak/red_level for m1 threshold raise
             ctx2 = dict(ctx); ctx2["loss_streak"] = ctx.get("loss_streak", 0.0)
             sig2 = self.m1.evaluate(ctx2)
             self.last_strategy = self.m1.name if sig2.type != "WAIT" else None
