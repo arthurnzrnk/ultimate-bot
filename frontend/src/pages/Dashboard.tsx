@@ -119,7 +119,7 @@ export default function Dashboard() {
 
     const W = canvas.clientWidth
     const H = canvas.clientHeight
-    const dpr = Math.max(1, window.devicePixelRatio || 1)
+    const dpr = Math.max(1, (window.devicePixelRatio || 1))
     if (canvas.width !== Math.floor(W * dpr)) canvas.width = Math.floor(W * dpr)
     if (canvas.height !== Math.floor(H * dpr)) canvas.height = Math.floor(H * dpr)
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
@@ -396,11 +396,11 @@ export default function Dashboard() {
               >
                 <ul style={{ listStyleType: 'none', paddingLeft: 0, margin: 0 }}>
                   {logs.map((l, idx) => (
-                    <li key={idx} style={{ marginBottom: 6, fontSize: 14 }}>
-                      <span style={{ opacity: 0.7, marginRight: 8 }}>
+                    <li key={idx} style={{ padding: '4px 0', fontSize: 12, lineHeight: 1.3 }}>
+                      <span style={{ opacity: 0.6, marginRight: 8 }}>
                         {new Date(l.ts * 1000).toLocaleTimeString()}
                       </span>
-                      <span>{l.text}</span>
+                      {l.text}
                     </li>
                   ))}
                 </ul>
