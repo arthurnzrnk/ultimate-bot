@@ -115,7 +115,8 @@ def get_status() -> Status:
         spreadBps=_fmt(engine._last_spread_bps, 2), feeToTp=_fmt(engine._last_fee_to_tp, 3),
         slipEst=_fmt(engine._last_slip_est, 2), top3DepthNotional=_fmt(engine._synthetic_top3_notional, 0),
         dayLockArmed=day_lock_armed, dayLockFloorPct=_fmt(day_lock_floor, 2),
-        redDayLevel=1 if engine._day_pnl_pct() <= settings.spec.RED_DAY_L1_PCT else (2 if engine._day_pnl_pct() <= settings.spec.RED_DAY_L2_PCT else 0),
+        # FIX: compute L2 before L1 so L2 can show
+        redDayLevel=2 if engine._day_pnl_pct() <= settings.spec.RED_DAY_L2_PCT else (1 if engine._day_pnl_pct() <= settings.spec.RED_DAY_L1_PCT else 0),
         fastTapeDisabled=1 if (int(time.time()) < engine._fast_tape_disabled_until) else 0,
         takerFailCount30m=taker_fails,
         autoTrade=bool(engine.settings.get("auto_trade", False)),
