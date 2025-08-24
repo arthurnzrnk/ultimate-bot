@@ -372,26 +372,41 @@ export default function Dashboard() {
                 <div><span>Entry</span><b>${fmt(data.pos.entry, 2)}</b></div>
                 <div><span>Stop</span><b>${fmt(data.pos.stop, 2)}</b></div>
                 <div><span>Take</span><b>${fmt(data.pos.take, 2)}</b></div>
-                <div><span>1R ($)</span><b>${fmt(data.pos.stop_dist, 2)}</b></div>
-                <div><span>BE?</span><b>{data.pos.be ? 'Yes' : 'No'}</b></div>
+                <div><span>1R ($)</span><b>{fmt(data.pos.stop_dist, 2)}</b></div>
+                <div><span>BE?</span><b>{data.pos.be ? 'yes' : 'no'}</b></div>
               </div>
             ) : (
-              <div className="muted">No open position.</div>
+              <div className="muted-xs" style={{ marginTop: 6 }}>No open position.</div>
             )}
           </section>
 
           <section className="glass pcard">
-            <h2 className="card-title">Recent Logs</h2>
-            <div ref={logBoxRef} className="logbox">
+            <h2 className="card-title">Tape / Telemetry</h2>
+            <div className="tele-grid">
+              <div><span>Spread (bps)</span><b>{fmt(data.spreadBps, 2)}</b></div>
+              <div><span>Fee → TP</span><b>{fmt(data.feeToTp, 3)}</b></div>
+              <div><span>Slip Est ($)</span><b>{fmt(data.slipEst, 2)}</b></div>
+              <div><span>Top‑3 Depth ($)</span><b>{fmt(data.top3DepthNotional, 0)}</b></div>
+              <div><span>VS</span><b>{fmt(data.vs, 2)}</b></div>
+              <div><span>PS</span><b>{fmt(data.ps, 2)}</b></div>
+              <div><span>Red‑Day</span><b>{data.redDayLevel ?? 0}</b></div>
+              <div><span>Fast‑tape Disabled</span><b>{data.fastTapeDisabled ? 'yes' : 'no'}</b></div>
+              <div><span>Taker fails (30m)</span><b>{data.takerFailCount30m ?? 0}</b></div>
+            </div>
+          </section>
+
+          <section className="glass pcard">
+            <h2 className="card-title">Logs</h2>
+            <div ref={logBoxRef} className="log-box">
               {loadingLogs ? (
-                <div className="muted">Loading logs…</div>
+                <div className="muted-xs">Loading…</div>
               ) : logs.length === 0 ? (
-                <div className="muted">No logs yet.</div>
+                <div className="muted-xs">No logs yet.</div>
               ) : (
-                logs.map((l, idx) => (
-                  <div key={idx} className="logline">
-                    <span className="ts">{new Date(l.ts * 1000).toLocaleTimeString()}</span>
-                    <span className="txt">{l.text}</span>
+                logs.map((l, i) => (
+                  <div key={i} className="log-line">
+                    <span className="log-ts">{new Date(l.ts * 1000).toLocaleTimeString()}</span>
+                    <span className="log-txt">{l.text}</span>
                   </div>
                 ))
               )}
