@@ -33,6 +33,10 @@ Additional corrections (this commit):
 - Dynamic hour buckets: derive TOP‑2 and BOTTOM‑2 hours from rolling median ATR% and median spread.
 - Use TOP‑2 for A+ gate and cooldown relax; block m1 in BOTTOM‑2 (H1 still allowed).
 - Reset cooldown-loss flags per hour and per day.
+
+**This file (Spec §8B + §7 compliance):**
+- Risk sizing PS clamp now uses **min 0.5** when computing `eff_risk` (was 0.25).
+- Pyramids (Add‑1 / Add‑2) now pass micro gates: depth ≥ 2×, slip_R ≤ 0.30, spread_to_R ≤ 0.05.
 """
 
 from __future__ import annotations
@@ -692,7 +696,8 @@ class BotEngine:
         hh = datetime.utcnow().hour + datetime.utcnow().minute / 60.0
         tod_mult += (settings.spec.TOD_RISK_TILT / 100.0) * math.cos((hh - 12.0) / 24.0 * 2 * math.pi)
 
-        eff_risk = base_risk * _clamp(self.PS, 0.25, 1.0) * tod_mult
+        # ---- SPEC §8B: PS clamp at >= 0.5 when sizing risk ----
+        eff_risk = base_risk * _clamp(self.PS, 0.5, 1.0) * tod_mult
         if red_level == 1 and sig.tf == "m1":
             eff_risk *= settings.spec.RED_DAY_L1_RISK_MULT  # 0.35×
 
@@ -1053,30 +1058,43 @@ class BotEngine:
                 self.broker.pos.partial_taken = True
             self.status_text = self._short_status("partial")
 
-        # Add‑1 pyramid (after partial+BE)
+        # ---------- Add‑1 pyramid (after partial+BE) — must pass micro gates ----------
         if self.broker.pos and p.tf == "m1" and p.partial_taken and p.be:
             meta = (self.broker.pos.meta or {})
             adds = meta.get("pyramid_adds")
             already_add2 = isinstance(adds, dict) and (adds.get("count", 0) >= 2)
             already_add1 = isinstance(adds, dict) and (adds.get("count", 0) >= 1)
-            if not already_add1:
+            if not already_add1 and not already_add2:
                 equity = max(1e-9, float(self.broker.equity))
-                add_risk = min( (settings.spec.LIVE_RISK_CAP/100.0) - (p.stop_dist * p.qty)/equity, (settings.spec.BASE_RISK_PCT_M1/100.0) * 0.5 )
+                add_risk = min(
+                    (settings.spec.LIVE_RISK_CAP/100.0) - (p.stop_dist * p.qty)/equity,
+                    (settings.spec.BASE_RISK_PCT_M1/100.0) * 0.5
+                )
                 if add_risk > 0:
                     add_qty = (equity * add_risk) / max(1e-9, p.stop_dist)
                     if add_qty > 0:
-                        self.broker.scale_in(add_qty, self.price or p.entry)
-                        self._last_activity_ts = now  # NEW: scale-in is activity
-                        # Structured pyramid telemetry
-                        R0 = float(meta.get("final_stop_dist_R") or p.stop_dist)
-                        open_qty = float(meta.get("open_qty") or p.qty)
-                        add_R_usd = add_qty * p.stop_dist
-                        base_R_usd = max(1e-9, R0 * open_qty)
-                        size_R = add_R_usd / base_R_usd
-                        meta["pyramid_adds"] = {"count": 1, "size_R": [float(size_R)], "times": [now]}
-                        self.broker.pos.meta = meta  # persist
+                        # ---- micro gates for pyramid add ----
+                        top3_notional = self._synthetic_top3_notional
+                        order_notional_add = add_qty * (self.price or p.entry)
+                        spread_abs = (self.ask - self.bid)
+                        spread_to_R_add = spread_abs / (2.0 * max(1e-9, p.stop_dist))
+                        impact_add = settings.slip_coeff_k * (order_notional_add / max(1e-9, top3_notional)) * p.stop_dist if top3_notional > 0 else 0.0
+                        slip_est_add = (spread_abs / 2.0) + impact_add  # maker‑style add
+                        slip_R_add = slip_est_add / max(1e-9, p.stop_dist)
+                        depth_ok = top3_notional >= settings.top3x_order_notional_min * order_notional_add
+                        if depth_ok and slip_R_add <= 0.30 and spread_to_R_add <= 0.05:
+                            self.broker.scale_in(add_qty, self.price or p.entry)
+                            self._last_activity_ts = now  # NEW: scale-in is activity
+                            # Structured pyramid telemetry
+                            R0 = float(meta.get("final_stop_dist_R") or p.stop_dist)
+                            open_qty = float(meta.get("open_qty") or p.qty)
+                            add_R_usd = add_qty * p.stop_dist
+                            base_R_usd = max(1e-9, R0 * open_qty)
+                            size_R = add_R_usd / base_R_usd
+                            meta["pyramid_adds"] = {"count": 1, "size_R": [float(size_R)], "times": [now]}
+                            self.broker.pos.meta = meta  # persist
 
-        # Add‑2 pyramid (profit‑funded, after Add‑1)
+        # ---------- Add‑2 pyramid (profit‑funded, after Add‑1) — must pass micro gates ----------
         if self.broker.pos and p.tf == "m1":
             meta = (self.broker.pos.meta or {})
             adds = meta.get("pyramid_adds")
@@ -1089,18 +1107,28 @@ class BotEngine:
                 if unreal > needed_usd and add_risk > 0:
                     add_qty = (equity * add_risk) / max(1e-9, p.stop_dist)
                     if add_qty > 0:
-                        self.broker.scale_in(add_qty, self.price or p.entry)
-                        self._last_activity_ts = now  # NEW: scale-in is activity
-                        # Update structured telemetry
-                        R0 = float(meta.get("final_stop_dist_R") or p.stop_dist)
-                        open_qty = float(meta.get("open_qty") or p.qty)
-                        add_R_usd = add_qty * p.stop_dist
-                        base_R_usd = max(1e-9, R0 * open_qty)
-                        size_R = add_R_usd / base_R_usd
-                        meta["pyramid_adds"]["count"] = 2
-                        meta["pyramid_adds"]["size_R"].append(float(size_R))
-                        meta["pyramid_adds"]["times"].append(now)
-                        self.broker.pos.meta = meta  # persist
+                        # ---- micro gates for pyramid add ----
+                        top3_notional = self._synthetic_top3_notional
+                        order_notional_add = add_qty * (self.price or p.entry)
+                        spread_abs = (self.ask - self.bid)
+                        spread_to_R_add = spread_abs / (2.0 * max(1e-9, p.stop_dist))
+                        impact_add = settings.slip_coeff_k * (order_notional_add / max(1e-9, top3_notional)) * p.stop_dist if top3_notional > 0 else 0.0
+                        slip_est_add = (spread_abs / 2.0) + impact_add  # maker‑style add
+                        slip_R_add = slip_est_add / max(1e-9, p.stop_dist)
+                        depth_ok = top3_notional >= settings.top3x_order_notional_min * order_notional_add
+                        if depth_ok and slip_R_add <= 0.30 and spread_to_R_add <= 0.05:
+                            self.broker.scale_in(add_qty, self.price or p.entry)
+                            self._last_activity_ts = now  # NEW: scale-in is activity
+                            # Update structured telemetry
+                            R0 = float(meta.get("final_stop_dist_R") or p.stop_dist)
+                            open_qty = float(meta.get("open_qty") or p.qty)
+                            add_R_usd = add_qty * p.stop_dist
+                            base_R_usd = max(1e-9, R0 * open_qty)
+                            size_R = add_R_usd / base_R_usd
+                            meta["pyramid_adds"]["count"] = 2
+                            meta["pyramid_adds"]["size_R"].append(float(size_R))
+                            meta["pyramid_adds"]["times"].append(now)
+                            self.broker.pos.meta = meta  # persist
 
         # RSI extreme extra scale-out 25%
         if self.broker.pos and not self.broker.pos.extra_scaled:
