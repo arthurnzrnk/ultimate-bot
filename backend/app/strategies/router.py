@@ -6,6 +6,11 @@ Updates for full spec compliance:
 - Red‑day L1 scoring: add +RED_DAY_L1_SCORE_ADD to the computed score (per spec)
   instead of raising the threshold.
 - m1 ATR% band honors [0.05%, 1.75%] × VS exactly (already in place).
+
+NEW in this patch:
+- Implement a conservative **micro‑triad** gate for M1 Level King (used by A+ / re‑entry).
+- H1 Mean‑Reversion uses the spec’s distance tiers: 0.75 / 0.85 / 0.95 ATR
+  with deeper entry when ADX < 14 (and deepest when ADX < 10).
 """
 
 from __future__ import annotations
@@ -40,6 +45,33 @@ def _wick_shapes(c: dict) -> Tuple[float,float,float,float,float]:
     lo_wick = min(c["open"], c["close"]) - c["low"]
     close_pos = (c["close"] - c["low"]) / rng
     return rng, body, hi_wick, lo_wick, close_pos
+
+
+def _micro_triad_ok(m1, vwap, i: int, band_pct: float, side: str) -> bool:
+    """Conservative 3‑bar micro‑pattern used for A+ and re‑entry gates.
+       Long: overshoot below → reclaim above → confirm (close ≥ prev high).
+       Short: overshoot above → reclaim below → confirm (close ≤ prev low)."""
+    if i is None or i < 2:
+        return False
+    try:
+        c0 = m1[i]        # current bar
+        c1 = m1[i - 1]    # prior bar
+        c2 = m1[i - 2]    # overshoot bar
+        vw0 = vwap[i]; vw1 = vwap[i - 1]; vw2 = vwap[i - 2]
+        if vw0 is None or vw1 is None or vw2 is None:
+            return False
+        if side == "long":
+            over = (c2["low"] <= (vw2 * (1 - 1.00 * band_pct)))
+            reclaim = (c1["close"] >= vw1)
+            confirm = (c0["close"] >= c1["high"])
+            return bool(over and reclaim and confirm)
+        else:
+            over = (c2["high"] >= (vw2 * (1 + 1.00 * band_pct)))
+            reclaim = (c1["close"] <= vw1)
+            confirm = (c0["close"] <= c1["low"])
+            return bool(over and reclaim and confirm)
+    except Exception:
+        return False
 
 
 class M1Scalp(Strategy):
@@ -195,6 +227,10 @@ class M1Scalp(Strategy):
         long_ok_bias = (ema_up or allow_ct_long)
         short_ok_bias = (ema_dn or allow_ct_short)
 
+        # --- micro‑triad gate (for downstream A+ / re-entry usage) ---
+        mt_long = _micro_triad_ok(m1, ctx["vwap"], i, band_pct, "long")
+        mt_short = _micro_triad_ok(m1, ctx["vwap"], i, band_pct, "short")
+
         if over_long and reclaim_long and vol_ok and long_pat and long_ok_bias and z_ok_long and score_long >= min_score:
             tp_pct_raw = max(settings.spec.TP_PCT_FLOOR, settings.spec.TP_PCT_FROM_BAND_MULT * band_pct) * (1.0 + 0.2 * max(0.0, VS - 1.0))
             dist = px * tp_pct_raw
@@ -205,7 +241,7 @@ class M1Scalp(Strategy):
                 take_dist=dist,
                 score=score_long,
                 tf="m1",
-                meta={"band_pct": band_pct, "tp_pct_raw": tp_pct_raw, "micro_triad_ok": True, "z_vwap": float(z_cur) if z_cur is not None else None}
+                meta={"band_pct": band_pct, "tp_pct_raw": tp_pct_raw, "micro_triad_ok": bool(mt_long), "z_vwap": float(z_cur) if z_cur is not None else None}
             )
         if over_short and reclaim_short and vol_ok and short_pat and short_ok_bias and z_ok_short and score_short >= min_score:
             tp_pct_raw = max(settings.spec.TP_PCT_FLOOR, settings.spec.TP_PCT_FROM_BAND_MULT * band_pct) * (1.0 + 0.2 * max(0.0, VS - 1.0))
@@ -217,7 +253,7 @@ class M1Scalp(Strategy):
                 take_dist=dist,
                 score=score_short,
                 tf="m1",
-                meta={"band_pct": band_pct, "tp_pct_raw": tp_pct_raw, "micro_triad_ok": True, "z_vwap": float(z_cur) if z_cur is not None else None}
+                meta={"band_pct": band_pct, "tp_pct_raw": tp_pct_raw, "micro_triad_ok": bool(mt_short), "z_vwap": float(z_cur) if z_cur is not None else None}
             )
 
         return Signal(type="WAIT", reason="Inside bands")
@@ -243,10 +279,14 @@ class H1MeanReversion(Strategy):
         if atr_abs <= 0:
             return Signal(type="WAIT", reason="ATR warmup")
 
-        # deeper entry if ADX<14
-        k_entry = 0.75
-        if (ax[i] or 0.0) < 14.0:
+        # Distance tiers per spec (deeper when ADX < 14; deepest when ADX < 10)
+        adx_now = (ax[i] or 0.0)
+        if adx_now < 10.0:
+            k_entry = 0.95
+        elif adx_now < 14.0:
             k_entry = 0.85
+        else:
+            k_entry = 0.75
 
         dist = px - mid
         side: Optional[str] = None
