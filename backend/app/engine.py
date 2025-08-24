@@ -18,6 +18,12 @@ Additional corrections (this commit):
 - Trail distance uses exact R‑units per spec (no extra VS multiplier).
 - Telemetry now includes `latency_halt` flag.
 - Lifecycle telemetry updates: we increment `partials` and `trail_events` live.
+
+**This commit (V3.4 compliance touch‑ups):**
+- Introduce a separate fee‑breaker pause window (`_m1_fee_pause_until`) distinct from latency halts.
+- Block m1 with reason "Fee‑breaker pause" when active; H1 still allowed.
+- Upgrade `pyramid_adds` telemetry to structured `{count, size_R, times}`.
+- Carry explicit `fee_breaker_pause` flag in per‑trade telemetry.
 """
 
 from __future__ import annotations
@@ -95,7 +101,7 @@ class BotEngine:
         self._macro_until: int = 0
         self._fee_violation_events: Deque[int] = deque(maxlen=10)
 
-        # Taker throttle
+        # Fast-tape taker throttle
         self._taker_fail_events: Deque[int] = deque(maxlen=10)
         self._fast_tape_disabled_until: int = 0
 
@@ -109,7 +115,8 @@ class BotEngine:
 
         # m1‑only blocks
         self._m1_block_until: int = 0             # spread instability / rules
-        self._m1_latency_block_until: int = 0     # m1‑only latency halt window (30m)
+        self._m1_latency_block_until: int = 0     # m1 latency halt window (30m)
+        self._m1_fee_pause_until: int = 0         # m1 fee‑breaker pause (30m on ≥3 breaks in 10m)
 
         # top3 crumble tracking
         self._top3_hist: Deque[tuple[int, float]] = deque(maxlen=120)
@@ -387,6 +394,7 @@ class BotEngine:
                 self._fallback_session_open = False
                 self._fallback_prev_nonneg = False
                 self._reentry_until_ts = 0
+                self._m1_fee_pause_until = 0
                 self._log("New UTC day: counters reset", set_status=False)
 
             # VS/PS
@@ -558,10 +566,13 @@ class BotEngine:
             if sig is None:
                 return
 
-        # m1‑only blocks: spread instability window, bottom‑hours, red‑day L1 top‑hours gate, latency halt
+        # m1‑only blocks: fee‑breaker pause, spread instability window, bottom‑hours, red‑day L1 top‑hours gate, latency halt
         def need_block_m1_now(choice: Signal) -> Tuple[bool, str]:
             if choice.tf != "m1":
                 return False, ""
+            # fee‑breaker pause active?
+            if now < self._m1_fee_pause_until:
+                return True, "Fee‑breaker pause (m1)"
             # latency halt active?
             if now < self._m1_latency_block_until:
                 return True, "Latency halt (m1‑only)"
@@ -730,7 +741,8 @@ class BotEngine:
         idx = len(self.m1) - 2
         macd_hist_now = ((macd_l[idx] or 0.0) - (macd_s[idx] or 0.0)) if (sig.tf == "m1" and macd_l and macd_s and idx is not None and idx < len(macd_l)) else 0.0
         macd_hist_prev = ((macd_l[idx - 1] or 0.0) - (macd_s[idx - 1] or 0.0)) if (sig.tf == "m1" and macd_l and macd_s and idx and idx-1 < len(macd_l)) else 0.0
-        macd_accel_ok = (macd_hist_prev != 0 and macd_hist_now >= settings.spec.RUNNER_ACCEL_MACD_MULT * macd_hist_prev)
+        # Accel gate (sign‑agnostic; requires magnitude increase by RUNNER_ACCEL_MACD_MULT)
+        macd_accel_ok = (macd_hist_prev != 0 and abs(macd_hist_now) >= settings.spec.RUNNER_ACCEL_MACD_MULT * abs(macd_hist_prev))
 
         consider_taker = False
         spread_to_R = None
@@ -807,11 +819,11 @@ class BotEngine:
                 self._fee_violation_events.append(now)
                 last10m = [t for t in self._fee_violation_events if now - t <= 600]
                 if len(last10m) >= settings.spec.FEE_TP_VIOLATIONS_IN_10M:
-                    # m1-only pause for fee-bound breaker
-                    self._m1_latency_block_until = max(self._m1_latency_block_until, now + settings.spec.PAUSE_AFTER_FEE_TP_BREAK_MIN * 60)
+                    # m1-only pause for fee-bound breaker (separate from latency)
+                    self._m1_fee_pause_until = max(self._m1_fee_pause_until, now + settings.spec.PAUSE_AFTER_FEE_TP_BREAK_MIN * 60)
                 self._log("Reject m1: fee_to_tp bound", set_status=False)
                 return
-            tp_pct_dec_final = fee_to_tp and tp_pct_dec  # keep actual TP% we will use
+            tp_pct_dec_final = tp_pct_dec  # keep actual TP% we will use
 
         # Re-entry guard (must also have micro‑triad + (top‑hour or z‑VWAP confirm))
         if reentry_active:
@@ -857,16 +869,18 @@ class BotEngine:
             "taker_fail_count_30m": len([t for t in self._taker_fail_events if now - t <= settings.spec.FAST_TAPE_DISABLE_WINDOW_MIN * 60]),
             "tick_p95_ms": self._tick_latency_ms_p95,
             "order_ack_p95_ms": self._order_ack_p95_ms,
-            "latency_halt": int(now < self._m1_latency_block_until),     # NEW: explicit flag
+            "latency_halt": int(now < self._m1_latency_block_until),
+            "fee_breaker_pause": int(now < self._m1_fee_pause_until),
             "spread_instability_block": int(now < self._m1_block_until),
             "top3_notional_drop_pct_3s": self._top3_notional_drop_3s,
             "cooldown_bonus_on": 0,
             "score": sig.score,
             "z_vwap": (sig.meta or {}).get("z_vwap"),
             "blocked_bottom_hour": 1 if (sig.tf == "m1" and datetime.utcnow().hour in (5, 6) and settings.spec.M1_BLOCK_BOTTOM_HOURS) else 0,
-            # lifecycle counters start at 0 so §11 fields are present
+            # lifecycle counters and open‑time anchors
             "partials": 0,
             "trail_events": 0,
+            "open_qty": qty,
         }
 
         # Telemetry requirement sanity (must-have set for commit)
@@ -961,30 +975,52 @@ class BotEngine:
                 self.broker.pos.partial_taken = True
             self.status_text = self._short_status("partial")
 
-        # Add‑1 pyramid
-        if self.broker.pos and p.tf == "m1" and p.partial_taken and p.be and not (p.meta or {}).get("pyramid_adds"):
-            equity = max(1e-9, float(self.broker.equity))
-            add_risk = min( (settings.spec.LIVE_RISK_CAP/100.0) - (p.stop_dist * p.qty)/equity, (settings.spec.BASE_RISK_PCT_M1/100.0) * 0.5 )
-            if add_risk > 0:
-                add_qty = (equity * add_risk) / max(1e-9, p.stop_dist)
-                if add_qty > 0:
-                    self.broker.scale_in(add_qty, self.price or p.entry)
-                    if self.broker.pos and self.broker.pos.meta is not None:
-                        self.broker.pos.meta["pyramid_adds"] = "Add-1"
+        # Add‑1 pyramid (after partial+BE)
+        if self.broker.pos and p.tf == "m1" and p.partial_taken and p.be:
+            meta = (self.broker.pos.meta or {})
+            adds = meta.get("pyramid_adds")
+            already_add2 = isinstance(adds, dict) and (adds.get("count", 0) >= 2)
+            already_add1 = isinstance(adds, dict) and (adds.get("count", 0) >= 1)
+            if not already_add1:
+                equity = max(1e-9, float(self.broker.equity))
+                add_risk = min( (settings.spec.LIVE_RISK_CAP/100.0) - (p.stop_dist * p.qty)/equity, (settings.spec.BASE_RISK_PCT_M1/100.0) * 0.5 )
+                if add_risk > 0:
+                    add_qty = (equity * add_risk) / max(1e-9, p.stop_dist)
+                    if add_qty > 0:
+                        self.broker.scale_in(add_qty, self.price or p.entry)
+                        # Structured pyramid telemetry
+                        R0 = float(meta.get("final_stop_dist_R") or p.stop_dist)
+                        open_qty = float(meta.get("open_qty") or p.qty)
+                        add_R_usd = add_qty * p.stop_dist
+                        base_R_usd = max(1e-9, R0 * open_qty)
+                        size_R = add_R_usd / base_R_usd
+                        meta["pyramid_adds"] = {"count": 1, "size_R": [float(size_R)], "times": [now]}
+                        self.broker.pos.meta = meta  # persist
 
-        # Add‑2 pyramid (profit‑funded)
-        if self.broker.pos and p.tf == "m1" and (p.meta or {}).get("pyramid_adds") == "Add-1":
-            equity = max(1e-9, float(self.broker.equity))
-            unreal = self.broker.mark(self.price or p.entry)
-            avail_risk_cap = (settings.spec.LIVE_RISK_CAP/100.0) - (p.stop_dist * p.qty)/equity
-            add_risk = min(avail_risk_cap, (settings.spec.BASE_RISK_PCT_M1/100.0) * 0.5)
-            needed_usd = add_risk * equity
-            if unreal > needed_usd and add_risk > 0:
-                add_qty = (equity * add_risk) / max(1e-9, p.stop_dist)
-                if add_qty > 0:
-                    self.broker.scale_in(add_qty, self.price or p.entry)
-                    if self.broker.pos and self.broker.pos.meta is not None:
-                        self.broker.pos.meta["pyramid_adds"] = "Add-1+2"
+        # Add‑2 pyramid (profit‑funded, after Add‑1)
+        if self.broker.pos and p.tf == "m1":
+            meta = (self.broker.pos.meta or {})
+            adds = meta.get("pyramid_adds")
+            if isinstance(adds, dict) and adds.get("count", 0) == 1:
+                equity = max(1e-9, float(self.broker.equity))
+                unreal = self.broker.mark(self.price or p.entry)
+                avail_risk_cap = (settings.spec.LIVE_RISK_CAP/100.0) - (p.stop_dist * p.qty)/equity
+                add_risk = min(avail_risk_cap, (settings.spec.BASE_RISK_PCT_M1/100.0) * 0.5)
+                needed_usd = add_risk * equity
+                if unreal > needed_usd and add_risk > 0:
+                    add_qty = (equity * add_risk) / max(1e-9, p.stop_dist)
+                    if add_qty > 0:
+                        self.broker.scale_in(add_qty, self.price or p.entry)
+                        # Update structured telemetry
+                        R0 = float(meta.get("final_stop_dist_R") or p.stop_dist)
+                        open_qty = float(meta.get("open_qty") or p.qty)
+                        add_R_usd = add_qty * p.stop_dist
+                        base_R_usd = max(1e-9, R0 * open_qty)
+                        size_R = add_R_usd / base_R_usd
+                        meta["pyramid_adds"]["count"] = 2
+                        meta["pyramid_adds"]["size_R"].append(float(size_R))
+                        meta["pyramid_adds"]["times"].append(now)
+                        self.broker.pos.meta = meta  # persist
 
         # RSI extreme extra scale-out 25%
         if self.broker.pos and not self.broker.pos.extra_scaled:
@@ -1029,7 +1065,7 @@ class BotEngine:
             macd_hist_now = ((line[i] or 0.0) - (sig[i] or 0.0)) if (line and sig and i is not None and i < len(line)) else 0.0
             macd_hist_prev = ((line[i - 1] or 0.0) - (sig[i - 1] or 0.0)) if (line and sig and i and i-1 < len(line)) else 0.0
             ratchet_at = settings.spec.RUNNER_RATCHET_AT_R
-            if settings.spec.RUNNER_ACCEL_ENABLE and macd_hist_prev != 0 and macd_hist_now >= settings.spec.RUNNER_ACCEL_MACD_MULT * macd_hist_prev:
+            if settings.spec.RUNNER_ACCEL_ENABLE and macd_hist_prev != 0 and abs(macd_hist_now) >= settings.spec.RUNNER_ACCEL_MACD_MULT * abs(macd_hist_prev):
                 ratchet_at = min(ratchet_at, settings.spec.RUNNER_RATCHET_AT_R_ACCEL)
                 if self.broker.pos.meta:
                     self.broker.pos.meta["runner_ratchet_early"] = 1
@@ -1105,10 +1141,10 @@ class BotEngine:
             self.status_text = self._short_status("vol_low")
         elif "wild" in r or "macro" in r:
             self.status_text = self._short_status("vol_high")
+        elif "fee-breaker" in r or (now < self._m1_fee_pause_until):
+            self.status_text = self._short_status("fees")
         elif "spread" in r or (now < self._m1_block_until) or (now < self._m1_latency_block_until):
             self.status_text = self._short_status("spread")
-        elif "fee" in r:
-            self.status_text = self._short_status("fees")
         elif "trend" in r:
             self.status_text = self._short_status("trend")
         elif "break" in r:
