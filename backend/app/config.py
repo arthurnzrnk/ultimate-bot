@@ -64,7 +64,8 @@ class Settings(BaseModel):
         MACD_SLOW: int = 26
         MACD_SIGNAL: int = 9
 
-        # z‑VWAP
+        # z‑VWAP / slope config
+        VWAP_EMA10_ON_TYPICAL: bool = True  # NEW: run slope cap on EMA10(Typical) per §6(A)
         ZVWAP_STD_WINDOW_M1: int = 40
         Z_MIN: float = 1.0
 
@@ -94,7 +95,7 @@ class Settings(BaseModel):
         # m1 banding
         SCALPER_ATR_PCT_MIN: float = 0.0005   # 0.05%
         SCALPER_ATR_PCT_MAX: float = 0.0175   # 1.75%
-        VWAP_SLOPE_CAP_PCT: float = 0.0005    # × VS
+        VWAP_SLOPE_CAP_PCT: float = 0.0005    # × VS (0.050%)
         BAND_PCT_MIN: float = 0.0015          # 0.15%
         BAND_PCT_ATR_MULT: float = 0.75
         TP_PCT_FLOOR: float = 0.0015          # 0.15%
