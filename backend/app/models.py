@@ -51,6 +51,7 @@ class Trade(BaseModel):
     regime: Optional[str] = None
     vs: Optional[float] = None
     ps: Optional[float] = None
+    loss_streak: Optional[float] = None  # <-- added
 
     # Micro
     spread_bps: Optional[float] = None
@@ -104,7 +105,6 @@ class Trade(BaseModel):
     tick_p95_ms: Optional[float] = None
     order_ack_p95_ms: Optional[float] = None
     spread_instability_block: Optional[int] = None
-    top3_crumble_block: Optional[int] = None
     top3_notional_drop_pct_3s: Optional[float] = None
     cooldown_bonus_on: Optional[int] = None
 
