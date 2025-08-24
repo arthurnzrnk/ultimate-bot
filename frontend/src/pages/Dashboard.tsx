@@ -280,6 +280,10 @@ export default function Dashboard() {
 
   const glowTone = !data.autoTrade ? 'gray' : data.pos ? (data.pos.side === 'long' ? 'green' : 'red') : 'orange'
 
+  // Safe accessors
+  const pos = data?.pos
+  const meta = (pos?.meta || {}) as any
+
   return (
     <div>
       <div className={`glow-dynamic tone-${glowTone}`} />
@@ -364,52 +368,64 @@ export default function Dashboard() {
                 </div>
               </div>
             </div>
-            {data.pos ? (
+
+            {pos ? (
               <div className="pos-grid">
-                <div><span>Side</span><b className="cap">{data.pos.side}</b></div>
-                <div><span>TF</span><b>{data.pos.tf}</b></div>
-                <div><span>Qty</span><b>{fmt(data.pos.qty, 6)}</b></div>
-                <div><span>Entry</span><b>${fmt(data.pos.entry, 2)}</b></div>
-                <div><span>Stop</span><b>${fmt(data.pos.stop, 2)}</b></div>
-                <div><span>Take</span><b>${fmt(data.pos.take, 2)}</b></div>
-                <div><span>1R ($)</span><b>{fmt(data.pos.stop_dist, 2)}</b></div>
-                <div><span>BE?</span><b>{data.pos.be ? 'yes' : 'no'}</b></div>
+                <div><span>Side</span><b className="cap">{pos.side}</b></div>
+                <div><span>TF</span><b>{pos.tf}</b></div>
+                <div><span>Qty</span><b>{fmt(pos.qty, 6)}</b></div>
+                <div><span>Entry</span><b>${fmt(pos.entry, 2)}</b></div>
+                <div><span>Stop</span><b>${fmt(pos.stop, 2)}</b></div>
+                <div><span>Take</span><b>${fmt(pos.take, 2)}</b></div>
+                <div><span>1R ($)</span><b>${fmt(pos.stop_dist, 2)}</b></div>
+                <div><span>BE</span><b>{pos.be ? 'yes' : 'no'}</b></div>
+                <div><span>Partial</span><b>{pos.partial_taken ? 'yes' : 'no'}</b></div>
+                <div><span>Post‑only</span><b>{meta.post_only ? 'yes' : 'no'}</b></div>
+                <div><span>Fast‑tape</span><b>{meta.fast_tape_taker ? 'yes' : 'no'}</b></div>
+                <div><span>Strategy</span><b>{pos.opened_by || meta.strategy || '—'}</b></div>
               </div>
             ) : (
-              <div className="muted-xs" style={{ marginTop: 6 }}>No open position.</div>
+              <p className="muted-xs" style={{ marginTop: 8 }}>No open position.</p>
             )}
           </section>
 
           <section className="glass pcard">
-            <h2 className="card-title">Tape / Telemetry</h2>
-            <div className="tele-grid">
-              <div><span>Spread (bps)</span><b>{fmt(data.spreadBps, 2)}</b></div>
-              <div><span>Fee → TP</span><b>{fmt(data.feeToTp, 3)}</b></div>
-              <div><span>Slip Est ($)</span><b>{fmt(data.slipEst, 2)}</b></div>
-              <div><span>Top‑3 Depth ($)</span><b>{fmt(data.top3DepthNotional, 0)}</b></div>
-              <div><span>VS</span><b>{fmt(data.vs, 2)}</b></div>
-              <div><span>PS</span><b>{fmt(data.ps, 2)}</b></div>
-              <div><span>Red‑Day</span><b>{data.redDayLevel ?? 0}</b></div>
-              <div><span>Fast‑tape Disabled</span><b>{data.fastTapeDisabled ? 'yes' : 'no'}</b></div>
+            <h2 className="card-title">Tape & Risk Telemetry</h2>
+            <div className="telemetry-grid">
+              <div><span>Spread</span><b>{fmt(data.spreadBps, 2)} bps</b></div>
+              <div><span>Fee→TP</span><b>{fmt(data.feeToTp, 3)}</b></div>
+              <div><span>Slip est.</span><b>${fmt(data.slipEst, 2)}</b></div>
+              <div><span>Top‑3 depth</span><b>${fmt(data.top3DepthNotional, 0)}</b></div>
+              <div><span>Day‑lock</span><b>{data.dayLockArmed ? `armed @ floor ${fmt(data.dayLockFloorPct, 2)}%` : '—'}</b></div>
+              <div><span>Red‑day</span><b>{data.redDayLevel ?? 0}</b></div>
+              <div><span>Fast‑tape disabled</span><b>{data.fastTapeDisabled ? 'yes' : 'no'}</b></div>
               <div><span>Taker fails (30m)</span><b>{data.takerFailCount30m ?? 0}</b></div>
             </div>
           </section>
 
           <section className="glass pcard">
             <h2 className="card-title">Logs</h2>
-            <div ref={logBoxRef} className="log-box">
-              {loadingLogs ? (
-                <div className="muted-xs">Loading…</div>
-              ) : logs.length === 0 ? (
-                <div className="muted-xs">No logs yet.</div>
-              ) : (
-                logs.map((l, i) => (
-                  <div key={i} className="log-line">
-                    <span className="log-ts">{new Date(l.ts * 1000).toLocaleTimeString()}</span>
-                    <span className="log-txt">{l.text}</span>
-                  </div>
-                ))
-              )}
+            <div
+              ref={logBoxRef}
+              style={{
+                maxHeight: 280,
+                overflow: 'auto',
+                fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
+                fontSize: 12,
+                padding: 8,
+                background: 'rgba(0,0,0,0.25)',
+                borderRadius: 8,
+              }}
+            >
+              {loadingLogs && <div style={{ opacity: 0.7 }}>Loading…</div>}
+              {!loadingLogs && (!logs || logs.length === 0) && <div style={{ opacity: 0.7 }}>No logs yet.</div>}
+              {logs && logs.map((l, i) => (
+                <div key={i} style={{ whiteSpace: 'pre-wrap' }}>
+                  <span style={{ opacity: 0.6 }}>{new Date(l.ts * 1000).toLocaleTimeString()}</span>
+                  {'  '}
+                  {l.text}
+                </div>
+              ))}
             </div>
           </section>
         </div>
