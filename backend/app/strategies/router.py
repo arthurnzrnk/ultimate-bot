@@ -12,6 +12,7 @@ Hard micro gates for m1:
   - ATR% band [0.05%, 1.75%] × VS
   - VWAP slope cap 0.050% × VS
   - MTF alignment or CT exception (ADX_h1 < 20×VS and RSI_m1 extreme)
+  - z‑VWAP confirm
 
 Scoring:
   +0.5 each: RSI extreme + favorable delta (proxy with RSI slope), MACD cross recent, h1 RSI extreme
@@ -22,11 +23,12 @@ The engine finalizes fee-aware targets (asym/A+) using Signal.meta hints.
 """
 
 from __future__ import annotations
-from statistics import median
+from statistics import median, mean, pstdev
 from typing import Optional, Tuple
 
 from .base import Strategy, Signal
 from ..ta import ema, atr, adx, donchian, rsi, macd_line_signal
+from ..config import settings
 
 
 def _macd_cross_recent(line, sig, i: int, side: str, lookback: int = 3) -> bool:
@@ -135,6 +137,31 @@ class M1Scalp(Strategy):
         over_long = bool(vprev and (m1[i - 1]["low"] <= (vprev * (1 - 1.00 * band_pct))))
         over_short = bool(vprev and (m1[i - 1]["high"] >= (vprev * (1 + 1.00 * band_pct))))
 
+        # --- z‑VWAP confirm (Spec §2/§6A) ---
+        # z is computed on (close - vwap) over the last ZVWAP_STD_WINDOW_M1 bars
+        W = settings.spec.ZVWAP_STD_WINDOW_M1
+        if i < W:
+            return Signal(type="WAIT", reason="zVWAP warmup")
+        devs = []
+        for k in range(i - W + 1, i + 1):
+            if ctx["vwap"][k] is None:
+                continue
+            devs.append(m1[k]["close"] - ctx["vwap"][k])
+        if len(devs) < max(10, int(W * 0.6)):
+            return Signal(type="WAIT", reason="zVWAP warmup")
+        mu = mean(devs)
+        sd = pstdev(devs) if len(devs) >= 2 else 0.0
+        def z_at(n_idx: int) -> Optional[float]:
+            vw = ctx["vwap"][n_idx]
+            if vw is None or sd <= 0:
+                return None
+            return (m1[n_idx]["close"] - vw - mu) / sd
+        z_prev = z_at(i - 1)
+        z_cur = z_at(i)
+        z_min = settings.spec.Z_MIN
+        z_ok_long = (z_prev is not None and z_prev <= -z_min) and (z_cur is not None and z_cur > -0.25)
+        z_ok_short = (z_prev is not None and z_prev >= +z_min) and (z_cur is not None and z_cur < +0.25)
+
         # MACD recency for scoring
         macd_l, macd_s = macd_line_signal([c["close"] for c in m1], 12, 26, 9)
         macd_long_recent = _macd_cross_recent(macd_l, macd_s, i, "long", 3)
@@ -166,20 +193,19 @@ class M1Scalp(Strategy):
         short_ok_bias = (ema_dn or allow_ct_short)
 
         # If passes, emit signal with meta hints so engine can do asym/A+ fee math
-        if over_long and reclaim_long and vol_ok and long_pat and long_ok_bias and score_long >= min_score:
-            # base TP% from band; engine will widen asym/A+
+        if over_long and reclaim_long and vol_ok and long_pat and long_ok_bias and z_ok_long and score_long >= min_score:
             tp_pct_raw = max(0.0015, 0.85 * band_pct) * (1.0 + 0.2 * max(0.0, VS - 1.0))
             dist = px * tp_pct_raw
             return Signal(
                 type="BUY",
                 reason="m1 reclaim long",
-                stop_dist=dist,     # symmetrical placeholder; engine converts to floor + asym widen
+                stop_dist=dist,
                 take_dist=dist,
                 score=score_long,
                 tf="m1",
-                meta={"band_pct": band_pct, "tp_pct_raw": tp_pct_raw, "micro_triad_ok": True}
+                meta={"band_pct": band_pct, "tp_pct_raw": tp_pct_raw, "micro_triad_ok": True, "z_vwap": float(z_cur) if z_cur is not None else None}
             )
-        if over_short and reclaim_short and vol_ok and short_pat and short_ok_bias and score_short >= min_score:
+        if over_short and reclaim_short and vol_ok and short_pat and short_ok_bias and z_ok_short and score_short >= min_score:
             tp_pct_raw = max(0.0015, 0.85 * band_pct) * (1.0 + 0.2 * max(0.0, VS - 1.0))
             dist = px * tp_pct_raw
             return Signal(
@@ -189,7 +215,7 @@ class M1Scalp(Strategy):
                 take_dist=dist,
                 score=score_short,
                 tf="m1",
-                meta={"band_pct": band_pct, "tp_pct_raw": tp_pct_raw, "micro_triad_ok": True}
+                meta={"band_pct": band_pct, "tp_pct_raw": tp_pct_raw, "micro_triad_ok": True, "z_vwap": float(z_cur) if z_cur is not None else None}
             )
 
         return Signal(type="WAIT", reason="Inside bands")
@@ -398,11 +424,14 @@ class RouterV3(Strategy):
             sig = self.h1_mr.evaluate(ctx)
             if sig.type != "WAIT":
                 self.last_strategy = self.h1_mr.name; sig.tf = sig.tf or "h1"; return sig
-            sig2 = self.m1.evaluate(ctx)
+            # pass loss_streak for m1 threshold raise
+            ctx2 = dict(ctx); ctx2["loss_streak"] = ctx.get("loss_streak", 0.0)
+            sig2 = self.m1.evaluate(ctx2)
             self.last_strategy = self.m1.name if sig2.type != "WAIT" else None
             sig2.tf = sig2.tf or "m1"; return sig2
         else:
-            sig = self.m1.evaluate(ctx)
+            ctx2 = dict(ctx); ctx2["loss_streak"] = ctx.get("loss_streak", 0.0)
+            sig = self.m1.evaluate(ctx2)
             if sig.type != "WAIT":
                 self.last_strategy = self.m1.name; sig.tf = sig.tf or "m1"; return sig
             sig2 = self.h1_mr.evaluate(ctx)
