@@ -51,7 +51,7 @@ class Trade(BaseModel):
     regime: Optional[str] = None
     vs: Optional[float] = None
     ps: Optional[float] = None
-    loss_streak: Optional[float] = None  # <-- added
+    loss_streak: Optional[float] = None  # <-- added earlier in your code
 
     # Micro
     spread_bps: Optional[float] = None
@@ -108,7 +108,10 @@ class Trade(BaseModel):
     top3_notional_drop_pct_3s: Optional[float] = None
     cooldown_bonus_on: Optional[int] = None
 
-    # Extras kept from UI convenience
+    # Naming parity with §11
+    realized_slip_R: Optional[float] = None  # paper: typically None
+
+    # Extras kept for UI convenience
     score: Optional[float] = None
     vol_multiple: Optional[float] = None
     candle_type: Optional[str] = None
@@ -159,7 +162,7 @@ class Status(BaseModel):
     slipEst: Optional[float] = None
     top3DepthNotional: Optional[float] = None
 
-    # New: day locks / throttles / taker
+    # Day locks / throttles / taker
     dayLockArmed: Optional[int] = None
     dayLockFloorPct: Optional[float] = None
     redDayLevel: Optional[int] = None
