@@ -64,6 +64,10 @@ class Settings(BaseModel):
         MACD_SLOW: int = 26
         MACD_SIGNAL: int = 9
 
+        # z‑VWAP
+        ZVWAP_STD_WINDOW_M1: int = 40
+        Z_MIN: float = 1.0
+
         # VS/PS
         VS_MIN: float = 0.5
         VS_MAX: float = 2.0
@@ -153,6 +157,7 @@ class Settings(BaseModel):
 
         # Heartbeat & breakers
         HEARTBEAT_MAX_STALL_SEC: int = 5
+        HEARTBEAT_PAUSE_MIN: int = 15
         FEE_TP_VIOLATIONS_IN_10M: int = 3
         PAUSE_AFTER_FEE_TP_BREAK_MIN: int = 30
         MACRO_SPIKE_MULT: float = 1.8
