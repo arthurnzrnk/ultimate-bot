@@ -2,10 +2,12 @@
 
 - Maker/taker fee rates read from settings at engine open().
 - Tracks equity and history; returns realized R on closes.
+- FIX: exit fees now respect ASSUME_TAKER_EXIT_ON_STOPS via exit_type.
 """
 
 from __future__ import annotations
 from time import time
+from typing import Optional
 from .models import Position, Trade
 
 
@@ -45,7 +47,7 @@ class PaperBroker:
             stop=stop,
             take=take,
             stop_dist=stop_dist,
-            fee_rate=fee_rate,
+            fee_rate=fee_rate,  # entry-side fee
             open_time=self._now(),
             hi=entry,
             lo=entry,
@@ -65,7 +67,7 @@ class PaperBroker:
             },
         )
 
-    # --- new: scale-in for pyramids (keeps stop/take intact) ---
+    # --- scale-in for pyramids (keeps stop/take intact) ---
     def scale_in(self, add_qty: float, add_entry: float) -> None:
         if not self.pos or add_qty <= 0:
             return
@@ -76,20 +78,39 @@ class PaperBroker:
         p.qty = new_qty
         p.hi = max(p.hi, add_entry)
         p.lo = min(p.lo, add_entry)
-        # recompute 1R in $ vs new averaged entry distance to current stop
-        p.stop_dist = abs(p.entry - p.stop)
+        p.stop_dist = abs(p.entry - p.stop)  # recompute 1R vs current stop
 
-    def _close_amount(self, qty_to_close: float, px: float) -> float:
+    def _close_amount(self, qty_to_close: float, px: float, *, exit_type: Optional[str] = None) -> float:
         if not self.pos or qty_to_close <= 0:
             return 0.0
         p = self.pos
+
+        # gross PnL for the closed slice
         gross = (px - p.entry) * qty_to_close if p.side == "long" else (p.entry - px) * qty_to_close
-        fees = (p.entry + px) * qty_to_close * p.fee_rate
+
+        # per-side fees
+        meta = p.meta or {}
+        maker_fee_rate = float(meta.get("maker_fee_rate", p.fee_rate))
+        taker_fee_rate = float(meta.get("taker_fee_rate", p.fee_rate))
+        assumed_model = meta.get("assumed_fee_model", "MM")  # "TM" => taker on stops
+
+        entry_fee_rate = p.fee_rate  # recorded at open (maker or taker)
+        # exit: taker only when stop & model is TM; else maker (post-only default)
+        if exit_type == "stop" and assumed_model == "TM":
+            exit_fee_rate = taker_fee_rate
+        else:
+            exit_fee_rate = maker_fee_rate
+
+        entry_fees = p.entry * qty_to_close * entry_fee_rate
+        exit_fees = px * qty_to_close * exit_fee_rate
+        fees = entry_fees + exit_fees
+
         net = gross - fees
         self.equity += net
+
         base_R_usd = p.stop_dist * qty_to_close
         r_mult = (net / base_R_usd) if base_R_usd > 0 else None
-        meta = p.meta or {}
+
         self.history.append(
             Trade(
                 side=p.side,
@@ -104,7 +125,7 @@ class PaperBroker:
                 regime=meta.get("regime"),
                 vs=meta.get("VS"),
                 ps=meta.get("PS"),
-                loss_streak=meta.get("loss_streak"),  # keep streak snapshot
+                loss_streak=meta.get("loss_streak"),
                 spread_bps=meta.get("spread_bps"),
                 spread_std_10s=meta.get("spread_std_10s"),
                 spread_median_60s=meta.get("spread_median_60s"),
@@ -146,7 +167,6 @@ class PaperBroker:
                 tick_p95_ms=meta.get("tick_p95_ms"),
                 order_ack_p95_ms=meta.get("order_ack_p95_ms"),
                 spread_instability_block=meta.get("spread_instability_block"),
-                top3_crumble_block=meta.get("top3_crumble_block"),
                 top3_notional_drop_pct_3s=meta.get("top3_notional_drop_pct_3s"),
                 cooldown_bonus_on=meta.get("cooldown_bonus_on"),
                 score=meta.get("score"),
@@ -154,22 +174,23 @@ class PaperBroker:
                 candle_type=meta.get("candle_type"),
             )
         )
+
         p.qty = max(0.0, p.qty - qty_to_close)
         if p.qty == 0.0:
             self.pos = None
         return net
 
-    def partial_close(self, fraction: float, px: float) -> float | None:
+    def partial_close(self, fraction: float, px: float, *, exit_type: str = "partial") -> float | None:
         if not self.pos or fraction <= 0.0 or fraction >= 1.0:
             return None
         qty_to_close = self.pos.qty * fraction
-        return self._close_amount(qty_to_close, px)
+        return self._close_amount(qty_to_close, px, exit_type=exit_type)
 
-    def close(self, px: float) -> float | None:
+    def close(self, px: float, *, exit_type: str = "manual") -> float | None:
         if not self.pos:
             return None
         p = self.pos
-        net = self._close_amount(p.qty, px)
+        net = self._close_amount(p.qty, px, exit_type=exit_type)
         self.pos = None
         return net
 
@@ -180,6 +201,7 @@ class PaperBroker:
         p.hi = max(p.hi, px)
         p.lo = min(p.lo, px)
         gross = (px - p.entry) * p.qty if p.side == "long" else (p.entry - px) * p.qty
-        exit_fee = px * p.qty * p.fee_rate
+        # best‑effort mark: assume maker on both sides here (just for UI)
+        exit_fee = px * p.qty * (p.meta or {}).get("maker_fee_rate", p.fee_rate)
         paid_fees = p.entry * p.qty * p.fee_rate
         return gross - (exit_fee + paid_fees)
