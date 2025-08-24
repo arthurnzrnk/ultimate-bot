@@ -1,7 +1,11 @@
 """Router + Strategies for Strategy V3.4.
 
-Fix: m1 ATR% band now honors [0.05%, 1.75%] × VS exactly (no absolute clamp).
-Other logic unchanged.
+Updates for full spec compliance:
+- VWAP slope cap now respects settings.spec.VWAP_EMA10_ON_TYPICAL.
+  If True, slope is computed on EMA10(Typical Price) instead of EMA10(VWAP).
+- Red‑day L1 scoring: add +RED_DAY_L1_SCORE_ADD to the computed score (per spec)
+  instead of raising the threshold.
+- m1 ATR% band honors [0.05%, 1.75%] × VS exactly (already in place).
 """
 
 from __future__ import annotations
@@ -50,21 +54,33 @@ class M1Scalp(Strategy):
         PS = float(ctx["PS"])
 
         # ATR% band (× VS exactly)
-        a14 = atr(m1, 14)
+        a14 = atr(m1, settings.spec.ATR_LEN)
         atr_pct = (a14[i] or 0.0) / max(1.0, px)
-        band_min = 0.0005 * VS   # 0.05% × VS
-        band_max = 0.0175 * VS   # 1.75% × VS
+        band_min = settings.spec.SCALPER_ATR_PCT_MIN * VS   # 0.05% × VS
+        band_max = settings.spec.SCALPER_ATR_PCT_MAX * VS   # 1.75% × VS
         if atr_pct < band_min or atr_pct > band_max:
             return Signal(type="WAIT", reason="ATR band")
 
-        # VWAP slope cap (EMA10 on VWAP)
+        # VWAP slope cap (EMA10 on VWAP or Typical, per config)
         vwap = ctx["vwap"]
         if vwap[i] is None:
             return Signal(type="WAIT", reason="VWAP warmup")
-        v10 = ema([x if x is not None else vwap[i] for x in vwap], 10)
         base = i - 3 if i >= 3 else max(0, i - 1)
-        slope = abs((v10[i] or vwap[i]) - (v10[base] or vwap[base])) / max(1.0, px)
-        if slope > (0.0005 * VS):  # 0.050% × VS
+
+        if settings.spec.VWAP_EMA10_ON_TYPICAL:
+            # Typical Price series for EMA10
+            tps = [ (c["high"] + c["low"] + c["close"]) / 3.0 for c in m1 ]
+            e10 = ema(tps, 10)
+            ref_now = e10[i] if e10[i] is not None else tps[i]
+            ref_base = e10[base] if e10[base] is not None else tps[base]
+        else:
+            # EMA10 on VWAP (fallback)
+            v10 = ema([x if x is not None else vwap[i] for x in vwap], 10)
+            ref_now  = v10[i]   if v10[i]   is not None else vwap[i]
+            ref_base = v10[base] if v10[base] is not None else vwap[base]
+
+        slope = abs(ref_now - ref_base) / max(1.0, px)
+        if slope > (settings.spec.VWAP_SLOPE_CAP_PCT * VS):  # 0.050% × VS
             return Signal(type="WAIT", reason="Slope cap")
 
         # Spread cap (if BBO available)
@@ -78,11 +94,11 @@ class M1Scalp(Strategy):
         # MTF bias on h1 EMA200 with CT exception
         h1 = ctx["h1"]; j = ctx["iC_h1"]
         closes_h1 = [c["close"] for c in h1]
-        e200 = ema(closes_h1, 200)
+        e200 = ema(closes_h1, settings.spec.EMA200_LEN_H1)
         ema_up = bool(e200[j] and h1[j]["close"] >= (e200[j] or 0.0)) if j is not None else True
         ema_dn = bool(e200[j] and h1[j]["close"] <= (e200[j] or 0.0)) if j is not None else True
-        ax_h1 = adx(h1, 14); adx_h1 = (ax_h1[j] or 0.0) if j is not None else 0.0
-        rsi_m1 = rsi([c["close"] for c in m1], 14); rsi_now = rsi_m1[i] or 50.0
+        ax_h1 = adx(h1, settings.spec.ADX_LEN); adx_h1 = (ax_h1[j] or 0.0) if j is not None else 0.0
+        rsi_m1 = rsi([c["close"] for c in m1], settings.spec.RSI_LEN); rsi_now = rsi_m1[i] or 50.0
         rsi_prev = rsi_m1[i - 1] if i - 1 >= 0 else None
 
         allow_ct_long = (adx_h1 < 20.0 * VS) and (rsi_now < 25.0)
@@ -112,7 +128,7 @@ class M1Scalp(Strategy):
         short_pat = bear_engulf(prev, cur) or shooting_star(cur)
 
         # Overshoot + reclaim of VWAP band
-        band_pct = max(0.0015, 0.75 * atr_pct)    # % of price
+        band_pct = max(settings.spec.BAND_PCT_MIN, settings.spec.BAND_PCT_ATR_MULT * atr_pct)    # % of price
         vprev = ctx["vwap"][i - 1]
         reclaim_long = (cur["close"] >= (ctx["vwap"][i] * (1 - 0.65 * band_pct)) and (cur["close"] >= cur["open"]))
         reclaim_short = (cur["close"] <= (ctx["vwap"][i] * (1 + 0.65 * band_pct)) and (cur["close"] <= cur["open"]))
@@ -144,12 +160,12 @@ class M1Scalp(Strategy):
         z_ok_short = (z_prev is not None and z_prev >= +z_min) and (z_cur is not None and z_cur < +0.25)
 
         # MACD recency for scoring
-        macd_l, macd_s = macd_line_signal([c["close"] for c in m1], 12, 26, 9)
+        macd_l, macd_s = macd_line_signal([c["close"] for c in m1], settings.spec.MACD_FAST, settings.spec.MACD_SLOW, settings.spec.MACD_SIGNAL)
         macd_long_recent = _macd_cross_recent(macd_l, macd_s, i, "long", 3)
         macd_short_recent = _macd_cross_recent(macd_l, macd_s, i, "short", 3)
 
         # h1 RSI extreme
-        rsi_h1 = rsi([c["close"] for c in h1], 14); rsi_h1_now = rsi_h1[j] if j is not None else None
+        rsi_h1 = rsi([c["close"] for c in h1], settings.spec.RSI_LEN); rsi_h1_now = rsi_h1[j] if j is not None else None
 
         # Score (base 4.0)
         score_long = score_short = 4.0
@@ -165,19 +181,22 @@ class M1Scalp(Strategy):
         score_long += 0.25
         score_short += 0.25
 
-        # Threshold with red-day add
+        # Red‑day L1 scoring add (per spec)
+        if int(ctx.get("red_level", 0)) == 1:
+            score_long += settings.spec.RED_DAY_L1_SCORE_ADD
+            score_short += settings.spec.RED_DAY_L1_SCORE_ADD
+
+        # Threshold with PS/loss‑streak tighten
         min_score = 5.25
         if PS < 0.4 or float(ctx.get("loss_streak", 0.0)) >= 2.0:
             min_score += 0.50  # 5.75
-        if int(ctx.get("red_level", 0)) == 1:
-            min_score += settings.spec.RED_DAY_L1_SCORE_ADD
 
         # Bias + CT exception
         long_ok_bias = (ema_up or allow_ct_long)
         short_ok_bias = (ema_dn or allow_ct_short)
 
         if over_long and reclaim_long and vol_ok and long_pat and long_ok_bias and z_ok_long and score_long >= min_score:
-            tp_pct_raw = max(0.0015, 0.85 * band_pct) * (1.0 + 0.2 * max(0.0, VS - 1.0))
+            tp_pct_raw = max(settings.spec.TP_PCT_FLOOR, settings.spec.TP_PCT_FROM_BAND_MULT * band_pct) * (1.0 + 0.2 * max(0.0, VS - 1.0))
             dist = px * tp_pct_raw
             return Signal(
                 type="BUY",
@@ -189,7 +208,7 @@ class M1Scalp(Strategy):
                 meta={"band_pct": band_pct, "tp_pct_raw": tp_pct_raw, "micro_triad_ok": True, "z_vwap": float(z_cur) if z_cur is not None else None}
             )
         if over_short and reclaim_short and vol_ok and short_pat and short_ok_bias and z_ok_short and score_short >= min_score:
-            tp_pct_raw = max(0.0015, 0.85 * band_pct) * (1.0 + 0.2 * max(0.0, VS - 1.0))
+            tp_pct_raw = max(settings.spec.TP_PCT_FLOOR, settings.spec.TP_PCT_FROM_BAND_MULT * band_pct) * (1.0 + 0.2 * max(0.0, VS - 1.0))
             dist = px * tp_pct_raw
             return Signal(
                 type="SELL",
@@ -211,8 +230,8 @@ class H1MeanReversion(Strategy):
         if i is None or i < max(220, ctx.get("min_h1_bars", 220)):
             return Signal(type="WAIT", reason="Warmup")
         px = h1[i]["close"]
-        a14 = atr(h1, 14); ax = adx(h1, 14)
-        dc = donchian(h1, 20)
+        a14 = atr(h1, settings.spec.ATR_LEN); ax = adx(h1, settings.spec.ADX_LEN)
+        dc = donchian(h1, settings.spec.DONCHIAN_LEN)
         VS = float(ctx["VS"])
         adx_cap = 17.0 * VS
         if (ax[i] or 0.0) > adx_cap:
@@ -236,12 +255,11 @@ class H1MeanReversion(Strategy):
         elif dist >= +(k_entry * atr_abs):
             side = "short"
 
-        rs = rsi([c["close"] for c in h1], 14); rsi_now = rs[i] or 50.0
+        rs = rsi([c["close"] for c in h1], settings.spec.RSI_LEN); rsi_now = rs[i] or 50.0
         if side == "long" and not (rsi_now < 30.0): return Signal(type="WAIT", reason="RSI not supportive")
         if side == "short" and not (rsi_now > 70.0): return Signal(type="WAIT", reason="RSI not supportive")
 
         # capitulation extension for take
-        from statistics import median
         v_win = [c.get("volume", 0.0) for c in h1[max(0, i - 20):i]]
         vmed = median(v_win) if v_win else 0.0
         k_take = 0.95
@@ -264,9 +282,8 @@ class H1Breakout(Strategy):
         h1 = ctx["h1"]; i = ctx["iC_h1"]
         if i is None or i < max(220, ctx.get("min_h1_bars", 220)):
             return Signal(type="WAIT", reason="Warmup")
-        a14 = atr(h1, 14); dc = donchian(h1, 20)
+        a14 = atr(h1, settings.spec.ATR_LEN); dc = donchian(h1, settings.spec.DONCHIAN_LEN)
         wnd = a14[max(0, i - 30):i]
-        from statistics import median
         if len([x for x in wnd if x is not None]) < 10:
             return Signal(type="WAIT", reason="ATR warmup")
         med = median([x for x in wnd if x is not None])
@@ -291,7 +308,7 @@ class H1Breakout(Strategy):
             return Signal(type="WAIT", reason="No breakout")
 
         # MACD cross confirm
-        macd_l, macd_s = macd_line_signal([c["close"] for c in h1], 12, 26, 9)
+        macd_l, macd_s = macd_line_signal([c["close"] for c in h1], settings.spec.MACD_FAST, settings.spec.MACD_SLOW, settings.spec.MACD_SIGNAL)
         prev = (macd_l[i - 1] or 0.0) - (macd_s[i - 1] or 0.0)
         cur = (macd_l[i] or 0.0) - (macd_s[i] or 0.0)
         cross_up = prev <= 0 < cur
@@ -313,10 +330,10 @@ class H1Trend(Strategy):
         if i is None or i < max(220, ctx.get("min_h1_bars", 220)):
             return Signal(type="WAIT", reason="Warmup")
         closes = [c["close"] for c in h1]
-        e200 = ema(closes, 200)
-        a14 = atr(h1, 14)
-        ax = adx(h1, 14)
-        dc = donchian(h1, 20)
+        e200 = ema(closes, settings.spec.EMA200_LEN_H1)
+        a14 = atr(h1, settings.spec.ATR_LEN)
+        ax = adx(h1, settings.spec.ADX_LEN)
+        dc = donchian(h1, settings.spec.DONCHIAN_LEN)
         PS = float(ctx["PS"])
         thr = 25.0 * (1.0 - 0.20 * (1.0 - PS))   # scaled by PS
         if (ax[i] or 0.0) < thr:
@@ -354,22 +371,22 @@ class RouterV3(Strategy):
         iC_m1 = ctx.get("iC_m1"); iC_h1 = ctx.get("iC_h1")
         prefer = ctx.get("preferTF", "m1")
 
-        ax_h1 = adx(h1, 14)
+        ax_h1 = adx(h1, settings.spec.ADX_LEN)
         adx_last = (ax_h1[iC_h1] or 0.0) if iC_h1 is not None else 0.0
         self.last_adx = adx_last
 
-        A = atr(h1, 14)
+        A = atr(h1, settings.spec.ATR_LEN)
         atr_pct = ((A[iC_h1] or 0.0) / max(1.0, h1[iC_h1]["close"])) if iC_h1 is not None else None
         self.last_atr_pct = atr_pct
 
         closes_h1 = [c["close"] for c in h1]
-        e200 = ema(closes_h1, 200)
+        e200 = ema(closes_h1, settings.spec.EMA200_LEN_H1)
         if iC_h1 is not None and e200[iC_h1] is not None:
             self.last_bias = "Bullish" if h1[iC_h1]["close"] >= (e200[iC_h1] or 0.0) else "Bearish"
         else:
             self.last_bias = None
 
-        dc = donchian(h1, 20)
+        dc = donchian(h1, settings.spec.DONCHIAN_LEN)
         bk_up = bk_dn = False
         if iC_h1 is not None and iC_h1 > 0:
             px = h1[iC_h1]["close"]
@@ -381,7 +398,7 @@ class RouterV3(Strategy):
         # Regime proposal
         if adx_last >= 25.0:
             regime_prop = "Trend"
-        elif (adx_last <= 23.0) and (bk_up or bk_dn) and (atr_pct is None or (0.0005 <= atr_pct <= 0.0175)):
+        elif (adx_last <= 23.0) and (bk_up or bk_dn) and (atr_pct is None or (settings.spec.SCALPER_ATR_PCT_MIN <= atr_pct <= settings.spec.SCALPER_ATR_PCT_MAX)):
             regime_prop = "Breakout"
         else:
             regime_prop = "Range"
