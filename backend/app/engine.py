@@ -6,6 +6,11 @@ Key fixes:
 - Fallback loosening: allow second activation only if prior fallback window ≥ 0 PnL.
 - Guarded quotes: require BBO present for new entries (reject otherwise).
 - Exit types wired to broker to compute per‑side fees correctly.
+
+New in this edit (spec‑correctness hardening):
+- Spread‑instability block is now **m1‑only** for 3 minutes (H1 remains allowed).
+- If m1 is blocked (instability, bottom‑hour gate, or red‑day L1 top‑hours rule),
+  we **fallback to H1** immediately (router re‑asked with preferTF='h1').
 """
 
 from __future__ import annotations
@@ -79,7 +84,7 @@ class BotEngine:
         self._day_lock_floor_pct: float | None = None
 
         # Pauses & breakers
-        self._pause_until: int = 0
+        self._pause_until: int = 0                # global pause (macro/giveback/hard day)
         self._macro_until: int = 0
         self._fee_violation_events: Deque[int] = deque(maxlen=10)
 
@@ -94,6 +99,9 @@ class BotEngine:
         self._spread_bps_window: Deque[float] = deque(maxlen=90)
         self._spread_std_10s: float | None = None
         self._spread_median_60s: float | None = None
+
+        # m1‑only instability gate (new)
+        self._m1_block_until: int = 0
 
         # top3 crumble tracking
         self._top3_hist: Deque[tuple[int, float]] = deque(maxlen=120)
@@ -388,11 +396,13 @@ class BotEngine:
                 self._macro_until = now + settings.spec.MACRO_PAUSE_MIN * 60
                 self._log("Macro pause: volatility spike", set_status=False)
 
-            # Spread instability block (m1 waits 3m)
-            spread_instability_block = False
+            # Spread instability: **m1-only** block for 3 minutes
+            # Gate becomes active as soon as ratio breaches; it persists until the deadline.
             if (self._spread_std_10s is not None) and (self._spread_median_60s is not None) and self._spread_median_60s > 0:
                 if (self._spread_std_10s / self._spread_median_60s) > settings.spec.SPREAD_STD_TO_MEDIAN_MAX:
-                    spread_instability_block = True
+                    if now >= self._m1_block_until:
+                        self._log("Spread instability: m1 wait 3m", set_status=False)
+                    self._m1_block_until = max(self._m1_block_until, now + 180)
 
             # Giveback guard
             if self.broker.equity > self._day_high_equity:
@@ -431,10 +441,10 @@ class BotEngine:
             if m1_closed or h1_closed:
                 if m1_closed: setattr(self, "_last_m1_bar", self.m1[-2]["time"])
                 if h1_closed: setattr(self, "_last_h1_bar", self.h1[-2]["time"])
-                await self._maybe_decide(now, spread_instability_block)
+                await self._maybe_decide(now)
 
             # Short status
-            self._status_tick(now, spread_instability_block)
+            self._status_tick(now)
 
             await asyncio.sleep(0.5)
 
@@ -459,7 +469,17 @@ class BotEngine:
         if lo <= a <= hi:
             self._fallback_pending_m1 = True
 
-    async def _maybe_decide(self, now: int, spread_instability_block: bool) -> None:
+    def _try_router(self, ctx: dict, prefer: str, cooldown_ok_m1: bool, cooldown_ok_h1: bool) -> Optional[Signal]:
+        """Ask router with a preference, honoring per‑TF cooldowns."""
+        ctx["preferTF"] = prefer
+        s = self.router.evaluate(ctx)
+        if s.tf == "m1" and not cooldown_ok_m1:
+            s = Signal(type="WAIT", reason="Cooldown m1")
+        if s.tf == "h1" and not cooldown_ok_h1:
+            s = Signal(type="WAIT", reason="Cooldown h1")
+        return s
+
+    async def _maybe_decide(self, now: int) -> None:
         if not self.settings.get("auto_trade"):
             self.status_text = self._short_status("off"); return
         if not self._warm_ok():
@@ -509,45 +529,49 @@ class BotEngine:
             bid=self.bid, ask=self.ask, min_bars=5, min_h1_bars=220,
             VS=self.VS, PS=self.PS, loss_streak=self._loss_streak, red_level=red_level,
         )
+
+        # Base preference: m1 first if VS≥1.0
         order = ("m1", "h1") if self.VS >= 1.0 else ("h1", "m1")
 
+        # First pass
         sig: Optional[Signal] = None
-        for first in order:
-            ctx["preferTF"] = first
-            s = self.router.evaluate(ctx)
-            # Track H1 signal timestamp
-            if s.tf == "h1" and s.type in ("BUY", "SELL"):
-                self._last_h1_signal_ts = now
-            # Per-TF cooldowns
-            if s.tf == "m1" and not cooldown_ok_m1:
-                s = Signal(type="WAIT", reason="Cooldown m1")
-            if s.tf == "h1" and not cooldown_ok_h1:
-                s = Signal(type="WAIT", reason="Cooldown h1")
-            sig = s
-            if s.type != "WAIT":
-                break
+        first = order[0]; second = order[1]
+        s = self._try_router(ctx.copy(), first, cooldown_ok_m1, cooldown_ok_h1)
+        sig = s if s and s.type != "WAIT" else None
+        if sig is None:
+            s2 = self._try_router(ctx.copy(), second, cooldown_ok_m1, cooldown_ok_h1)
+            sig = s2 if s2 and s2.type != "WAIT" else None
+            if sig is None:
+                return
 
-        # spread instability blocks only m1
-        if sig and sig.tf == "m1" and spread_instability_block:
-            self._log("Spread instability: m1 wait 3m", set_status=False)
-            self._pause_until = max(self._pause_until, now + 180)
-            return
-
-        if sig is None or sig.type == "WAIT":
-            return
-
-        # bottom-hour m1 block (simple “bottom-2” hours: 5–6 UTC placeholder)
-        blocked_bottom_hour = 0
-        if sig.tf == "m1" and settings.spec.M1_BLOCK_BOTTOM_HOURS:
+        # m1‑only blocks: spread instability window, bottom‑hours, or red‑day L1 top‑hours gate
+        def need_block_m1_now(choice: Signal) -> Tuple[bool, str]:
+            if choice.tf != "m1":
+                return False, ""
+            # spread instability window active?
+            if now < self._m1_block_until:
+                return True, "Spread instability window"
+            # bottom‑2 hours (placeholder buckets)
             hr = datetime.utcnow().hour
-            if hr in (5, 6):  # can replace with buckets later
-                blocked_bottom_hour = 1
+            if settings.spec.M1_BLOCK_BOTTOM_HOURS and hr in (5, 6):
+                return True, "Bottom-hour block"
+            # red‑day L1 “top hours only”
+            if red_level == 1 and settings.spec.RED_DAY_L1_TOP_HOURS_ONLY and hr not in (13, 14):
+                return True, "Red‑day L1 top-hours gate"
+            return False, ""
+
+        blocked, why = need_block_m1_now(sig)
+        if blocked:
+            # Try an immediate H1 alternative before giving up
+            alt = self._try_router(ctx.copy(), "h1", cooldown_ok_m1, cooldown_ok_h1)
+            if alt and alt.type != "WAIT":
+                sig = alt
+            else:
+                # No H1 available — respect the m1 block and skip this cycle
+                self._log(f"{why}: skipping m1 (H1 unavailable this cycle)", set_status=False)
                 return
 
-        # Red-day L1: “top hours only” gate for m1 entries
-        if sig.tf == "m1" and red_level == 1 and settings.spec.RED_DAY_L1_TOP_HOURS_ONLY:
-            if datetime.utcnow().hour not in (13, 14):
-                return
+        # --- execution continues with 'sig' (either m1 allowed now, or H1 fallback) ---
 
         # Sizing & fee-aware targets
         if self.price is None or sig.stop_dist is None:
@@ -815,15 +839,15 @@ class BotEngine:
             "taker_fail_count_30m": len([t for t in self._taker_fail_events if now - t <= settings.spec.FAST_TAPE_DISABLE_WINDOW_MIN * 60]),
             "tick_p95_ms": self._tick_latency_ms_p95,
             "order_ack_p95_ms": self._order_ack_p95_ms,
-            "spread_instability_block": int(spread_instability_block),
+            "spread_instability_block": int(now < self._m1_block_until),
             "top3_notional_drop_pct_3s": self._top3_notional_drop_3s,
             "cooldown_bonus_on": 0,
             "score": sig.score,
             "z_vwap": (sig.meta or {}).get("z_vwap"),
-            "blocked_bottom_hour": blocked_bottom_hour,
+            "blocked_bottom_hour": 1 if (sig.tf == "m1" and datetime.utcnow().hour in (5, 6) and settings.spec.M1_BLOCK_BOTTOM_HOURS) else 0,
         }
 
-        # Telemetry requirement sanity
+        # Telemetry requirement sanity (must-have set for commit)
         critical_fields = ["final_stop_dist_R", "final_tp_pct", "tp_price", "tp_fee_floor", "fee_to_tp", "round_trip_fee_pct"]
         if any(meta.get(k) is None for k in critical_fields):
             self._log("Reject: missing required telemetry", set_status=False)
@@ -1030,7 +1054,7 @@ class BotEngine:
 
     # -------- status --------
 
-    def _status_tick(self, now: int, spread_instability_block: bool) -> None:
+    def _status_tick(self, now: int) -> None:
         if not self.settings.get("auto_trade"):
             self.status_text = self._short_status("off"); return
         if self.settings.get("macro_pause"):
@@ -1045,7 +1069,7 @@ class BotEngine:
             self.status_text = self._short_status("vol_low")
         elif "wild" in r or "macro" in r:
             self.status_text = self._short_status("vol_high")
-        elif "spread" in r or spread_instability_block:
+        elif "spread" in r or (now < self._m1_block_until):
             self.status_text = self._short_status("spread")
         elif "fee" in r:
             self.status_text = self._short_status("fees")
