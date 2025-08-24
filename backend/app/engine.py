@@ -24,6 +24,10 @@ Additional corrections (this commit):
 - Block m1 with reason "Fee‑breaker pause" when active; H1 still allowed.
 - Upgrade `pyramid_adds` telemetry to structured `{count, size_R, times}`.
 - Carry explicit `fee_breaker_pause` flag in per‑trade telemetry.
+
+**This file (PS idle-decay correction to match Spec §3):**
+- Track `_last_activity_ts` and decay PS toward 0.5 when idle ≥ `PS_DECAY_HOURS_IF_IDLE`.
+- Update `_last_activity_ts` on opens, partials/extra scales, scale‑ins, and final closes; reset on UTC rollover.
 """
 
 from __future__ import annotations
@@ -166,6 +170,9 @@ class BotEngine:
         self._reentry_until_ts: int = 0
         self._reentry_required_top_hour_or_zvwap: bool = False
 
+        # ---------- NEW: last activity tracking for PS decay ----------
+        self._last_activity_ts: int = int(time.time())
+
     # --------- utils ---------
 
     def _log(self, text: str, set_status: bool = False) -> None:
@@ -265,8 +272,9 @@ class BotEngine:
         self.PS = _clamp(PS, 0.0, 1.0)
         if now is None:
             now = int(time.time())
-        # idle decay (best-effort)
-        if self._fills_today() == 0 and (now - self._day_sod) >= settings.spec.PS_DECAY_HOURS_IF_IDLE * 3600:
+        # ---- Spec-correct idle decay: decay toward 0.5 after ≥ PS_DECAY_HOURS_IF_IDLE since LAST ACTIVITY ----
+        if (now - (self._last_activity_ts or self._day_sod)) >= settings.spec.PS_DECAY_HOURS_IF_IDLE * 3600:
+            # gentle pull 10% toward 0.5 each tick while idle
             self.PS += (0.5 - self.PS) * 0.10
 
     def _short_status(self, key: str) -> str:
@@ -292,6 +300,7 @@ class BotEngine:
         self._day_open_equity = self.broker.equity
         self._day_high_equity = self.broker.equity
         self._day_lock_peak_equity = self.broker.equity
+        self._last_activity_ts = int(time.time())  # reset activity at engine start
         self._log(f"Engine ready. Seeded m1={len(self.m1)} h1={len(self.h1)} (src: {source})", set_status=True)
         asyncio.create_task(self._run())
 
@@ -375,6 +384,7 @@ class BotEngine:
             if (now - self._last_tick_ts) > settings.spec.HEARTBEAT_MAX_STALL_SEC:
                 if self.broker.pos:
                     self.broker.close(self.price or 0.0, exit_type="manual")
+                    self._last_activity_ts = now  # track close as activity
                 self._pause_until = now + settings.spec.HEARTBEAT_PAUSE_MIN * 60
                 self._log("Heartbeat stall: flatten & pause", set_status=False)
 
@@ -395,6 +405,7 @@ class BotEngine:
                 self._fallback_prev_nonneg = False
                 self._reentry_until_ts = 0
                 self._m1_fee_pause_until = 0
+                self._last_activity_ts = new_sod  # reset activity clock at SOD
                 self._log("New UTC day: counters reset", set_status=False)
 
             # VS/PS
@@ -779,7 +790,7 @@ class BotEngine:
                     round_trip_fee_pct = round_trip_fee_pct_base
                     self._taker_fail_events.append(now)
 
-        # Depth / slip & shrink‑to‑fit
+        # Depth / slip & shrink-to-fit
         impact_component = settings.slip_coeff_k * (order_notional / max(1e-9, top3_notional)) * R if top3_notional > 0 else None
         slip_est_maker = slip_est_post
         slip_est_taker = (slip_est_post + (impact_component or 0.0)) if fast_tape_taker else slip_est_post
@@ -894,6 +905,7 @@ class BotEngine:
             ps = self.broker.pos.side
             if (sig.type == "BUY" and ps == "short") or (sig.type == "SELL" and ps == "long"):
                 self.broker.close(entry_price, exit_type="reverse")
+                self._last_activity_ts = now  # count reverse close as activity
                 self._log("Reversed position", set_status=False)
 
         # Open
@@ -921,6 +933,7 @@ class BotEngine:
                 post_only=post_only, fast_tape_taker=fast_tape_taker, crossing_entry=crossing_entry,
                 tf=sig.tf or "m1", scratch_after_sec=240, opened_by=self.router.last_strategy, meta=meta,
             )
+            self._last_activity_ts = now  # NEW: record open as activity
             if sig.tf == "m1":
                 self._last_open_m1 = now
                 # taker fail self-throttle
@@ -965,6 +978,7 @@ class BotEngine:
                 partial_frac = 0.25 if ("breakout" in (p.opened_by or "").lower() or "trend" in (p.opened_by or "").lower()) else 0.30
                 if p.tf == "m1": partial_frac = 0.60
             self.broker.partial_close(partial_frac, self.price, exit_type="partial")
+            self._last_activity_ts = now  # NEW: partial is activity
             # lifecycle telemetry: count partials
             if self.broker.pos and self.broker.pos.meta is not None:
                 self.broker.pos.meta["partials"] = int((self.broker.pos.meta.get("partials") or 0)) + 1
@@ -988,6 +1002,7 @@ class BotEngine:
                     add_qty = (equity * add_risk) / max(1e-9, p.stop_dist)
                     if add_qty > 0:
                         self.broker.scale_in(add_qty, self.price or p.entry)
+                        self._last_activity_ts = now  # NEW: scale-in is activity
                         # Structured pyramid telemetry
                         R0 = float(meta.get("final_stop_dist_R") or p.stop_dist)
                         open_qty = float(meta.get("open_qty") or p.qty)
@@ -1011,6 +1026,7 @@ class BotEngine:
                     add_qty = (equity * add_risk) / max(1e-9, p.stop_dist)
                     if add_qty > 0:
                         self.broker.scale_in(add_qty, self.price or p.entry)
+                        self._last_activity_ts = now  # NEW: scale-in is activity
                         # Update structured telemetry
                         R0 = float(meta.get("final_stop_dist_R") or p.stop_dist)
                         open_qty = float(meta.get("open_qty") or p.qty)
@@ -1029,6 +1045,7 @@ class BotEngine:
             if rsi_now is not None:
                 if (p.side == "long" and rsi_now > 80.0) or (p.side == "short" and rsi_now < 20.0):
                     self.broker.partial_close(0.25, self.price, exit_type="scale")
+                    self._last_activity_ts = now  # NEW: extra scale is activity
                     if self.broker.pos:
                         self.broker.pos.extra_scaled = True
                         if self.broker.pos.meta is not None:
@@ -1095,6 +1112,7 @@ class BotEngine:
                 else:
                     p.meta["loss_R"] = -1.0
             net = self.broker.close(p.take if hit_take else self.price, exit_type=("take" if hit_take else "stop"))
+            self._last_activity_ts = now  # NEW: final close is activity
             r_mult = (net / max(1e-9, base_R_usd)) if net is not None else 0.0
             self._last_Rs.append(r_mult); self._last_Rs = self._last_Rs[-20:]
             self._log(f"Close {'TAKE' if hit_take else 'STOP'} {p.tf} PnL {net:+.2f} ({r_mult:+.2f}R)", set_status=False)
