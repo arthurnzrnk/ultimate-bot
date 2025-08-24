@@ -362,64 +362,98 @@ export default function Dashboard() {
                 <div className="num-lg">${fmt(data.equity, 2)}</div>
               </div>
               <div className="glass mini">
-                <div className="muted-xs">Unrealized (net)</div>
-                <div className={`num-lg ${(data.unrealNet ?? 0) >= 0 ? 'price-up' : 'price-down'}`}>
-                  {(data.unrealNet ?? 0) >= 0 ? '+' : ''}{fmt(data.unrealNet, 2)}
+                <div className="muted-xs">P&amp;L Today</div>
+                <div className={`num-lg ${pnlToday >= 0 ? 'price-up' : 'price-down'}`}>
+                  {pnlToday >= 0 ? '+' : ''}{fmt(pnlToday, 2)}
                 </div>
               </div>
-            </div>
-
-            {pos ? (
-              <div className="pos-grid">
-                <div><span>Side</span><b className="cap">{pos.side}</b></div>
-                <div><span>TF</span><b className="cap">{pos.tf}</b></div>
-                <div><span>Qty</span><b>{fmt(pos.qty, 6)}</b></div>
-                <div><span>Entry</span><b>${fmt(pos.entry, 2)}</b></div>
-                <div><span>Stop</span><b>${fmt(pos.stop, 2)}</b></div>
-                <div><span>Take</span><b>${fmt(pos.take, 2)}</b></div>
-                <div><span>1R ($)</span><b>{fmt(pos.stop_dist, 2)}</b></div>
-                <div><span>BE</span><b className="cap">{pos.be ? 'yes' : 'no'}</b></div>
-                <div><span>Opened</span><b>{new Date((pos.open_time || 0) * 1000).toLocaleTimeString()}</b></div>
+              <div className="glass mini">
+                <div className="muted-xs">Fills Today</div>
+                <div className="num-lg">{fills}</div>
               </div>
+              <div className="glass mini">
+                <div className="muted-xs">Day Lock</div>
+                <div className="num-lg">{data.dayLockArmed ? `Armed ≥ ${fmt(data.dayLockFloorPct, 2)}%` : '—'}</div>
+              </div>
+            </div>
+          </section>
+
+          <section className="glass pcard">
+            <h2 className="card-title">Open Position</h2>
+            {!pos ? (
+              <div className="muted">No open position.</div>
             ) : (
-              <div className="muted-xs">No open position.</div>
+              <table className="table compact">
+                <tbody>
+                  <tr>
+                    <td>Side</td>
+                    <td style={{ textAlign: 'right', textTransform: 'capitalize' }}>{pos.side}</td>
+                  </tr>
+                  <tr>
+                    <td>Qty</td>
+                    <td style={{ textAlign: 'right' }}>{fmt(pos.qty, 6)}</td>
+                  </tr>
+                  <tr>
+                    <td>Entry / Stop / Take</td>
+                    <td style={{ textAlign: 'right' }}>
+                      {fmt(pos.entry, 2)} / {fmt(pos.stop, 2)} / {fmt(pos.take, 2)}
+                    </td>
+                  </tr>
+                  <tr>
+                    <td>1R ($)</td>
+                    <td style={{ textAlign: 'right' }}>{fmt(pos.stop_dist, 2)}</td>
+                  </tr>
+                  <tr>
+                    <td>TP% / Fee→TP</td>
+                    <td style={{ textAlign: 'right' }}>
+                      {meta?.final_tp_pct != null ? `${fmt((meta.final_tp_pct || 0) * 100, 2)}%` : '—'}
+                      {' '} / {meta?.fee_to_tp != null ? fmt(meta.fee_to_tp, 3) : '—'}
+                    </td>
+                  </tr>
+                  <tr>
+                    <td>Fast Tape</td>
+                    <td style={{ textAlign: 'right' }}>
+                      {meta?.fast_tape_taker ? 'TAKER' : 'MAKER'}
+                      {meta?.fast_tape_disabled ? ' (disabled)' : ''}
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
             )}
+          </section>
 
-            {/* Execution / Telemetry quick‑view */}
-            <div className="meta-grid">
-              <div><span>Spread (bps)</span><b>{fmt(data.spreadBps, 2)}</b></div>
-              <div><span>Slip Est ($)</span><b>{fmt(data.slipEst, 2)}</b></div>
-              <div><span>Fee/TP</span><b>{fmt(data.feeToTp, 3)}</b></div>
-              <div><span>VS</span><b>{fmt(data.vs, 2)}</b></div>
-              <div><span>PS</span><b>{fmt(data.ps, 2)}</b></div>
-              <div><span>Taker Fails (30m)</span><b>{fmt(data.takerFailCount30m, 0)}</b></div>
+          <section className="glass pcard">
+            <h2 className="card-title">Tape &amp; Risk</h2>
+            <div className="kv">
+              <div>Spread (bps)</div><div>{fmt(data.spreadBps, 2)}</div>
             </div>
-
-            {pos && meta ? (
-              <details className="telemetry">
-                <summary>Trade Telemetry</summary>
-                <div className="telemetry-kv">
-                  <div><span>Post‑only</span><b>{String(meta.post_only ?? '')}</b></div>
-                  <div><span>Fast‑tape</span><b>{fmt(meta.fast_tape_taker, 0)}</b></div>
-                  <div><span>TP price</span><b>${fmt(meta.tp_price, 2)}</b></div>
-                  <div><span>Final TP%</span><b>{meta.final_tp_pct != null ? fmt((meta.final_tp_pct || 0) * 100, 3) + '%' : '—'}</b></div>
-                  <div><span>R (stop $)</span><b>{fmt(meta.final_stop_dist_R, 2)}</b></div>
-                  <div><span>A+ Gate</span><b>{fmt(meta.a_plus_gate_on, 0)}</b></div>
-                </div>
-              </details>
-            ) : null}
+            <div className="kv">
+              <div>Fee→TP</div><div>{data.feeToTp != null ? fmt(data.feeToTp, 3) : '—'}</div>
+            </div>
+            <div className="kv">
+              <div>Slip Est ($)</div><div>{fmt(data.slipEst, 2)}</div>
+            </div>
+            <div className="kv">
+              <div>Top‑3 Depth ($)</div><div>{fmt(data.top3DepthNotional, 0)}</div>
+            </div>
+            <div className="kv">
+              <div>Red‑Day Level</div><div>{data.redDayLevel ?? 0}</div>
+            </div>
+            <div className="kv">
+              <div>Fast Tape Disabled</div><div>{data.fastTapeDisabled ? 'Yes' : 'No'}{data.takerFailCount30m ? ` (${data.takerFailCount30m})` : ''}</div>
+            </div>
           </section>
 
           <section className="glass pcard">
             <h2 className="card-title">Logs</h2>
-            <div className="logbox" ref={logBoxRef}>
+            <div ref={logBoxRef} className="logbox">
               {loadingLogs ? (
-                <div className="muted-xs">Loading logs…</div>
+                <div className="muted">Loading logs…</div>
               ) : (
                 logs.map((l, i) => (
-                  <div className="log-line" key={`${l.ts}-${i}`}>
-                    <span className="log-ts">{new Date(l.ts * 1000).toLocaleTimeString()}</span>
-                    <span className="log-text">{l.text}</span>
+                  <div key={i} className="logline">
+                    <span className="logts">{new Date(l.ts * 1000).toLocaleTimeString()}</span>
+                    <span className="logtxt">{l.text}</span>
                   </div>
                 ))
               )}
@@ -430,3 +464,4 @@ export default function Dashboard() {
     </div>
   )
 }
+// EOF
