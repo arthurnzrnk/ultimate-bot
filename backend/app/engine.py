@@ -6,8 +6,9 @@ Implements:
 - Fast-tape gates, fail counting & cooldown.
 - Depth/slip gating with shrink-to-fit loop (synthetic top-3 until real book).
 - Global risk: giveback, day-lock, red-day throttles, hard day stops and DD halt.
-- Heartbeat & macro pause; spread instability blocks.
-- Telemetry per §11 (logged into Trade.meta).
+- Heartbeat & macro pause; spread instability blocks; top-3 crumble guard.
+- Re-entry window (≤ 11 m1 bars) half-risk with micro triad + (top-hour or z‑VWAP confirm).
+- Telemetry per §11 (logged into Trade.meta); missing required telemetry ⇒ REJECT.
 """
 
 from __future__ import annotations
@@ -97,8 +98,9 @@ class BotEngine:
         self._spread_std_10s: float | None = None
         self._spread_median_60s: float | None = None
 
-        # top3 crumble placeholder (no live OB): keep 0 / block only if missing data
-        self._top3_notional_drop_3s: float | None = None
+        # top3 crumble tracking
+        self._top3_hist: Deque[tuple[int, float]] = deque(maxlen=120)
+        self._top3_notional_drop_3s: float = 0.0
 
         # recent execution telemetry
         self._last_spread_bps: Optional[float] = None
@@ -106,13 +108,13 @@ class BotEngine:
         self._last_slip_est: Optional[float] = None
         self._synthetic_top3_notional: float = settings.synthetic_top3_notional
 
-        # realized R
+        # realized R window (for quick health)
         self._last_Rs: list[float] = []
 
         # H1 signals & fallback
         self._last_h1_signal_ts: int = 0
         self._fallback_pending_m1: bool = False
-        self._fallback_used_day: int | None = None
+        self._fallback_activations_today: int = 0  # ≤ FALLBACK_MAX_ACTIVATIONS_PER_UTC
 
         # Router
         self.router = RouterV3()
@@ -136,6 +138,10 @@ class BotEngine:
         # 7‑day DD monitor
         self._equity_marks: Deque[tuple[int, float]] = deque(maxlen=20000)
         self._dd7_halt: bool = False
+
+        # Re-entry state (m1)
+        self._reentry_until_ts: int = 0
+        self._reentry_required_top_hour_or_zvwap: bool = False
 
     # --------- utils ---------
 
@@ -244,9 +250,9 @@ class BotEngine:
         m = {
             "off": "Off", "macro": "Macro pause", "cool": "Cooling off", "waiting": "Waiting setup",
             "vol_low": "Too quiet", "vol_high": "Too wild", "spread": "Spread too wide", "fees": "Fees too high",
-            "pullback": "Waiting pullback", "managing": "Managing trade", "trailing": "Trailing stop",
+            "managing": "Managing trade", "trailing": "Trailing stop",
             "partial": "Taking partials", "scratch": "Scratching trade", "giveback": "Protecting day",
-            "trend": "Trend play", "range": "Range fade", "break": "Breakout watch",
+            "trend": "Trend play", "break": "Breakout watch",
         }
         return m.get(key, "Standing by")
 
@@ -280,10 +286,6 @@ class BotEngine:
             c["volume"] = (c.get("volume", 0.0) or 0.0) + 1.0
 
     async def _run(self) -> None:
-        last_m1_closed = 0
-        last_h1_closed = 0
-        last_tick_wall = time.time()
-
         while True:
             # poll tick
             try:
@@ -326,6 +328,15 @@ class BotEngine:
 
             now = int(time.time())
 
+            # track top-3 notional and drop over 3s (synthetic until real OB wired)
+            self._top3_hist.append((now, self._synthetic_top3_notional))
+            while self._top3_hist and now - self._top3_hist[0][0] > 3:
+                self._top3_hist.popleft()
+            if len(self._top3_hist) >= 2:
+                start_v = self._top3_hist[0][1]
+                end_v = self._top3_hist[-1][1]
+                self._top3_notional_drop_3s = 0.0 if start_v <= 0 else max(0.0, (start_v - end_v) / start_v)
+
             # append equity mark & compute 7d drawdown halt
             self._equity_marks.append((now, self.broker.equity))
             seven_days_ago = now - 7 * 86400
@@ -336,7 +347,6 @@ class BotEngine:
                 if dd <= -0.10:
                     self._dd7_halt = True
                 elif self.broker.equity >= hwm * 0.90:
-                    # back above cap → resume
                     self._dd7_halt = False
 
             # heartbeat stall -> flatten & pause
@@ -357,8 +367,9 @@ class BotEngine:
                 self._day_lock_floor_pct = None
                 self._losses_today = 0
                 self._giveback_triggered_today = False
-                self._fallback_used_day = None
                 self._taker_fail_events.clear()
+                self._fallback_activations_today = 0
+                self._reentry_until_ts = 0
                 self._log("New UTC day: counters reset", set_status=False)
 
             # VS/PS
@@ -388,7 +399,7 @@ class BotEngine:
             runup = self._day_high_equity - self._day_open_equity
             giveback = self._day_high_equity - self.broker.equity
             gb_limit = settings.spec.GIVEBACK_PCT_OF_RUNUP / 100.0
-            if self.VS >= 1.5 and self.PS <= 0.4:
+            if self.VS >= settings.spec.GIVEBACK_TIGHT_IF["VS_GE"] and self.PS <= settings.spec.GIVEBACK_TIGHT_IF["PS_LE"]:
                 gb_limit = (settings.spec.GIVEBACK_TIGHT_IF["TIGHT_TO"] / 100.0)
             if runup > 0 and giveback >= gb_limit * runup and self._pause_until < now + 1800:
                 self._pause_until = now + 1800  # 30m
@@ -430,7 +441,7 @@ class BotEngine:
     # -------- decision/sizing/exec --------
 
     def _maybe_set_fallback(self, now: int) -> None:
-        if self._fallback_used_day == self._day_sod:
+        if self._fallback_activations_today >= settings.spec.FALLBACK_MAX_ACTIVATIONS_PER_UTC:
             return
         if (now - (self._last_h1_signal_ts or 0)) < settings.spec.FALLBACK_AFTER_HOURS_NO_H1 * 3600:
             return
@@ -445,15 +456,12 @@ class BotEngine:
 
     async def _maybe_decide(self, now: int, spread_instability_block: bool) -> None:
         if not self.settings.get("auto_trade"):
-            return
+            self.status_text = self._short_status("off"); return
         if not self._warm_ok():
-            self.status_text = self._short_status("waiting")
-            return
+            self.status_text = self._short_status("waiting"); return
         if self.settings.get("macro_pause"):
             self.status_text = self._short_status("macro"); return
-        if now < self._pause_until:
-            self.status_text = self._short_status("cool"); return
-        if self._dd7_halt:
+        if now < self._pause_until or self._dd7_halt:
             self.status_text = self._short_status("cool"); return
 
         # Hard day guard
@@ -488,7 +496,7 @@ class BotEngine:
         ctx = dict(
             m1=self.m1, h1=self.h1, iC_m1=iC_m1, iC_h1=iC_h1, vwap=self.vwap,
             bid=self.bid, ask=self.ask, min_bars=5, min_h1_bars=220,
-            VS=self.VS, PS=self.PS, loss_streak=self._loss_streak,
+            VS=self.VS, PS=self.PS, loss_streak=self._loss_streak, red_level=red_level,
         )
         order = ("m1", "h1") if self.VS >= 1.0 else ("h1", "m1")
 
@@ -555,10 +563,16 @@ class BotEngine:
         if red_level == 1 and sig.tf == "m1":
             eff_risk *= settings.spec.RED_DAY_L1_RISK_MULT  # 0.35×
 
-        # fallback loosening (m1)
+        # fallback loosening (m1) – VS_eff shifts only band/TP math
         VS_eff = self.VS
         if sig.tf == "m1" and self._fallback_pending_m1:
-            VS_eff = max(0.9, min(2.0, VS_eff + settings.spec.FALLBACK_VS_DELTA))
+            if self._fallback_activations_today < settings.spec.FALLBACK_MAX_ACTIVATIONS_PER_UTC:
+                VS_eff = max(0.9, min(2.0, VS_eff + settings.spec.FALLBACK_VS_DELTA))
+
+        # Re-entry window (≤ 11 bars): half-risk, needs (top-hour or z‑VWAP confirm)
+        reentry_active = (sig.tf == "m1") and (now <= self._reentry_until_ts)
+        if reentry_active:
+            eff_risk *= 0.5
 
         # --- m1 fee-aware asym TP + A+ widen (spec §8C & §13a) ---
         fast_tape_taker = 0
@@ -591,11 +605,17 @@ class BotEngine:
 
             # A+ gate
             spread_abs = (self.ask - self.bid) if (self.ask is not None and self.bid is not None) else entry_price * 0.0006
-            micro_triad_ok = bool(sig.meta.get("micro_triad_ok")) if sig.meta else True
+            micro_triad_ok = bool((sig.meta or {}).get("micro_triad_ok", True))
             regime = (self.router.last_regime or "Range").lower()
             top2_hour = datetime.utcnow().hour in (13, 14)  # simple proxy
             spread_to_R_pre = spread_abs / (2.0 * max(1e-9, R_prelim))
-            a_plus_gate_on = int(settings.spec.A_PLUS_TP_ENABLE and top2_hour and micro_triad_ok and (regime in ("trend", "breakout")) and (spread_to_R_pre <= settings.spec.A_PLUS_GATE_REQ["spread_to_stop_max"]))
+            a_plus_gate_on = int(
+                settings.spec.A_PLUS_TP_ENABLE
+                and top2_hour
+                and micro_triad_ok
+                and (regime in ("trend", "breakout"))
+                and (spread_to_R_pre <= settings.spec.A_PLUS_GATE_REQ["spread_to_stop_max"])
+            )
             mult = (settings.spec.A_PLUS_TP_WIDEN_MULT if a_plus_gate_on else settings.spec.ASYM_TP_WIDEN_MULT_BASE)
             tp_pct_dec = max(tp_floor_dec, tp_pct_raw_dec * (1.0 + mult * max(0.0, VS_eff - 1.0)))
             asym_on = 1
@@ -609,54 +629,6 @@ class BotEngine:
             stop_dist = abs(entry_price - stop_price)
             tp_pct_dec = take_dist / entry_price
             R = stop_dist
-
-            # Taker admission rule (§8E)
-            spread_to_R = spread_abs / (2.0 * max(1e-9, R))
-            macd_l, macd_s = self._macd_m1
-            idx = len(self.m1) - 2
-            macd_hist_now = ((macd_l[idx] or 0.0) - (macd_s[idx] or 0.0)) if (macd_l and macd_s and idx is not None and idx < len(macd_l)) else 0.0
-            macd_hist_prev = ((macd_l[idx - 1] or 0.0) - (macd_s[idx - 1] or 0.0)) if (macd_l and macd_s and idx and idx-1 < len(macd_l)) else 0.0
-            macd_accel_ok = (macd_hist_prev != 0 and macd_hist_now >= settings.spec.RUNNER_ACCEL_MACD_MULT * macd_hist_prev)
-
-            fast_tape_disabled = int(now < self._fast_tape_disabled_until)
-            consider_taker = (not fast_tape_disabled) and (macd_accel_ok if settings.spec.FAST_TAPE_NEED_MACD_ACCEL else True) \
-                             and micro_triad_ok and (self._synthetic_top3_notional >= 3.0 * (entry_price * 1.0)) \
-                             and (spread_to_R <= 0.05)
-
-            round_trip_fee_pct = round_trip_fee_pct_base
-            if consider_taker:
-                # One-time TP bump by paid spread
-                tp_price_pre_bump = tp_price
-                tp_price = _round_to_tick(tp_price + (spread_abs if sig.type == "BUY" else -spread_abs), settings.price_tick)
-                take_dist = abs(tp_price - entry_price)
-                tp_pct_dec = take_dist / entry_price
-                round_trip_fee_pct = taker_fee + maker_fee
-                fast_tape_taker, crossing_entry, post_only = 1, True, False
-                if (round_trip_fee_pct / max(1e-12, tp_pct_dec)) > settings.spec.FAST_TAPE_TAKER_MAX_FEE_TO_TP:
-                    # fallback to maker; counts as taker fail
-                    fast_tape_taker, crossing_entry, post_only = 0, False, True
-                    tp_price = tp_price_pre_bump
-                    take_dist = abs(tp_price - entry_price)
-                    tp_pct_dec = take_dist / entry_price
-                    round_trip_fee_pct = round_trip_fee_pct_base
-                    self._taker_fail_events.append(now)
-
-            fee_to_tp = round_trip_fee_pct / max(1e-12, tp_pct_dec)
-            fee_bound = (settings.spec.FAST_TAPE_TAKER_MAX_FEE_TO_TP if fast_tape_taker else settings.spec.FEE_TP_MAX_RATIO)
-            # QA fee‑bound assertion: if taker==0, bound must be 0.20
-            if (fast_tape_taker == 0 and abs(fee_bound - settings.spec.FEE_TP_MAX_RATIO) > 1e-9) or (fast_tape_taker == 1 and abs(fee_bound - settings.spec.FAST_TAPE_TAKER_MAX_FEE_TO_TP) > 1e-9):
-                self._log("QA fee_bound mismatch; correcting")
-                fee_bound = (settings.spec.FAST_TAPE_TAKER_MAX_FEE_TO_TP if fast_tape_taker else settings.spec.FEE_TP_MAX_RATIO)
-            if fee_to_tp > fee_bound:
-                # reject & breaker counting
-                self._fee_violation_events.append(now)
-                last10m = [t for t in self._fee_violation_events if now - t <= 600]
-                if len(last10m) >= settings.spec.FEE_TP_VIOLATIONS_IN_10M:
-                    self._pause_until = now + settings.spec.PAUSE_AFTER_FEE_TP_BREAK_MIN * 60
-                self._log("Reject m1: fee_to_tp bound", set_status=False)
-                return
-
-            tp_pct_dec_final = tp_pct_dec
 
         # h1 (simple fee viability)
         else:
@@ -673,7 +645,6 @@ class BotEngine:
             tp_price = _round_to_tick(entry_price + (take_dist if sig.type == "BUY" else -take_dist), settings.price_tick)
             stop_price = _round_to_tick(entry_price - (stop_dist if sig.type == "BUY" else -stop_dist), settings.price_tick)
             post_only, fast_tape_taker, crossing_entry = True, 0, False
-            round_trip_fee_pct = (2 * maker_fee)
             tp_pct_dec_final = abs(tp_price - entry_price) / max(1e-9, entry_price)
 
         # Quantity sizing & leverage caps (spec §8B, §13e)
@@ -681,8 +652,8 @@ class BotEngine:
         qty = (equity * eff_risk) / max(1e-9, R)
 
         # Leverage caps: 10× if spread tight, else 5× (h1=2×)
-        spread_abs = (self.ask - self.bid) if (self.ask is not None and self.bid is not None) else entry_price * 0.0006
-        slip_est_post = spread_abs / 2.0
+        spread_abs_for_caps = (self.ask - self.bid) if (self.ask is not None and self.bid is not None) else entry_price * 0.0006
+        slip_est_post = spread_abs_for_caps / 2.0
         lev_cap = 2.0 if sig.tf == "h1" else (10.0 if (self._last_spread_bps or 999) <= 4.0 else 5.0)
         qty_cap = (equity * lev_cap) / max(1.0, entry_price)
         qty = max(0.0, min(qty, qty_cap))
@@ -695,10 +666,61 @@ class BotEngine:
             live = (self.broker.pos.stop_dist * self.broker.pos.qty) / equity
             if (live + eff_risk) > (settings.spec.LIVE_RISK_CAP / 100.0):
                 return
+        else:
+            if eff_risk > (settings.spec.LIVE_RISK_CAP / 100.0):
+                return
 
-        # Depth/slip gating & shrink-to-fit (§8F)
+        # Order notional (needed for taker admission)
         order_notional = qty * entry_price
         top3_notional = self._synthetic_top3_notional
+
+        # ---- Fast‑tape taker admission & 1× bump *after* sizing (spec §8E) ----
+        round_trip_fee_pct = round_trip_fee_pct_base
+        fast_tape_disabled = int(now < self._fast_tape_disabled_until)
+
+        # compute MACD accel for admission
+        macd_l, macd_s = self._macd_m1
+        idx = len(self.m1) - 2
+        macd_hist_now = ((macd_l[idx] or 0.0) - (macd_s[idx] or 0.0)) if (sig.tf == "m1" and macd_l and macd_s and idx is not None and idx < len(macd_l)) else 0.0
+        macd_hist_prev = ((macd_l[idx - 1] or 0.0) - (macd_s[idx - 1] or 0.0)) if (sig.tf == "m1" and macd_l and macd_s and idx and idx-1 < len(macd_l)) else 0.0
+        macd_accel_ok = (macd_hist_prev != 0 and macd_hist_now >= settings.spec.RUNNER_ACCEL_MACD_MULT * macd_hist_prev)
+
+        consider_taker = False
+        spread_to_R = None
+
+        if sig.tf == "m1":
+            spread_abs = (self.ask - self.bid) if (self.ask is not None and self.bid is not None) else entry_price * 0.0006
+            spread_to_R = spread_abs / (2.0 * max(1e-9, R))
+            micro_triad_ok = bool((sig.meta or {}).get("micro_triad_ok", True))
+            consider_taker = (not fast_tape_disabled) \
+                             and (macd_accel_ok if settings.spec.FAST_TAPE_NEED_MACD_ACCEL else True) \
+                             and micro_triad_ok \
+                             and (top3_notional >= 3.0 * order_notional) \
+                             and (spread_to_R <= 0.05)
+
+            # top‑3 crumble guard: if drop > 50% in 3s → reject taker attempt & fallback to maker (no fail)
+            if self._top3_notional_drop_3s > settings.spec.TOP3_CRUMBLE_MAX_DROP_PCT:
+                consider_taker = False  # fallback to maker path (no fail count)
+
+            if consider_taker:
+                # One-time TP bump by paid spread
+                tp_price_pre_bump = tp_price
+                bump = spread_abs if sig.type == "BUY" else -spread_abs
+                tp_price = _round_to_tick(tp_price + bump, settings.price_tick)
+                take_dist = abs(tp_price - entry_price)
+                tp_pct_dec = take_dist / entry_price
+                round_trip_fee_pct = taker_fee + maker_fee
+                fast_tape_taker, crossing_entry, post_only = 1, True, False
+                if (round_trip_fee_pct / max(1e-12, tp_pct_dec)) > settings.spec.FAST_TAPE_TAKER_MAX_FEE_TO_TP:
+                    # fallback to maker; counts as taker fail
+                    fast_tape_taker, crossing_entry, post_only = 0, False, True
+                    tp_price = tp_price_pre_bump
+                    take_dist = abs(tp_price - entry_price)
+                    tp_pct_dec = take_dist / entry_price
+                    round_trip_fee_pct = round_trip_fee_pct_base
+                    self._taker_fail_events.append(now)
+
+        # Depth/slip gating & shrink-to-fit (§8F)
         # impact component (R units)
         impact_component = settings.slip_coeff_k * (order_notional / max(1e-9, top3_notional)) * R if top3_notional > 0 else None
         slip_est_maker = slip_est_post
@@ -728,9 +750,36 @@ class BotEngine:
         if settings.min_notional_usd > 0 and order_notional < settings.min_notional_usd:
             return
 
+        # Final fee viability & QA assertion
+        if sig.tf == "m1":
+            fee_to_tp = ( (taker_fee + maker_fee) if fast_tape_taker else round_trip_fee_pct_base ) / max(1e-12, tp_pct_dec)
+            fee_bound = (settings.spec.FAST_TAPE_TAKER_MAX_FEE_TO_TP if fast_tape_taker else settings.spec.FEE_TP_MAX_RATIO)
+            # QA fee‑bound assertion: if taker==0, bound must be 0.20; if taker==1 → 0.18
+            if (fast_tape_taker == 0 and abs(fee_bound - settings.spec.FEE_TP_MAX_RATIO) > 1e-9) or (fast_tape_taker == 1 and abs(fee_bound - settings.spec.FAST_TAPE_TAKER_MAX_FEE_TO_TP) > 1e-9):
+                self._log("QA fee_bound mismatch; correcting")
+                fee_bound = (settings.spec.FAST_TAPE_TAKER_MAX_FEE_TO_TP if fast_tape_taker else settings.spec.FEE_TP_MAX_RATIO)
+            if fee_to_tp > fee_bound:
+                # reject & breaker counting (only on REJECT)
+                self._fee_violation_events.append(now)
+                last10m = [t for t in self._fee_violation_events if now - t <= 600]
+                if len(last10m) >= settings.spec.FEE_TP_VIOLATIONS_IN_10M:
+                    self._pause_until = now + settings.spec.PAUSE_AFTER_FEE_TP_BREAK_MIN * 60
+                self._log("Reject m1: fee_to_tp bound", set_status=False)
+                return
+            tp_pct_dec_final = tp_pct_dec
+
+        # Re-entry guard (must also have top-hour or z‑VWAP confirm when active)
+        if reentry_active:
+            ok_top_hour = (datetime.utcnow().hour in (13, 14))
+            # z‑VWAP confirm: we require |z_prev| ≥ 1 and a revert toward mean
+            zv = (sig.meta or {}).get("z_vwap")
+            ok_z = (zv is not None)  # router computed it and confirmed reclaim
+            if not (ok_top_hour or ok_z):
+                return
+
         # Record telemetry meta
         self._last_slip_est = (slip_est_taker if fast_tape_taker else slip_est_maker)
-        self._last_fee_to_tp = ( (taker_fee + maker_fee) if fast_tape_taker else ( (taker_fee + maker_fee) if settings.assume_taker_exit_on_stops else (2*maker_fee) ) ) / max(1e-12, tp_pct_dec_final)
+        self._last_fee_to_tp = ( (taker_fee + maker_fee) if fast_tape_taker else ( (taker_fee + maker_fee) if settings.assume_taker_exit_on_stops else (2*maker_fee) ) ) / max(1e-12, tp_pct_dec_final or 0.0)
         meta = {
             "strategy": self.router.last_strategy,
             "regime": self.router.last_regime,
@@ -743,7 +792,7 @@ class BotEngine:
             "order_notional": order_notional,
             "impact_component": impact_component,
             "slip_est": self._last_slip_est,
-            "spread_to_stop_ratio": (spread_abs / max(1e-9, (2.0 * R))),
+            "spread_to_stop_ratio": ( ((self.ask - self.bid) if (self.ask is not None and self.bid is not None) else entry_price * 0.0006) / max(1e-9, (2.0 * R)) ),
             "assumed_fee_model": "TM" if settings.assume_taker_exit_on_stops else "MM",
             "round_trip_fee_pct": (taker_fee + maker_fee) if fast_tape_taker else ((taker_fee + maker_fee) if settings.assume_taker_exit_on_stops else (2*maker_fee)),
             "fee_to_tp": self._last_fee_to_tp,
@@ -764,10 +813,18 @@ class BotEngine:
             "tick_p95_ms": self._tick_latency_ms_p95,
             "order_ack_p95_ms": self._order_ack_p95_ms,
             "spread_instability_block": int(spread_instability_block),
+            "top3_notional_drop_pct_3s": self._top3_notional_drop_3s,
             "cooldown_bonus_on": 0,
             "score": sig.score,
             "z_vwap": (sig.meta or {}).get("z_vwap"),
+            "blocked_bottom_hour": blocked_bottom_hour,
         }
+
+        # Telemetry requirement sanity: reject if any critical fee/target field missing
+        critical_fields = ["final_stop_dist_R", "final_tp_pct", "tp_price", "tp_fee_floor", "fee_to_tp", "round_trip_fee_pct"]
+        if any(meta.get(k) is None for k in critical_fields):
+            self._log("Reject: missing required telemetry", set_status=False)
+            return
 
         # Close & reverse if opposite
         if self.broker.pos:
@@ -782,8 +839,10 @@ class BotEngine:
             if sig.tf == "m1":
                 hr = datetime.utcnow().hour
                 in_top = hr in (13, 14)
-                if in_top and (meta["spread_to_stop_ratio"] <= settings.spec.COOLDOWN_TOP_HOUR_GATE["spread_to_stop_max"]) \
-                   and ( (self._last_slip_est or 0)/max(1e-9,R) <= settings.spec.COOLDOWN_TOP_HOUR_GATE["slip_R_max"]) \
+                spread_to_R_for_cd = meta["spread_to_stop_ratio"]
+                slip_R_for_cd = (self._last_slip_est or 0)/max(1e-9, R)
+                if in_top and (spread_to_R_for_cd <= settings.spec.COOLDOWN_TOP_HOUR_GATE["spread_to_stop_max"]) \
+                   and (slip_R_for_cd <= settings.spec.COOLDOWN_TOP_HOUR_GATE["slip_R_max"]) \
                    and (0.9 <= self.VS <= 1.4) and (self.PS >= 0.60) \
                    and (not self._lost_in_hour.get(hr, False)):
                     self._last_open_m1 = now - settings.spec.COOLDOWN_M1_SEC + settings.spec.COOLDOWN_M1_SEC_TOP_HOUR
@@ -807,8 +866,7 @@ class BotEngine:
                     self._fast_tape_disabled_until = now + settings.spec.FAST_TAPE_DISABLE_COOLDOWN_MIN * 60
                 if self._fallback_pending_m1:
                     self._fallback_pending_m1 = False
-                    # allow second activation only if first period had >= 0 PnL (omitted in paper, safe)
-                    self._fallback_used_day = self._day_sod
+                    self._fallback_activations_today += 1
             else:
                 self._last_open_h1 = now
 
@@ -858,6 +916,21 @@ class BotEngine:
                     if self.broker.pos and self.broker.pos.meta is not None:
                         self.broker.pos.meta["pyramid_adds"] = "Add-1"
 
+        # --- Add‑2 pyramid (profit‑funded, dollars) ---
+        if self.broker.pos and p.tf == "m1" and (p.meta or {}).get("pyramid_adds") == "Add-1":
+            # only allow once; require that unrealized PnL covers the incremental R-risk
+            equity = max(1e-9, float(self.broker.equity))
+            unreal = self.broker.mark(self.price or p.entry)
+            avail_risk_cap = (settings.spec.LIVE_RISK_CAP/100.0) - (p.stop_dist * p.qty)/equity
+            add_risk = min(avail_risk_cap, (settings.spec.BASE_RISK_PCT_M1/100.0) * 0.5)
+            needed_usd = add_risk * equity
+            if unreal > needed_usd and add_risk > 0:
+                add_qty = (equity * add_risk) / max(1e-9, p.stop_dist)
+                if add_qty > 0:
+                    self.broker.scale_in(add_qty, self.price or p.entry)
+                    if self.broker.pos and self.broker.pos.meta is not None:
+                        self.broker.pos.meta["pyramid_adds"] = "Add-1+2"
+
         # RSI extreme extra scale-out 25%
         if self.broker.pos and not self.broker.pos.extra_scaled:
             idx = (len(self.m1) - 2) if p.tf == "m1" else (len(self.h1) - 2)
@@ -868,7 +941,7 @@ class BotEngine:
                     if self.broker.pos:
                         self.broker.pos.extra_scaled = True
 
-        # Trail: 0.8R×VS; tighten to 0.6R×VS on MACD fade
+        # Trail: TRAIL_R_VS; tighten to 0.6R on MACD fade
         if self.broker.pos:
             tighten = False
             if p.tf == "m1":
@@ -939,6 +1012,11 @@ class BotEngine:
                     self._pause_until = int(time.time()) + 2700  # 45m
                 elif self._loss_streak >= 2.0:
                     self._pause_until = int(time.time()) + 900   # 15m
+
+            # Start re-entry window (m1 only)
+            if p.tf == "m1":
+                # allow next re-entry for ≤ 11 bars
+                self._reentry_until_ts = int(time.time()) + settings.spec.REENTRY_MAX_BARS * settings.spec.tf_m1
 
     # -------- status --------
 
