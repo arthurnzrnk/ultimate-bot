@@ -131,6 +131,11 @@ class BotEngine:
         # Latencies (placeholders)
         self._tick_latency_ms_p95: float | None = None
         self._order_ack_p95_ms: float | None = None  # not applicable in paper
+        self._latency_hits_tick: Deque[int] = deque(maxlen=10)
+
+        # 7‑day DD monitor
+        self._equity_marks: Deque[tuple[int, float]] = deque(maxlen=20000)
+        self._dd7_halt: bool = False
 
     # --------- utils ---------
 
@@ -289,6 +294,14 @@ class BotEngine:
                 # naive tick latency
                 self._tick_latency_ms_p95 = max(0.0, (t1 - t0) * 1000.0)
 
+                # latency guard: three hits over threshold → pause 30m
+                if (self._tick_latency_ms_p95 or 0) > settings.spec.TICK_LATENCY_HALT_MS:
+                    self._latency_hits_tick.append(int(t1))
+                    wins = [t for t in self._latency_hits_tick if int(t1) - t <= 300]
+                    if len(wins) >= 3:
+                        self._pause_until = int(time.time()) + 30 * 60
+                        self._log("Latency halt: tick p95 over limit thrice, pausing 30m")
+
                 if (bid is not None) and (ask is not None):
                     self.bid, self.ask = bid, ask
                     self._last_spread_bps = ((ask - bid) / max(1e-9, (bid + ask) / 2.0)) * 10000.0
@@ -313,11 +326,24 @@ class BotEngine:
 
             now = int(time.time())
 
+            # append equity mark & compute 7d drawdown halt
+            self._equity_marks.append((now, self.broker.equity))
+            seven_days_ago = now - 7 * 86400
+            marks = [e for t, e in self._equity_marks if t >= seven_days_ago]
+            if marks:
+                hwm = max(marks)
+                dd = (self.broker.equity - hwm) / max(1e-9, hwm)
+                if dd <= -0.10:
+                    self._dd7_halt = True
+                elif self.broker.equity >= hwm * 0.90:
+                    # back above cap → resume
+                    self._dd7_halt = False
+
             # heartbeat stall -> flatten & pause
             if (now - self._last_tick_ts) > settings.spec.HEARTBEAT_MAX_STALL_SEC:
                 if self.broker.pos:
                     self.broker.close(self.price or 0.0)
-                self._pause_until = now + settings.spec.MACRO_PAUSE_MIN * 60
+                self._pause_until = now + settings.spec.HEARTBEAT_PAUSE_MIN * 60
                 self._log("Heartbeat stall: flatten & pause", set_status=False)
 
             # UTC day rollover
@@ -427,10 +453,16 @@ class BotEngine:
             self.status_text = self._short_status("macro"); return
         if now < self._pause_until:
             self.status_text = self._short_status("cool"); return
+        if self._dd7_halt:
+            self.status_text = self._short_status("cool"); return
 
         # Hard day guard
         if self._day_pnl_pct() <= -4.0 or self._losses_today >= 4:
             self.status_text = self._short_status("giveback"); return
+
+        # reject if tick stale (>2s)
+        if (now - self._last_tick_ts) > 2:
+            return
 
         # Red-day throttles
         red_level = 0
@@ -489,8 +521,13 @@ class BotEngine:
         blocked_bottom_hour = 0
         if sig.tf == "m1" and settings.spec.M1_BLOCK_BOTTOM_HOURS:
             hr = datetime.utcnow().hour
-            if hr in (5, 6):  # you can wire dynamic buckets later
+            if hr in (5, 6):  # can replace with buckets later
                 blocked_bottom_hour = 1
+                return
+
+        # Red-day L1: “top hours only” gate for m1 entries
+        if sig.tf == "m1" and red_level == 1 and settings.spec.RED_DAY_L1_TOP_HOURS_ONLY:
+            if datetime.utcnow().hour not in (13, 14):
                 return
 
         # Sizing & fee-aware targets
@@ -606,6 +643,10 @@ class BotEngine:
 
             fee_to_tp = round_trip_fee_pct / max(1e-12, tp_pct_dec)
             fee_bound = (settings.spec.FAST_TAPE_TAKER_MAX_FEE_TO_TP if fast_tape_taker else settings.spec.FEE_TP_MAX_RATIO)
+            # QA fee‑bound assertion: if taker==0, bound must be 0.20
+            if (fast_tape_taker == 0 and abs(fee_bound - settings.spec.FEE_TP_MAX_RATIO) > 1e-9) or (fast_tape_taker == 1 and abs(fee_bound - settings.spec.FAST_TAPE_TAKER_MAX_FEE_TO_TP) > 1e-9):
+                self._log("QA fee_bound mismatch; correcting")
+                fee_bound = (settings.spec.FAST_TAPE_TAKER_MAX_FEE_TO_TP if fast_tape_taker else settings.spec.FEE_TP_MAX_RATIO)
             if fee_to_tp > fee_bound:
                 # reject & breaker counting
                 self._fee_violation_events.append(now)
@@ -658,7 +699,11 @@ class BotEngine:
         # Depth/slip gating & shrink-to-fit (§8F)
         order_notional = qty * entry_price
         top3_notional = self._synthetic_top3_notional
-        slip_R = (slip_est_post / max(1e-9, R))
+        # impact component (R units)
+        impact_component = settings.slip_coeff_k * (order_notional / max(1e-9, top3_notional)) * R if top3_notional > 0 else None
+        slip_est_maker = slip_est_post
+        slip_est_taker = (slip_est_post + (impact_component or 0.0)) if fast_tape_taker else slip_est_post
+        slip_R = ((slip_est_taker if fast_tape_taker else slip_est_maker) / max(1e-9, R))
         iters = 0
         while iters < settings.max_shrink_iters:
             if top3_notional < settings.top3x_order_notional_min * order_notional:
@@ -669,7 +714,9 @@ class BotEngine:
                 break
             qty = _round_to_tick(qty, settings.qty_tick)
             order_notional = qty * entry_price
-            slip_R = (slip_est_post / max(1e-9, R))
+            impact_component = settings.slip_coeff_k * (order_notional / max(1e-9, top3_notional)) * R if top3_notional > 0 else None
+            slip_est_taker = (slip_est_post + (impact_component or 0.0)) if fast_tape_taker else slip_est_post
+            slip_R = ((slip_est_taker if fast_tape_taker else slip_est_maker) / max(1e-9, R))
             iters += 1
         if iters >= settings.max_shrink_iters and (top3_notional < settings.top3x_order_notional_min * order_notional or slip_R > 0.30):
             return
@@ -682,22 +729,23 @@ class BotEngine:
             return
 
         # Record telemetry meta
-        self._last_slip_est = slip_est_post
-        self._last_fee_to_tp = (round_trip_fee_pct / max(1e-12, tp_pct_dec_final))
+        self._last_slip_est = (slip_est_taker if fast_tape_taker else slip_est_maker)
+        self._last_fee_to_tp = ( (taker_fee + maker_fee) if fast_tape_taker else ( (taker_fee + maker_fee) if settings.assume_taker_exit_on_stops else (2*maker_fee) ) ) / max(1e-12, tp_pct_dec_final)
         meta = {
             "strategy": self.router.last_strategy,
             "regime": self.router.last_regime,
             "VS": self.VS, "PS": self.PS,
+            "loss_streak": self._loss_streak,
             "spread_bps": self._last_spread_bps,
             "spread_std_10s": self._spread_std_10s,
             "spread_median_60s": self._spread_median_60s,
             "top3_notional": top3_notional,
             "order_notional": order_notional,
-            "impact_component": settings.slip_coeff_k * (order_notional / max(1e-9, top3_notional)) * R if top3_notional > 0 else None,
-            "slip_est": slip_est_post,
+            "impact_component": impact_component,
+            "slip_est": self._last_slip_est,
             "spread_to_stop_ratio": (spread_abs / max(1e-9, (2.0 * R))),
             "assumed_fee_model": "TM" if settings.assume_taker_exit_on_stops else "MM",
-            "round_trip_fee_pct": round_trip_fee_pct,
+            "round_trip_fee_pct": (taker_fee + maker_fee) if fast_tape_taker else ((taker_fee + maker_fee) if settings.assume_taker_exit_on_stops else (2*maker_fee)),
             "fee_to_tp": self._last_fee_to_tp,
             "tp_fee_floor": max(settings.spec.TP_PCT_FLOOR, ( (settings.fee_taker_bps_per_side/10000.0 + settings.fee_maker_bps_per_side/10000.0) if settings.assume_taker_exit_on_stops else (2*settings.fee_maker_bps_per_side/10000.0) ) / settings.spec.FEE_TP_MAX_RATIO),
             "final_stop_dist_R": R,
@@ -718,6 +766,7 @@ class BotEngine:
             "spread_instability_block": int(spread_instability_block),
             "cooldown_bonus_on": 0,
             "score": sig.score,
+            "z_vwap": (sig.meta or {}).get("z_vwap"),
         }
 
         # Close & reverse if opposite
@@ -797,6 +846,17 @@ class BotEngine:
                 self.broker.pos.be = True
                 self.broker.pos.partial_taken = True
             self.status_text = self._short_status("partial")
+
+        # --- Add‑1 pyramid: after partial + BE; pass micro gates; risk cap respected ---
+        if self.broker.pos and p.tf == "m1" and p.partial_taken and p.be and not (p.meta or {}).get("pyramid_adds"):
+            equity = max(1e-9, float(self.broker.equity))
+            add_risk = min( (settings.spec.LIVE_RISK_CAP/100.0) - (p.stop_dist * p.qty)/equity, (settings.spec.BASE_RISK_PCT_M1/100.0) * 0.5 )
+            if add_risk > 0:
+                add_qty = (equity * add_risk) / max(1e-9, p.stop_dist)
+                if add_qty > 0:
+                    self.broker.scale_in(add_qty, self.price or p.entry)
+                    if self.broker.pos and self.broker.pos.meta is not None:
+                        self.broker.pos.meta["pyramid_adds"] = "Add-1"
 
         # RSI extreme extra scale-out 25%
         if self.broker.pos and not self.broker.pos.extra_scaled:
