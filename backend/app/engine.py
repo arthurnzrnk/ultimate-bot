@@ -789,6 +789,11 @@ class BotEngine:
                     tp_pct_dec = take_dist / entry_price
                     round_trip_fee_pct = round_trip_fee_pct_base
                     self._taker_fail_events.append(now)
+                    # --- NEW: prune to 30m window and self‑throttle immediately per §8E ---
+                    while self._taker_fail_events and now - self._taker_fail_events[0] > settings.spec.FAST_TAPE_DISABLE_WINDOW_MIN * 60:
+                        self._taker_fail_events.popleft()
+                    if len(self._taker_fail_events) >= settings.spec.FAST_TAPE_DISABLE_AFTER_FAILS:
+                        self._fast_tape_disabled_until = now + settings.spec.FAST_TAPE_DISABLE_COOLDOWN_MIN * 60
 
         # Depth / slip & shrink-to-fit
         impact_component = settings.slip_coeff_k * (order_notional / max(1e-9, top3_notional)) * R if top3_notional > 0 else None
@@ -936,7 +941,7 @@ class BotEngine:
             self._last_activity_ts = now  # NEW: record open as activity
             if sig.tf == "m1":
                 self._last_open_m1 = now
-                # taker fail self-throttle
+                # taker fail self-throttle (secondary check)
                 fails_30m = [t for t in self._taker_fail_events if now - t <= settings.spec.FAST_TAPE_DISABLE_WINDOW_MIN * 60]
                 if len(fails_30m) >= settings.spec.FAST_TAPE_DISABLE_AFTER_FAILS:
                     self._fast_tape_disabled_until = now + settings.spec.FAST_TAPE_DISABLE_COOLDOWN_MIN * 60
