@@ -4,7 +4,7 @@ import { BrowserRouter, Routes, Route } from 'react-router-dom'
 import App from './App'
 import Dashboard from './pages/Dashboard'
 import ApiKeys from './pages/ApiKeys'
-import Learning from './pages/Learning'
+import Learning from './pages/Learning' // still available by route if you need it
 import './styles.css'
 
 createRoot(document.getElementById('root')!).render(
@@ -13,7 +13,6 @@ createRoot(document.getElementById('root')!).render(
       <App>
         <Routes>
           <Route path="/" element={<Dashboard />} />
-          {/* Status route removed: logs are integrated into Dashboard */}
           <Route path="/apikeys" element={<ApiKeys />} />
           <Route path="/learning" element={<Learning />} />
         </Routes>
