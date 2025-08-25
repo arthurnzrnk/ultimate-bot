@@ -12,430 +12,391 @@ type Overlay = {
 }
 
 export default function Dashboard() {
-  const [data, setData] = useState<any>({ history: [], candles: [], autoTrade: false })
+  const [s, setS] = useState<any>({ candles: [], autoTrade: false, history: [] })
+  const [dir, setDir] = useState<'up' | 'down' | null>(null)
+  const lastShown = useRef<number | undefined>(undefined)
+
+  // logs (thin bar at bottom)
   const [logs, setLogs] = useState<LogLine[]>([])
   const [loadingLogs, setLoadingLogs] = useState(true)
-  const logProcessedTs = useRef<number>(0)
 
+  // chart
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  // shorter visible window so candles draw bigger
+  const VISIBLE_BARS = 120
 
-  // ---------- Poll /status ----------
+  // sound
+  const audioRef = useRef<AudioContext | null>(null)
+  const prevPosRef = useRef<any>(null)
+  const lastLogTsRef = useRef<number>(0)
+
+  // boot audio context on first user interaction
+  useEffect(() => {
+    const priming = () => {
+      if (!audioRef.current) audioRef.current = new (window.AudioContext || (window as any).webkitAudioContext)()
+      window.removeEventListener('pointerdown', priming)
+      window.removeEventListener('keydown', priming)
+    }
+    window.addEventListener('pointerdown', priming)
+    window.addEventListener('keydown', priming)
+    return () => {
+      window.removeEventListener('pointerdown', priming)
+      window.removeEventListener('keydown', priming)
+    }
+  }, [])
+
+  function blip(kind: 'open-long' | 'open-short' | 'take' | 'stop') {
+    const ctx = audioRef.current
+    if (!ctx) return
+    const osc = ctx.createOscillator()
+    const gain = ctx.createGain()
+    osc.connect(gain); gain.connect(ctx.destination)
+    const t = ctx.currentTime
+    const dur = kind === 'stop' ? 0.28 : kind === 'take' ? 0.25 : 0.18
+    const f0 = kind === 'open-long' ? 720 : kind === 'open-short' ? 460 : kind === 'take' ? 880 : 240
+    const f1 = kind === 'open-long' ? 880 : kind === 'open-short' ? 320 : kind === 'take' ? 1320 : 120
+    osc.frequency.setValueAtTime(f0, t)
+    osc.frequency.exponentialRampToValueAtTime(f1, t + dur * 0.9)
+    gain.gain.setValueAtTime(0.0001, t)
+    gain.gain.exponentialRampToValueAtTime(kind === 'stop' ? 0.3 : 0.18, t + 0.02)
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + dur)
+    osc.type = kind === 'stop' ? 'sawtooth' : 'triangle'
+    osc.start(t); osc.stop(t + dur + 0.01)
+  }
+
+  // watch status for open/close → sounds + gradient tone
+  useEffect(() => {
+    const prev = prevPosRef.current
+    const cur = s?.pos || null
+    if (prev === null && cur) {
+      blip(cur.side === 'long' ? 'open-long' : 'open-short')
+    } else if (prev && cur === null) {
+      // try to classify by last log
+      const recent = logs[logs.length - 1]?.text || ''
+      if (recent.includes('Close TAKE')) blip('take')
+      else if (recent.includes('Close STOP')) blip('stop')
+      else blip('stop')
+    }
+    prevPosRef.current = cur
+  }, [s?.pos, logs])
+
+  // poll /status (1s)
   useEffect(() => {
     let alive = true
     const tick = async () => {
-      const s = await getStatus()
+      const ns = await getStatus()
       if (!alive) return
-      setData(s)
+      setS(ns)
+      const shown = ns.price ?? (ns.bid && ns.ask ? (ns.bid + ns.ask) / 2 : null)
+      if (typeof shown === 'number') {
+        const prev = lastShown.current
+        setDir(prev == null ? null :
+          Math.round(shown * 100) > Math.round((prev || 0) * 100) ? 'up' :
+          Math.round(shown * 100) < Math.round((prev || 0) * 100) ? 'down' : null)
+        lastShown.current = shown
+      }
     }
     tick()
     const id = setInterval(tick, 1000)
     return () => { alive = false; clearInterval(id) }
   }, [])
 
-  // ---------- Poll logs (for footer + sound) ----------
+  // poll logs (2s)
   useEffect(() => {
     let alive = true
-    const pull = async () => {
+    const fetchLogs = async () => {
       try {
         const r = await getLogs(250)
         if (!alive) return
         setLogs(r.logs || [])
+        const lastTs = r.logs?.[r.logs.length - 1]?.ts || 0
+        lastLogTsRef.current = lastTs
       } catch (e) {
-        console.error(e)
+        // ignore
       } finally {
         if (alive) setLoadingLogs(false)
       }
     }
-    pull()
-    const id = setInterval(pull, 1500)
+    fetchLogs()
+    const id = setInterval(fetchLogs, 2000)
     return () => { alive = false; clearInterval(id) }
   }, [])
 
-  // ---------- Sound FX (open/close) ----------
-  useEffect(() => {
-    if (!logs.length) return
-    const fresh = logs.filter(l => l.ts > (logProcessedTs.current || 0))
-    if (fresh.length) logProcessedTs.current = fresh[fresh.length - 1].ts
+  // helpers
+  const fmt = (n: any, d = 2) => (n == null || isNaN(n)) ? '—'
+    : Number(n).toLocaleString(undefined, { maximumFractionDigits: d, minimumFractionDigits: d })
 
-    fresh.forEach(l => {
-      const t = l.text || ''
-      if (t.includes('Open BUY')) beep('BUY')
-      else if (t.includes('Open SELL')) beep('SELL')
-      else if (t.includes('Close TAKE')) beep('TAKE')
-      else if (t.includes('Close STOP')) beep('STOP')
-    })
-  }, [logs])
-
-  function beep(kind: 'BUY' | 'SELL' | 'TAKE' | 'STOP') {
-    try {
-      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)()
-      const now = ctx.currentTime
-      const o = ctx.createOscillator()
-      const g = ctx.createGain()
-      o.type = 'sine'
-      o.connect(g); g.connect(ctx.destination)
-
-      const env = (t: number, v: number) => g.gain.linearRampToValueAtTime(v, now + t)
-      g.gain.setValueAtTime(0, now)
-
-      const seq: Array<[number, number]> = ((): Array<[number, number]> => {
-        switch (kind) {
-          case 'BUY':  return [[660, 0.00], [880, 0.08], [990, 0.14]]
-          case 'SELL': return [[440, 0.00], [330, 0.08], [262, 0.14]]
-          case 'TAKE': return [[880, 0.00], [660, 0.08]]
-          case 'STOP': return [[220, 0.00], [196, 0.10]]
-        }
-      })()
-
-      seq.forEach(([freq, t], i) => {
-        o.frequency.setValueAtTime(freq, now + t)
-        env(t, 0.0); env(t + 0.005, 0.18); env(t + 0.07, 0.0)
-      })
-      o.start(now)
-      o.stop(now + 0.25)
-    } catch { /* autoplay may require a user gesture first */ }
+  // ---------- TA builders (client-side, lightweight) ----------
+  const closes: number[] = useMemo(() => (s?.candles || []).map((c: Candle) => c.close), [s?.candles])
+  function ema(src: number[], len: number): Array<number | null> {
+    if (!src.length) return []
+    const k = 2 / (len + 1); const out: Array<number | null> = []
+    let e = src[0]; out.push(e)
+    for (let i = 1; i < src.length; i++) { e = src[i] * k + e * (1 - k); out.push(e) }
+    return out
+  }
+  function sessionVWAP(cs: Candle[]): Array<number | null> {
+    const out: Array<number | null> = []; let day: string | null = null, pv = 0, vv = 0
+    for (let i = 0; i < cs.length; i++) {
+      const c = cs[i]; const d = new Date(c.time * 1000).toISOString().slice(0,10)
+      if (day !== d) { day = d; pv = 0; vv = 0 }
+      const tp = (c.high + c.low + c.close) / 3; const v = Math.max(1e-8, c.volume ?? 1)
+      pv += tp * v; vv += v; out.push(pv / Math.max(1e-8, vv))
+    }
+    return out
+  }
+  function linreg(src: number[], len: number): Array<number | null> {
+    const out: Array<number | null> = new Array(src.length).fill(null)
+    if (src.length < len) return out
+    const xs = Array.from({ length: len }, (_, i) => i)
+    const sumX = xs.reduce((a,b)=>a+b,0); const sumXX = xs.reduce((a,b)=>a+b*b,0)
+    for (let i = len - 1; i < src.length; i++) {
+      const win = src.slice(i - len + 1, i + 1)
+      const sumY = win.reduce((a,b)=>a+b,0)
+      const sumXY = win.reduce((a,b,idx)=>a+idx*b,0)
+      const n = len
+      const denom = n * sumXX - sumX * sumX
+      if (denom === 0) continue
+      const m = (n * sumXY - sumX * sumY) / denom
+      const b = (sumY - m * sumX) / n
+      const y = m * (len - 1) + b
+      out[i] = y
+    }
+    return out
   }
 
-  // ---------- Helpers ----------
-  const fmt = (n: any, d = 2) =>
-    n == null || isNaN(n) ? '—' : Number(n).toLocaleString(undefined, { maximumFractionDigits: d, minimumFractionDigits: d })
-
-  // Liquid-glass friendly overlays (only when bot is ON)
-  const overlays: Overlay[] = useMemo(() => {
-    const cs: Candle[] = (data?.candles || []) as Candle[]
-    if (!data?.autoTrade || !Array.isArray(cs) || cs.length < 6) return []
-
-    const tp = cs.map(c => (c.high + c.low + c.close) / 3)
-    const ema = (arr: number[], period: number) => {
-      const out: Array<number | null> = new Array(arr.length).fill(null)
-      if (!arr.length) return out
-      const k = 2 / (period + 1)
-      let e = arr[0]
-      out[0] = e
-      for (let i = 1; i < arr.length; i++) {
-        e = arr[i] * k + e * (1 - k)
-        out[i] = e
-      }
-      return out
-    }
-    const donchMid = (period = 20) => {
-      const out: Array<number | null> = new Array(cs.length).fill(null)
-      for (let i = 0; i < cs.length; i++) {
-        const s = Math.max(0, i - period + 1)
-        let H = -Infinity, L = Infinity
-        for (let j = s; j <= i; j++) { H = Math.max(H, cs[j].high); L = Math.min(L, cs[j].low) }
-        out[i] = (H + L) / 2
-      }
-      return out
-    }
-
-    // VWAP by session
-    const vwap: Array<number | null> = []
-    let day: string | null = null, pv = 0, vv = 0
-    cs.forEach(c => {
-      const d = new Date(c.time * 1000).toISOString().slice(0, 10)
-      if (day !== d) { day = d; pv = 0; vv = 0 }
-      const typical = (c.high + c.low + c.close) / 3
-      const v = Math.max(1e-8, c?.volume ?? 0)
-      pv += typical * v; vv += v
-      vwap.push(pv / Math.max(1e-8, vv))
-    })
-
-    return [
-      { data: vwap, color: '#7dd3fc', dashed: true },       // VWAP (dashed)
-      { data: ema(tp, 10), color: '#60a5fa' },               // EMA-10 (typical)
-      { data: ema(tp, 30), color: '#fbbf24' },               // EMA-30 (typical)
-      { data: donchMid(20), color: '#cbd5e1' },              // Donchian midline
-    ]
-  }, [data.autoTrade, data.candles])
-
-  // ---------- Chart drawing ----------
-  function drawChart(canvas: HTMLCanvasElement, candles: Candle[], overlays: Overlay[], highlight: 'BUY' | 'SELL' | null, limit = 90) {
+  // draw chart
+  useEffect(() => {
+    const canvas = canvasRef.current
+    const candles: Candle[] = s?.candles || []
+    if (!canvas) return
     const ctx = canvas.getContext('2d')
-    if (!ctx || !candles || candles.length === 0) return
+    if (!ctx) return
 
-    const W = canvas.clientWidth
-    const H = canvas.clientHeight
+    const WCSS = 1024 // fixed width area for the chart canvas wrapper
+    const HCSS = 420
     const dpr = Math.max(1, window.devicePixelRatio || 1)
-    if (canvas.width !== Math.floor(W * dpr)) canvas.width = Math.floor(W * dpr)
-    if (canvas.height !== Math.floor(H * dpr)) canvas.height = Math.floor(H * dpr)
+    if (canvas.width !== WCSS * dpr) canvas.width = WCSS * dpr
+    if (canvas.height !== HCSS * dpr) canvas.height = HCSS * dpr
+    canvas.style.width = `${WCSS}px`
+    canvas.style.height = `${HCSS}px`
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-    ctx.clearRect(0, 0, W, H)
+    ctx.clearRect(0, 0, WCSS, HCSS)
+
+    if (!candles.length) {
+      ctx.fillStyle = 'rgba(255,255,255,0.7)'
+      ctx.font = '12px ui-sans-serif, system-ui'
+      ctx.textAlign = 'center'
+      ctx.fillText('Loading…', WCSS/2, HCSS/2)
+      return
+    }
 
     const n = candles.length
-    const padL = 36, padR = 8, padT = 10, padB = 18
-    const chartW = W - padL - padR
-    const chartH = H - padT - padB
-    const start = Math.max(0, n - limit)
-
+    const start = Math.max(0, n - VISIBLE_BARS)
     let lo = Infinity, hi = -Infinity
     for (let i = start; i < n; i++) { lo = Math.min(lo, candles[i].low); hi = Math.max(hi, candles[i].high) }
-    overlays?.forEach(o => {
-      if (!o?.data) return
-      for (let i = start; i < Math.min(n, o.data.length); i++) {
-        const v = o.data[i]; if (v == null) continue
-        lo = Math.min(lo, v); hi = Math.max(hi, v)
-      }
-    })
+
+    // overlays (ON only)
+    const overlays: Overlay[] = []
+    if (s?.autoTrade) {
+      const v = sessionVWAP(candles)
+      const e20 = ema(closes, 20)
+      const e60 = ema(closes, 60)
+      const r50 = linreg(closes, 50)
+      const r100 = linreg(closes, 100)
+      overlays.push({ data: v, color: '#f59e0b', dashed: true })   // VWAP (amber)
+      overlays.push({ data: e20, color: '#60a5fa' })               // EMA20 (blue)
+      overlays.push({ data: e60, color: '#fde047' })               // EMA60 (yellow)
+      overlays.push({ data: r50, color: '#38bdf8' })               // short reg (blue-cyan)
+      overlays.push({ data: r100, color: '#facc15' })              // long reg (yellow)
+      // extend hi/lo with overlay values
+      overlays.forEach(o => (o.data || []).forEach((v,i) => { if (i >= start && v != null) { lo = Math.min(lo, v); hi = Math.max(hi, v) } }))
+    }
+
     if (!isFinite(lo) || !isFinite(hi) || hi <= lo) return
 
-    const xPer = chartW / Math.max(1, Math.min(limit, n - start))
-    const y = (p: number) => padT + (hi - p) * (chartH / Math.max(1e-8, hi - lo))
+    const padL = 36, padR = 12, padT = 10, padB = 16
+    const chartW = WCSS - padL - padR
+    const chartH = HCSS - padT - padB
+    const xPer = chartW / Math.max(1, n - start)
+    const y = (p: number) => padT + (hi - p) * (chartH / Math.max(1e-8, (hi - lo)))
 
-    // faint grid
+    // subtle grid
     ctx.strokeStyle = 'rgba(255,255,255,0.06)'
     ctx.lineWidth = 1
     ctx.beginPath()
-    for (let i = 0; i <= 5; i++) {
-      const yy = padT + (chartH * i) / 5
-      ctx.moveTo(padL, yy); ctx.lineTo(W - padR, yy)
-    }
+    for (let i = 0; i <= 5; i++) { const yy = padT + (chartH * i) / 5; ctx.moveTo(padL, yy); ctx.lineTo(WCSS - padR, yy) }
     ctx.stroke()
 
-    // candles (GREEN up, RED down; bigger bodies)
+    // candles (thicker, green/red)
     for (let i = start; i < n; i++) {
       const c = candles[i]
       const idx = i - start
       const x = padL + idx * xPer + xPer * 0.05
-      const cw = xPer * 0.90
+      const cw = xPer * 0.9
       const up = c.close >= c.open
-      ctx.strokeStyle = up ? '#22c55e' : '#f43f5e'
-      ctx.fillStyle = up ? '#22c55e' : '#f43f5e'
+      ctx.strokeStyle = up ? '#16a34a' : '#f43f5e'
+      ctx.fillStyle = up ? '#16a34a' : '#f43f5e'
       // wick
       ctx.beginPath()
-      ctx.moveTo(x + cw / 2, y(c.high))
-      ctx.lineTo(x + cw / 2, y(c.low))
-      ctx.stroke()
+      ctx.moveTo(x + cw / 2, y(c.high)); ctx.lineTo(x + cw / 2, y(c.low)); ctx.stroke()
       // body
-      const bh = Math.max(1.5, Math.abs(y(c.open) - y(c.close)))
+      const bh = Math.max(2, Math.abs(y(c.open) - y(c.close)))
       ctx.fillRect(x, Math.min(y(c.open), y(c.close)), cw, bh)
     }
 
-    // overlays (only if bot ON)
-    overlays?.forEach(o => {
-      if (!o?.data) return
-      const n2 = o.data.length
+    // overlays
+    overlays.forEach(o => {
+      const data = o.data || []
       ctx.strokeStyle = o.color || '#fff'
-      ctx.lineWidth = 1.7
-      ctx.setLineDash(o.dashed ? [4, 3] : [])
+      ctx.lineWidth = 1.8
+      if (o.dashed) ctx.setLineDash([5, 4])
       ctx.beginPath()
-      let started = false; let j = 0
-      for (let i = start; i < n && i < n2; i++, j++) {
-        const v = o.data[i]; if (v == null) continue
-        const xx = padL + j * xPer + xPer / 2
+      let started = false
+      for (let i = start; i < n && i < data.length; i++) {
+        const v = data[i]; if (v == null) continue
+        const xx = padL + (i - start) * xPer + xPer / 2
         const yy = y(v)
         if (!started) { ctx.moveTo(xx, yy); started = true } else { ctx.lineTo(xx, yy) }
       }
       ctx.stroke()
       ctx.setLineDash([])
     })
+  }, [s?.candles, s?.autoTrade])
 
-    // subtle highlight border when a position is open
-    if (highlight) {
-      ctx.strokeStyle = highlight === 'BUY' ? 'rgba(34,197,94,0.8)' : 'rgba(244,63,94,0.8)'
-      ctx.lineWidth = 3
-      ctx.strokeRect(2, 2, W - 4, H - 4)
-    }
-  }
-
-  // render chart
-  useEffect(() => {
-    const canvas = canvasRef.current
-    if (!canvas) return
-    const candles = (data.candles || []) as Candle[]
-    if (!Array.isArray(candles) || candles.length < 5) {
-      const ctx = canvas.getContext('2d')
-      if (!ctx) return
-      const W = canvas.clientWidth, H = canvas.clientHeight
-      ctx.clearRect(0, 0, W, H)
-      ctx.fillStyle = 'rgba(255,255,255,0.6)'
-      ctx.font = '12px ui-sans-serif, system-ui'
-      ctx.textAlign = 'center'
-      ctx.fillText('Loading candles…', W / 2, H / 2)
-      return
-    }
-    const pos = data?.pos
-    const hl = pos ? (pos.side === 'long' ? 'BUY' : 'SELL') : null
-    drawChart(canvas, candles, overlays, hl, 90) // shorter window, larger candles
-  }, [data.candles, data.pos, overlays])
-
-  // Actions (kept only for parity; main switch moved to header)
-  async function forceStartStop(next: boolean) {
+  // toggle auto trade from header switch
+  async function toggleAuto() {
+    const next = !s.autoTrade
     await postSettings({ autoTrade: next })
-    setData((d: any) => ({ ...d, autoTrade: next }))
+    setS((d: any) => ({ ...d, autoTrade: next }))
   }
 
-  // UI text
-  const pnlToday = data?.pnlToday ?? 0
-  const fills = data?.fillsToday ?? 0
-  const pos = data?.pos
-  const meta = (pos?.meta || {}) as any
+  // dynamic tone class for the background wash
+  const tone = !s.autoTrade ? 'gray' : s.pos ? (s.pos.side === 'long' ? 'green' : 'red') : 'orange'
+  const px = s?.price ?? null
+  const priceClass = dir === 'up' ? 'p-up' : dir === 'down' ? 'p-down' : ''
 
-  const atrLine = data.atrPct == null ? null : `ATR%: ${fmt((data.atrPct || 0) * 100, 2)}%`
+  // CONDITIONS (market only; no PnL / fills here)
   const conditionsText = [
-    data.regime ? `Regime: ${data.regime}` : null,
-    data.bias ? `Bias: ${data.bias}` : null,
-    data.adx != null ? `ADX: ${fmt(data.adx, 0)}` : null,
-    atrLine,
+    s.regime ? `Regime: ${s.regime}` : null,
+    s.bias ? `Bias: ${s.bias}` : null,
+    s.adx != null ? `ADX: ${fmt(s.adx, 0)}` : null,
+    s.atrPct != null ? `ATR%: ${fmt((s.atrPct || 0) * 100, 2)}%` : null,
   ].filter(Boolean).join(' • ')
 
   return (
-    <div>
-      {/* STATUS + CONDITIONS */}
-      <div className="status-row">
-        <div className={`glass status-pill ${pos ? (pos.side === 'long' ? 'status-green' : 'status-red') : ''}`}>
-          <b>STATUS:</b>&nbsp;&nbsp;{data.status ?? '—'}
+    <div className={`dashboard tone-${tone}`}>
+      {/* header */}
+      <div className="topbar">
+        <div className="brand-row">
+          <div className="brand">COINSELF</div>
+          <button className={`ios-switch ${s.autoTrade ? 'on' : ''}`} onClick={toggleAuto} aria-label="Toggle bot" />
+          {s.autoTrade && (
+            <div className="autowarn">THE SYSTEM WILL BE TRADING AUTOMATICALLY UNTIL THE BOT IS MANUALLY TURNED OFF.</div>
+          )}
         </div>
-        <div className="glass conditions-pill">
+        <div className="price-right">
+          <div className={`price ${priceClass}`}>${fmt(px, 2)}</div>
+          <div className="pair">BTC/USD</div>
+        </div>
+      </div>
+
+      {/* status row */}
+      <div className="row status-line">
+        <div className={`pill status-pill`}>
+          <b>STATUS:</b>&nbsp;&nbsp;{s?.status ?? '—'}
+        </div>
+        <div className="pill cond-pill">
           <b>CONDITIONS:</b>&nbsp;&nbsp;{conditionsText || '—'}
         </div>
       </div>
 
-      {/* GRID */}
-      <div className="main-grid">
-        <div className="left-col">
-          <div className="glass chart-wrap">
-            <canvas ref={canvasRef} className="chart" />
+      {/* chart */}
+      <div className="chart-card glass">
+        <canvas ref={canvasRef} />
+      </div>
+
+      {/* bottom row: history (left) + account (right) */}
+      <div className="row bottom">
+        <section className="glass block">
+          <h2 className="card-title">Order History</h2>
+          <table className="table">
+            <thead>
+              <tr><th>Time</th><th>Side</th><th style={{textAlign:'right'}}>Entry</th><th style={{textAlign:'right'}}>Exit</th><th style={{textAlign:'right'}}>PNL</th></tr>
+            </thead>
+            <tbody>
+              {[...(s.history || [])].reverse().map((t: any, i: number) => (
+                <tr key={i}>
+                  <td>{new Date(((t.close_time ?? t.open_time) || 0) * 1000).toLocaleString()}</td>
+                  <td style={{ textTransform: 'capitalize' }}>{t.side}</td>
+                  <td style={{ textAlign: 'right' }}>{fmt(t.entry, 2)}</td>
+                  <td style={{ textAlign: 'right' }}>{fmt(t.close, 2)}</td>
+                  <td style={{ textAlign: 'right' }} className={(t.pnl ?? 0) >= 0 ? 'p-up' : 'p-down'}>
+                    {(t.pnl ?? 0) >= 0 ? '+' : ''}{fmt(t.pnl, 2)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </section>
+
+        <section className="glass block account">
+          <div className="card-head">
+            <h2 className="card-title">Account</h2>
+            <Link to="/apikeys" className="chip-link">API</Link>
           </div>
 
-          <section className="glass history-card">
-            <h2 className="card-title">Order History</h2>
-            <table className="table">
-              <thead>
-                <tr>
-                  <th>Time</th>
-                  <th>Side</th>
-                  <th style={{ textAlign: 'right' }}>Entry</th>
-                  <th style={{ textAlign: 'right' }}>Exit</th>
-                  <th style={{ textAlign: 'right' }}>PNL</th>
-                </tr>
-              </thead>
-              <tbody>
-                {[...(data.history || [])].reverse().map((t: any, i: number) => (
-                  <tr key={i}>
-                    <td>{new Date(((t.close_time ?? t.open_time) || 0) * 1000).toLocaleString()}</td>
-                    <td style={{ textTransform: 'capitalize' }}>{t.side}</td>
-                    <td style={{ textAlign: 'right' }}>{fmt(t.entry, 2)}</td>
-                    <td style={{ textAlign: 'right' }}>{fmt(t.close, 2)}</td>
-                    <td style={{ textAlign: 'right' }} className={(t.pnl ?? 0) >= 0 ? 'price-up' : 'price-down'}>
-                      {(t.pnl ?? 0) >= 0 ? '+' : ''}{fmt(t.pnl, 2)}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </section>
-        </div>
-
-        <div className="right-col">
-          {/* Account card (toggle removed; API link added) */}
-          <section className="glass pcard">
-            <div className="card-title-row">
-              <h2 className="card-title">Account</h2>
-              <Link to="/apikeys" className="api-link">API</Link>
+          <div className="acct-grid">
+            <div className="mini">
+              <div className="muted-xs">Paper Account Equity</div>
+              <div className="num-lg">${fmt(s.equity, 2)}</div>
             </div>
-            <div className="acct-grid">
-              <div className="glass mini">
-                <div className="muted-xs">Equity</div>
-                <div className="num-lg">${fmt(data.equity, 2)}</div>
-              </div>
-              <div className="glass mini">
-                <div className="muted-xs">P&amp;L Today</div>
-                <div className={`num-lg ${pnlToday >= 0 ? 'price-up' : 'price-down'}`}>
-                  {pnlToday >= 0 ? '+' : ''}{fmt(pnlToday, 2)}
-                </div>
-              </div>
-              <div className="glass mini">
-                <div className="muted-xs">Fills Today</div>
-                <div className="num-lg">{fills}</div>
-              </div>
-              <div className="glass mini">
-                <div className="muted-xs">Day Lock</div>
-                <div className="num-lg">{data.dayLockArmed ? `Armed ≥ ${fmt(data.dayLockFloorPct, 2)}%` : '—'}</div>
+            <div className="mini">
+              <div className="muted-xs">Unrealized (net)</div>
+              <div className={`num-lg ${(s.unrealNet ?? 0) >= 0 ? 'p-up' : 'p-down'}`}>
+                {(s.unrealNet ?? 0) >= 0 ? '+' : ''}{fmt(s.unrealNet, 2)}
               </div>
             </div>
+            <div className="mini">
+              <div className="muted-xs">Fills Today</div>
+              <div className="num-lg">{s.fillsToday ?? 0}</div>
+            </div>
+            <div className="mini">
+              <div className="muted-xs">P&L Today</div>
+              <div className={`num-lg ${(s.pnlToday ?? 0) >= 0 ? 'p-up' : 'p-down'}`}>
+                {(s.pnlToday ?? 0) >= 0 ? '+' : ''}{fmt(s.pnlToday, 2)}
+              </div>
+            </div>
+          </div>
 
-            {!data.autoTrade ? (
-              <button className="btn-pill" onClick={() => forceStartStop(true)} style={{ marginTop: 10 }}>
-                Turn Bot ON
-              </button>
-            ) : (
-              <button className="btn-pill danger" onClick={() => forceStartStop(false)} style={{ marginTop: 10 }}>
-                Turn Bot OFF
-              </button>
-            )}
-          </section>
-
-          <section className="glass pcard">
-            <h2 className="card-title">Open Position</h2>
-            {!pos ? (
+          <div className="pos-card">
+            <div className="muted-xs" style={{marginBottom:6}}>Open Position</div>
+            {!s?.pos ? (
               <div className="muted">No open position.</div>
             ) : (
               <table className="table compact">
                 <tbody>
-                  <tr>
-                    <td>Side</td>
-                    <td style={{ textAlign: 'right', textTransform: 'capitalize' }}>{pos.side}</td>
-                  </tr>
-                  <tr>
-                    <td>Qty</td>
-                    <td style={{ textAlign: 'right' }}>{fmt(pos.qty, 6)}</td>
-                  </tr>
-                  <tr>
-                    <td>Entry / Stop / Take</td>
-                    <td style={{ textAlign: 'right' }}>
-                      {fmt(pos.entry, 2)} / {fmt(pos.stop, 2)} / {fmt(pos.take, 2)}
-                    </td>
-                  </tr>
-                  <tr>
-                    <td>1R ($)</td>
-                    <td style={{ textAlign: 'right' }}>{fmt(pos.stop_dist, 2)}</td>
-                  </tr>
-                  <tr>
-                    <td>TP% / Fee→TP</td>
-                    <td style={{ textAlign: 'right' }}>
-                      {meta?.final_tp_pct != null ? `${fmt((meta.final_tp_pct || 0) * 100, 2)}%` : '—'}
-                      {' '} / {meta?.fee_to_tp != null ? fmt(meta.fee_to_tp, 3) : '—'}
-                    </td>
-                  </tr>
-                  <tr>
-                    <td>Fast Tape</td>
-                    <td style={{ textAlign: 'right' }}>
-                      {meta?.fast_tape_taker ? 'TAKER' : 'MAKER'}
-                      {meta?.fast_tape_disabled ? ' (disabled)' : ''}
-                    </td>
-                  </tr>
+                  <tr><td>Side</td><td style={{textAlign:'right', textTransform:'capitalize'}}>{s.pos.side}</td></tr>
+                  <tr><td>Qty</td><td style={{textAlign:'right'}}>{fmt(s.pos.qty, 6)}</td></tr>
+                  <tr><td>Entry / Stop / Take</td><td style={{textAlign:'right'}}>{fmt(s.pos.entry,2)} / {fmt(s.pos.stop,2)} / {fmt(s.pos.take,2)}</td></tr>
+                  <tr><td>1R ($)</td><td style={{textAlign:'right'}}>{fmt(s.pos.stop_dist,2)}</td></tr>
                 </tbody>
               </table>
             )}
-          </section>
-
-          <section className="glass pcard">
-            <h2 className="card-title">Tape &amp; Risk</h2>
-            <div className="kv"><div>Spread (bps)</div><div>{fmt(data.spreadBps, 2)}</div></div>
-            <div className="kv"><div>Fee→TP</div><div>{data.feeToTp != null ? fmt(data.feeToTp, 3) : '—'}</div></div>
-            <div className="kv"><div>Slip Est ($)</div><div>{fmt(data.slipEst, 2)}</div></div>
-            <div className="kv"><div>Top‑3 Depth ($)</div><div>{fmt(data.top3DepthNotional, 0)}</div></div>
-            <div className="kv"><div>Red‑Day Level</div><div>{data.redDayLevel ?? 0}</div></div>
-            <div className="kv"><div>Fast Tape Disabled</div><div>{data.fastTapeDisabled ? 'Yes' : 'No'}{data.takerFailCount30m ? ` (${data.takerFailCount30m})` : ''}</div></div>
-          </section>
-        </div>
+          </div>
+        </section>
       </div>
 
-      {/* FOOTER LOGS — gray, no panel */}
-      <div className="logbar container" role="log" aria-live="polite">
-        {loadingLogs ? (
-          <span className="muted">Loading logs…</span>
-        ) : (
-          (logs.slice(-40)).map((l, i) => (
-            <span key={i} className="logchip">
-              <span className="logts">{new Date(l.ts * 1000).toLocaleTimeString()}</span>
-              <span className="logtxt">{l.text}</span>
+      {/* thin gray logs bar (no glass) */}
+      <div className="logs-bar">
+        {loadingLogs ? 'Loading logs…' :
+          (logs.slice(-4).map((l, i) => (
+            <span key={i} className="log-item">
+              <span className="logts">{new Date(l.ts * 1000).toLocaleTimeString()}</span> {l.text}
             </span>
-          ))
-        )}
+          )))
+        }
       </div>
     </div>
   )
 }
-// EOF
